@@ -1,0 +1,466 @@
+import torch
+from torch import nn
+import einops
+
+from ..encoder.multimodal.encoder3d import Encoder as Encoder3D
+from ..encoder.multimodal.encoder2d import Encoder as Encoder2D
+from ..utils.layers import DoubleCrossSelfAttentionModule, AttentionModule
+from ..utils.position_encodings import SinusoidalPosEmb, RotaryPositionEncoding3D
+
+from .base_denoise_actor import DenoiseActor as BaseDenoiseActor
+
+
+class FlowerActor3D(BaseDenoiseActor):
+
+    def __init__(self,
+                 # Encoder arguments
+                 backbone="clip",
+                 output_level="res3",
+                 upsample=False,
+                 finetune_backbone=False,
+                 finetune_text_encoder=False,
+                 num_vis_instr_attn_layers=2,
+                 fps_subsampling_factor=5,
+                 # Encoder and decoder arguments
+                 embedding_dim=60,
+                 num_attn_heads=9,
+                 nhist=3,
+                 nhand=1,
+                 # Decoder arguments
+                 num_shared_attn_layers=4,
+                 relative=False,
+                 rotation_format='quat_xyzw',
+                 # Denoising arguments
+                 denoise_timesteps=100,
+                 denoise_model="ddpm",
+                 # Training arguments
+                 lv2_batch_size=1):
+        super().__init__(
+            embedding_dim=embedding_dim,
+            num_attn_heads=num_attn_heads,
+            nhist=nhist,
+            nhand=nhand,
+            num_shared_attn_layers=num_shared_attn_layers,
+            relative=relative,
+            rotation_format=rotation_format,
+            denoise_timesteps=denoise_timesteps,
+            denoise_model=denoise_model,
+            lv2_batch_size=lv2_batch_size
+        )
+        # Vision-language encoder, runs only once
+        self.encoder = Encoder3D(
+            backbone=backbone,
+            output_level=output_level,
+            upsample=upsample,
+            embedding_dim=embedding_dim,
+            nhist=nhist * nhand,
+            num_attn_heads=num_attn_heads,
+            num_vis_instr_attn_layers=num_vis_instr_attn_layers,
+            fps_subsampling_factor=fps_subsampling_factor,
+            finetune_backbone=finetune_backbone,
+            finetune_text_encoder=finetune_text_encoder
+        )
+
+        # Action decoder, runs at every denoising timestep
+        self.prediction_head = TransformerHead(
+            embedding_dim=embedding_dim,
+            nhist=nhist * nhand,
+            num_attn_heads=num_attn_heads,
+            num_shared_attn_layers=num_shared_attn_layers,
+            rot_dim=3 if rotation_format == 'euler' else 6
+        )
+
+
+class TransformerHead(nn.Module):
+
+    def __init__(self,
+                 embedding_dim=60,
+                 num_attn_heads=8,
+                 num_shared_attn_layers=4,
+                 nhist=3,
+                 rotary_pe=True,
+                 rot_dim=6):
+        super().__init__()
+
+        # Different embeddings
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb(embedding_dim),
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+        self.curr_gripper_emb = nn.Sequential(
+            nn.Linear(embedding_dim * nhist, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+        self.traj_time_emb = SinusoidalPosEmb(embedding_dim)
+        self.hand_embed = nn.Embedding(2, embedding_dim)
+
+        # Attention from trajectory queries to language
+        self.traj_lang_attention = AttentionModule(
+            num_layers=1,
+            d_model=embedding_dim,
+            dim_fw=4 * embedding_dim,
+            dropout=0.1,
+            n_heads=num_attn_heads,
+            pre_norm=False,
+            rotary_pe=False,
+            use_adaln=False,
+            is_self=False
+        )
+
+        # Shared attention layers
+        self.self_attn = DoubleCrossSelfAttentionModule(
+            num_layers=num_shared_attn_layers,
+            d_model=embedding_dim,
+            dim_fw=4 * embedding_dim,
+            dropout=0.1,
+            n_heads=num_attn_heads,
+            pre_norm=False,
+            rotary_pe_0=rotary_pe,
+            rotary_pe_1=rotary_pe,
+            use_adaln=True
+        )
+
+        # Specific (non-shared) Output layers:
+        # 1. Rotation
+        self.rotation_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.rotation_self_attn = DoubleCrossSelfAttentionModule(
+            num_layers=2,
+            d_model=embedding_dim,
+            dim_fw=4 * embedding_dim,
+            dropout=0.1,
+            n_heads=num_attn_heads,
+            pre_norm=False,
+            rotary_pe_0=rotary_pe,
+            rotary_pe_1=rotary_pe,
+            use_adaln=True
+        )
+        self.rotation_predictor = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, rot_dim)
+        )
+
+        # 2. Position
+        self.position_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.position_self_attn = DoubleCrossSelfAttentionModule(
+            num_layers=2,
+            d_model=embedding_dim,
+            dim_fw=4 * embedding_dim,
+            dropout=0.1,
+            n_heads=num_attn_heads,
+            pre_norm=False,
+            rotary_pe_0=rotary_pe,
+            rotary_pe_1=rotary_pe,
+            use_adaln=True
+        )
+        self.position_predictor = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, 3)
+        )
+
+        # 3. Openess
+        self.openess_predictor = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, 1)
+        )
+
+        # Relative positional embeddings
+        self.relative_pe_layer = RotaryPositionEncoding3D(embedding_dim)
+
+    def forward(self, traj_feats, trajectory, timesteps,
+                rgb3d_feats, rgb3d_pos, rgb2d_feats, rgb2d_pos,
+                instr_feats, instr_pos, proprio_feats,
+                fps_scene_feats, fps_scene_pos):
+        """
+        Arguments:
+            traj_feats: (B, trajectory_length, nhand, F)
+            trajectory: (B, trajectory_length, nhand, 3+6+X)
+            timesteps: (B, 1)
+            rgb3d_feats: (B, N, F)
+            rgb3d_pos: (B, N, 3)
+            rgb2d_feats: (B, N2d, F)
+            rgb2d_pos: (B, N2d, 3)
+            instr_feats: (B, L, F)
+            instr_pos: (B, L, 3)
+            proprio_feats: (B, nhist*nhand, F)
+            fps_scene_feats: (B, M, F), M < N
+            fps_scene_pos: (B, M, 3)
+
+        Returns:
+            list of (B, trajectory_length, nhand, 3+6+X)
+        """
+        _, traj_len, nhand, _ = trajectory.shape
+
+        # Trajectory features
+        if nhand > 1:
+            traj_feats = traj_feats + self.hand_embed.weight[None, None]
+        traj_feats = einops.rearrange(traj_feats, 'b l h c -> b (l h) c')
+        trajectory = einops.rearrange(trajectory, 'b l h c -> b (l h) c')
+
+        # Trajectory features cross-attend to context features
+        traj_time_pos = self.traj_time_emb(
+            torch.arange(0, traj_len, device=traj_feats.device)
+        )[None, None].repeat(len(traj_feats), 1, nhand, 1)
+        traj_time_pos = einops.rearrange(traj_time_pos, 'b l h c -> b (l h) c')
+        traj_feats = self.traj_lang_attention(
+            seq1=traj_feats,
+            seq2=instr_feats,
+            seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
+        )[-1]
+        traj_feats = traj_feats + traj_time_pos
+        traj_xyz = trajectory[..., :3]
+
+        # Denoising timesteps' embeddings
+        time_embs = self.encode_denoising_timestep(
+            timesteps, proprio_feats
+        )
+
+        # Concatenate scene feature and language features
+        rgb3d_feats = torch.cat((rgb3d_feats, instr_feats), 1)
+        #fake_instr_pos = torch.ones_like(instr_pos) * 100.0  # for debug
+        rgb3d_pos = torch.cat((rgb3d_pos, instr_pos), 1)
+
+        # Positional embeddings
+        rel_traj_pos = self.relative_pe_layer(traj_xyz)
+        rel_scene_pos = self.relative_pe_layer(rgb3d_pos)
+
+        # Self attention among gripper and sampled context
+        traj_feats = self.self_attn(
+            seq=traj_feats,
+            seq0=rgb3d_feats,
+            seq_pos_0=rel_traj_pos,
+            seq0_pos=rel_scene_pos,
+            seq_pos_1=rel_traj_pos,
+            ada_sgnl=time_embs
+        )[-1]
+
+        # Rotation head
+        rotation = self.predict_rot(
+            traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
+            time_embs, traj_feats.shape[1]
+        )
+
+        # Position head
+        position, position_features = self.predict_pos(
+            traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
+            time_embs, traj_feats.shape[1]
+        )
+
+        # Openess head from position head
+        openess = self.openess_predictor(position_features)
+
+        return [
+            torch.cat((position, rotation, openess), -1)
+                 .unflatten(1, (traj_len, nhand))
+        ]
+
+    def encode_denoising_timestep(self, timestep, proprio_feats):
+        """
+        Compute denoising timestep features and positional embeddings.
+
+        Args:
+            - timestep: (B,)
+
+        Returns:
+            - time_feats: (B, F)
+        """
+        time_feats = self.time_emb(timestep)
+        proprio_feats = proprio_feats.flatten(1)
+        curr_gripper_feats = self.curr_gripper_emb(proprio_feats)
+        return time_feats + curr_gripper_feats
+
+    def predict_pos(self, traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
+                    time_embs, traj_len):
+        position_features = self.position_self_attn(
+            seq=traj_feats,
+            seq0=rgb3d_feats,
+            seq_pos_0=rel_traj_pos,
+            seq0_pos=rel_scene_pos,
+            seq_pos_1=rel_traj_pos,
+            ada_sgnl=time_embs
+        )[-1]
+        position_features = position_features[:, :traj_len]
+        position_features = self.position_proj(position_features)  # (B, N, C)
+        position = self.position_predictor(position_features)
+        return position, position_features
+
+    def predict_rot(self, traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
+                    time_embs, traj_len):
+        rotation_features = self.rotation_self_attn(
+            seq=traj_feats,
+            seq0=rgb3d_feats,
+            seq_pos_0=rel_traj_pos,
+            seq0_pos=rel_scene_pos,
+            seq_pos_1=rel_traj_pos,
+            ada_sgnl=time_embs
+        )[-1]
+        rotation_features = rotation_features[:, :traj_len]
+        rotation_features = self.rotation_proj(rotation_features)  # (B, N, C)
+        rotation = self.rotation_predictor(rotation_features)
+        return rotation
+
+
+class FlowerActor2D(BaseDenoiseActor):
+
+    def __init__(self,
+                 # Encoder arguments
+                 backbone="clip",
+                 output_level="res3",
+                 upsample=False,
+                 finetune_backbone=False,
+                 finetune_text_encoder=False,
+                 num_vis_instr_attn_layers=2,
+                 fps_subsampling_factor=5,
+                 # Encoder and decoder arguments
+                 embedding_dim=60,
+                 num_attn_heads=9,
+                 nhist=3,
+                 nhand=1,
+                 # Decoder arguments
+                 num_shared_attn_layers=4,
+                 relative=False,
+                 rotation_format='quat_xyzw',
+                 # Denoising arguments
+                 denoise_timesteps=100,
+                 denoise_model="ddpm",
+                 # Training arguments
+                 lv2_batch_size=1):
+        super().__init__(
+            embedding_dim=embedding_dim,
+            num_attn_heads=num_attn_heads,
+            nhist=nhist,
+            nhand=nhand,
+            num_shared_attn_layers=num_shared_attn_layers,
+            relative=relative,
+            rotation_format=rotation_format,
+            denoise_timesteps=denoise_timesteps,
+            denoise_model=denoise_model,
+            lv2_batch_size=lv2_batch_size
+        )
+        # Vision-language encoder, runs only once
+        self.encoder = Encoder2D(
+            backbone=backbone,
+            output_level=output_level,
+            upsample=upsample,
+            embedding_dim=embedding_dim,
+            nhist=nhist * nhand,
+            num_attn_heads=num_attn_heads,
+            num_vis_instr_attn_layers=num_vis_instr_attn_layers,
+            fps_subsampling_factor=fps_subsampling_factor,
+            finetune_backbone=finetune_backbone,
+            finetune_text_encoder=finetune_text_encoder,
+            rot_dim=3 if rotation_format == 'euler' else 6
+        )
+
+        # Action decoder, runs at every denoising timestep
+        self.prediction_head = TransformerHead2D(
+            embedding_dim=embedding_dim,
+            nhist=nhist * nhand,
+            num_attn_heads=num_attn_heads,
+            num_shared_attn_layers=num_shared_attn_layers,
+            rot_dim=3 if rotation_format == 'euler' else 6
+        )
+
+
+class TransformerHead2D(TransformerHead):
+
+    def __init__(self,
+                 embedding_dim=60,
+                 num_attn_heads=8,
+                 num_shared_attn_layers=4,
+                 nhist=3,
+                 rotary_pe=False,
+                 rot_dim=6):
+        super().__init__(
+            embedding_dim=embedding_dim,
+            num_attn_heads=num_attn_heads,
+            num_shared_attn_layers=num_shared_attn_layers,
+            nhist=nhist,
+            rotary_pe=rotary_pe,
+            rot_dim=rot_dim
+        )
+
+        del self.relative_pe_layer
+
+    def forward(self, traj_feats, trajectory, timesteps,
+                rgb3d_feats, rgb3d_pos, rgb2d_feats, rgb2d_pos,
+                instr_feats, instr_pos, proprio_feats,
+                fps_scene_feats, fps_scene_pos):
+        """
+        Arguments:
+            traj_feats: (B, trajectory_length, nhand, F)
+            trajectory: (B, trajectory_length, nhand, 3+6+X)
+            timesteps: (B, 1)
+            rgb3d_feats: (B, N, F)
+            rgb3d_pos: (B, N, 3)
+            rgb2d_feats: (B, N2d, F)
+            rgb2d_pos: (B, N2d, 3)
+            instr_feats: (B, L, F)
+            instr_pos: (B, L, 3)
+            proprio_feats: (B, nhist*nhand, F)
+            fps_scene_feats: (B, M, F), M < N
+            fps_scene_pos: (B, M, 3)
+
+        Returns:
+            list of (B, trajectory_length, nhand, 3+6+X)
+        """
+        _, traj_len, nhand, _ = trajectory.shape
+
+        # Trajectory features
+        if nhand > 1:
+            traj_feats = traj_feats + self.hand_embed.weight[None, None]
+        traj_feats = einops.rearrange(traj_feats, 'b l h c -> b (l h) c')
+        trajectory = einops.rearrange(trajectory, 'b l h c -> b (l h) c')
+
+        # Trajectory features cross-attend to context features
+        traj_time_pos = self.traj_time_emb(
+            torch.arange(0, traj_len, device=traj_feats.device)
+        )[None, None].repeat(len(traj_feats), 1, nhand, 1)
+        traj_time_pos = einops.rearrange(traj_time_pos, 'b l h c -> b (l h) c')
+        traj_feats = self.traj_lang_attention(
+            seq1=traj_feats,
+            seq2=instr_feats,
+            seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
+        )[-1]
+        traj_feats = traj_feats + traj_time_pos
+        traj_xyz = trajectory[..., :3]
+
+        # Denoising timesteps' embeddings
+        time_embs = self.encode_denoising_timestep(
+            timesteps, proprio_feats
+        )
+
+        # Concatenate scene feature and language features
+        rgb3d_feats = torch.cat((rgb3d_feats, instr_feats), 1)
+
+        # Self attention among gripper and sampled context
+        traj_feats = self.self_attn(
+            seq=traj_feats,
+            seq0=rgb3d_feats,
+            ada_sgnl=time_embs
+        )[-1]
+
+        # Rotation head
+        rotation = self.predict_rot(
+            traj_feats, rgb3d_feats, None, None,
+            time_embs, traj_feats.shape[1]
+        )
+
+        # Position head
+        position, position_features = self.predict_pos(
+            traj_feats, rgb3d_feats, None, None,
+            time_embs, traj_feats.shape[1]
+        )
+
+        # Openess head from position head
+        openess = self.openess_predictor(position_features)
+
+        return [
+            torch.cat((position, rotation, openess), -1)
+                 .unflatten(1, (traj_len, nhand))
+        ]

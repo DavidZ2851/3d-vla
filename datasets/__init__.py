@@ -1,0 +1,38 @@
+from .calvin import CALVINDataset
+from .rlbench import (
+    Peract2Dataset,
+    Peract2SingleCamDataset,
+    Peract2Dataset3cam2Dwrist,
+    PeractDataset,
+    PeractTwoCamDataset,
+    SinglePeract2Dataset,
+    Peract2AllDataset,
+    DatPeractDataset,
+    DatPeractTwoCamDataset
+)
+from .geniesim3 import GenieSim3Dataset
+
+
+def fetch_dataset_class(dataset_name):
+    """Fetch the dataset class based on the dataset name."""
+    dataset_classes = {
+        "Peract2_3dfront_3dwrist": Peract2Dataset,
+        "Peract2_3dfront": Peract2SingleCamDataset,
+        "Peract2_3dfront_2dwrist": Peract2Dataset3cam2Dwrist,
+        "Peract": PeractDataset,
+        "PeractTwoCam": PeractTwoCamDataset,
+        "PeractDat": DatPeractDataset,
+        "PeractDatTwoCam": DatPeractTwoCamDataset,
+        'Calvin': CALVINDataset,
+        'Calvin10th': CALVINDataset,
+        "Peract2TCSingle": SinglePeract2Dataset,
+        "Peract2All": Peract2AllDataset
+        ,
+        "GenieSim3": GenieSim3Dataset,
+        "GenieSim3.0": GenieSim3Dataset,
+    }
+    
+    if dataset_name not in dataset_classes:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    
+    return dataset_classes[dataset_name]
