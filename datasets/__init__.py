@@ -12,7 +12,6 @@ from .rlbench import (
 )
 from .geniesim3 import GenieSim3Dataset
 
-
 def fetch_dataset_class(dataset_name):
     """Fetch the dataset class based on the dataset name."""
     dataset_classes = {
@@ -26,8 +25,7 @@ def fetch_dataset_class(dataset_name):
         'Calvin': CALVINDataset,
         'Calvin10th': CALVINDataset,
         "Peract2TCSingle": SinglePeract2Dataset,
-        "Peract2All": Peract2AllDataset
-        ,
+        "Peract2All": Peract2AllDataset,
         "GenieSim3": GenieSim3Dataset,
         "GenieSim3.0": GenieSim3Dataset,
     }

@@ -2,7 +2,7 @@ import json
 
 from torch.utils.data import Dataset
 
-from .utils import to_tensor, read_zarr_with_cache, to_relative_action, convert_quaternion_format
+from .utils import to_tensor, read_zarr_with_cache, to_relative_action
 
 
 class BaseDataset(Dataset):
@@ -16,21 +16,13 @@ class BaseDataset(Dataset):
         relative_action=False,  # whether to return relative actions
         mem_limit=8,  # cache limit per dataset class in GigaBytes
         actions_only=False,  # return actions without observations
-        chunk_size=4,  # chunk size for zarr
-        input_quat_format=None  # quaternion format in input data: 'wxyz' or 'xyzw'. If None, uses self.quat_format
+        chunk_size=4  # chunk size for zarr
     ):
         super().__init__()
         self.copies = self.train_copies if copies is None else copies
         self._relative_action = relative_action
         self._actions_only = actions_only
         self.chunk_size = chunk_size
-        if input_quat_format is None:
-            input_quat_format = getattr(self, 'quat_format', 'wxyz')
-        self._input_quat_format = input_quat_format
-        self._output_quat_format = getattr(self, 'output_quat_format', 'wxyz')
-        self._needs_quat_conversion = (self._input_quat_format != self._output_quat_format)
-        if self._needs_quat_conversion:
-            print(f"Dataset will convert quaternions from {self._input_quat_format} to {self._output_quat_format}")
 
         # Load instructions
         self._instructions = self._load_instructions(instructions)
@@ -65,38 +57,18 @@ class BaseDataset(Dataset):
         return self._get_attr_by_idx(idx, key, True)
 
     def _get_proprioception(self, idx):
-        prop = self._get_attr_by_idx(idx, 'proprioception', False)
-        return prop
+        return self._get_attr_by_idx(idx, 'proprioception', False)
 
     def _get_action(self, idx):
         if self._relative_action:
             if 'rel_action' in self.annos:
-                action = self._get_attr_by_idx(idx, 'rel_action', False)
-                if self._needs_quat_conversion:
-                    action = convert_quaternion_format(action, self._input_quat_format, self._output_quat_format)
-                return action
+                return self._get_attr_by_idx(idx, 'rel_action', False)
             else:
                 action = self._get_attr_by_idx(idx, 'action', False)
-                if self._needs_quat_conversion:
-                    action = convert_quaternion_format(action, self._input_quat_format, self._output_quat_format)
-                prop = self._get_proprioception(idx)  # already converted if needed
-                # For single-hand: prop is (chunk_size, nhist, 8) -> last history step is (chunk_size, 1, 8)
-                # For multi-hand: prop is (chunk_size, nhist, nhand, 8) -> last history is (chunk_size, nhand, 1, 8)
-                if len(prop.shape) == 3:
-                    anchor_action = prop[:, -1:, :]  # (chunk_size, 1, 8)
-                elif len(prop.shape) == 4:
-                    anchor_action = prop[:, -1, :, :].unsqueeze(-2)  # (chunk_size, nhand, 1, 8)
-                    if len(action.shape) == 4:
-                        action = action.transpose(1, 2)  # (chunk_size, nhand, T, 8)
-                else:
-                    raise ValueError(f"Unexpected proprioception shape: {prop.shape}")
-                action = to_relative_action(action, anchor_action, self._output_quat_format)
-                if len(prop.shape) == 4 and len(action.shape) == 4:
-                    action = action.transpose(1, 2)  # (chunk_size, T, nhand, 8)
+                prop = self._get_proprioception(idx)[[-1]]
+                action = to_relative_action(action, prop, self.quat_format)
         else:
             action = self._get_attr_by_idx(idx, 'action', False)
-            if self._needs_quat_conversion:
-                action = convert_quaternion_format(action, self._input_quat_format, self._output_quat_format)
         return action
 
     def __getitem__(self, idx):

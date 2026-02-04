@@ -254,50 +254,35 @@ class FeatureFusionBlock(nn.Module):
         self.resConfUnit1 = ResidualConvUnit(features, activation, bn)
         self.resConfUnit2 = ResidualConvUnit(features, activation, bn)
 
-    def forward_original(self, *xs):
-        """Forward pass.
-
-        Returns:
-            tensor: output
-        """
-        output = xs[0]
-
-        if len(xs) == 2:
-            output = output + self.resConfUnit1(xs[1])
-
-        output = self.resConfUnit2(output)
-
-        output = nn.functional.interpolate(
-            output, scale_factor=2, mode="bilinear",
-            align_corners=self.align_corners
-        )
-
-        output = self.out_conv(output)
-
-        return output
-    
     def forward(self, *xs):
         """Forward pass.
+
         Returns:
             tensor: output
         """
         output = xs[0]
+
         if len(xs) == 2:
-            res = self.resConfUnit1(xs[1])
-            if output.shape[-2:] != res.shape[-2:]:
+            lateral = xs[1]
+            if output.shape[-2:] != lateral.shape[-2:]:
                 output = nn.functional.interpolate(
                     output, 
-                    size=res.shape[-2:], 
+                    size=lateral.shape[-2:], 
                     mode="bilinear", 
-                    align_corners=False
+                    align_corners=self.align_corners
                 )
-            output = output + res
+            output = output + self.resConfUnit1(lateral)
+            # output = output + self.resConfUnit1(xs[1])  # TODO: for debug shape mismatch, was only this line
+
         output = self.resConfUnit2(output)
+
         output = nn.functional.interpolate(
             output, scale_factor=2, mode="bilinear",
             align_corners=self.align_corners
         )
+
         output = self.out_conv(output)
+
         return output
 
 
@@ -325,7 +310,7 @@ if __name__ == "__main__":
     }
     from time import time
     t = time()
-    with torch.autocast(device_type="cuda", dtype=torch.float32):  # TODO: for debug bfloat16
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for _ in range(100):
             out = model(x)
     print(time() - t)

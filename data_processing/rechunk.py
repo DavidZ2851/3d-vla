@@ -14,9 +14,9 @@ def parse_arguments():
     # Tuples: (name, type, default)
     arguments = [
         # Dataset/loader arguments
-        ('src', str, '/data/user_data/ngkanats/zarr_datasets/Peract2_dense_zarr/train.zarr'),
-        ('tgt', str, '/data/user_data/ngkanats/zarr_datasets/Peract2_dense_zarr/train_rechunked4.zarr'),
-        ('chunk_size', int, 4),
+        ('src', str, '/data/group_data/katefgroup/VLA/zarr_datasets/CALVIN_zarr/val.zarr'),
+        ('tgt', str, '/data/group_data/katefgroup/VLA/zarr_datasets/CALVIN_zarr/val_rechunked8.zarr'),
+        ('chunk_size', int, 8),
         ('shuffle', str2bool, False)
     ]
     for arg in arguments:
@@ -40,6 +40,10 @@ def rechunk_zarr_group(
         inds = np.arange(len(old_group['action']))
 
     # Create new Zarr group (overwrite if exists)
+    if os.path.exists(new_zarr_path):  # quit if exists
+        print(f"{new_zarr_path} already exists, exiting.")
+        import sys
+        sys.exit(1)
     if os.path.exists(new_zarr_path):
         print(f"Deleting existing {new_zarr_path}")
         import shutil

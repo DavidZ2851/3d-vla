@@ -5,8 +5,6 @@ from .rlbench import RLBenchTrainTester
 
 def fetch_train_tester(dataset_name):
     dataset_name = dataset_name.lower()
-    if 'geniesim' in dataset_name:
-        return RLBenchTrainTester
     if 'peract2' in dataset_name:
         return RLBenchTrainTester
     if 'peract' in dataset_name:
@@ -15,4 +13,6 @@ def fetch_train_tester(dataset_name):
         return RLBenchTrainTester
     if 'calvin' in dataset_name:
         return CALVINTrainTester
+    if 'geniesim' in dataset_name:
+        return RLBenchTrainTester
     return None

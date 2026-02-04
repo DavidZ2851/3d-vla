@@ -21,7 +21,7 @@ def parse_arguments():
     # Tuples: (name, type, default)
     arguments = [
         ('root', str, '/data/group_data/katefgroup/VLA/calvin_dataset/task_ABC_D'),
-        ('tgt', str, '/data/user_data/ngkanats/zarr_datasets/CALVIN_zarr'),
+        ('tgt', str, '/data/group_data/katefgroup/VLA/zarr_datasets/calvin_zarr'),
         ('store_every', int, 1),
         ('store_val', int, 1),
         ('store_instructions', int, 1)

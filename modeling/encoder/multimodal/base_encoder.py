@@ -139,51 +139,6 @@ class Encoder(nn.Module):
     def encode_florence2(self, rgb3d, rgb2d, pcd, text):
         """
         Compute visual features/pos embeddings at different scales.
-        """
-        # rgb3d shape: (B, ncam, 3, H, W)
-        B, ncam, C, H, W = rgb3d.shape
-        
-        import math
-        feat_h = int(math.ceil(H / 32)) # 400 -> 13
-        feat_w = int(math.ceil(W / 32)) # 640 -> 20
-
-        rgb3d = self.normalize(rgb3d)
-        rgb3d_feats, instr_feats = self.backbone(rgb3d, text, output_hidden_states=True)
-        
-        # Total_Tokens = ncam * feat_h * feat_w
-        instr_feats = self.cond_linear(self.cond_norm(instr_feats))
-        
-        nc = rgb3d.shape[1]
-    
-        rgb3d_feats = self.vit_fpn({
-            'res5': einops.rearrange(rgb3d_feats[:, 3], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=feat_h, w=feat_w),
-            'res4': einops.rearrange(rgb3d_feats[:, 2], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=feat_h, w=feat_w),
-            'res3': einops.rearrange(rgb3d_feats[:, 1], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=feat_h, w=feat_w),
-            'res2': einops.rearrange(rgb3d_feats[:, 0], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=feat_h, w=feat_w)
-        })
-        _, _, out_h, out_w = rgb3d_feats.shape
-        
-        rgb3d_feats = einops.rearrange(rgb3d_feats, "(b nc) c h w -> b (nc h w) c", nc=nc)
-
-        num_cameras = pcd.shape[1]
-        
-        pcd = F.interpolate(
-            einops.rearrange(pcd, "bt ncam c h w -> (bt ncam) c h w"),
-            (out_h, out_w),
-            mode='bilinear'
-        )
-        
-        # Merge different cameras
-        pcd = einops.rearrange(
-            pcd,
-            "(bt ncam) c h w -> bt (ncam h w) c", ncam=num_cameras
-        )
-        
-        return rgb3d_feats, None, pcd, instr_feats
-
-    def encode_florence2_original(self, rgb3d, rgb2d, pcd, text):
-        """
-        Compute visual features/pos embeddings at different scales.
 
         Args:
             - rgb3d: (B, ncam3d, 3, H, W), rgb obs of 3D cameras

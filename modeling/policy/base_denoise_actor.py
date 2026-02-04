@@ -26,7 +26,7 @@ class DenoiseActor(nn.Module):
                  # Decoder arguments
                  num_shared_attn_layers=4,
                  relative=False,
-                 rotation_format='quat_wxyz',
+                 rotation_format='quat_xyzw',
                  # Denoising arguments
                  denoise_timesteps=100,
                  denoise_model="ddpm",
@@ -147,7 +147,6 @@ class DenoiseActor(nn.Module):
 
     def compute_trajectory(self, trajectory_mask,
                            rgb3d, rgb2d, pcd, instruction, proprio):
-        # NOTE: This function is only called for evaluation (train. validation, test) and inference
         # Encode observations, states, instructions
         fixed_inputs = self.encode_inputs(
             rgb3d, rgb2d, pcd, instruction, proprio
@@ -188,7 +187,7 @@ class DenoiseActor(nn.Module):
         gt_openess = gt_trajectory[..., -1:]
         gt_trajectory = gt_trajectory[..., :-1]
         # Normalize all pos
-        gt_trajectory = self.normalize_pos(gt_trajectory)  # NOTE: this is the only line we normalize gt trajectory
+        gt_trajectory = self.normalize_pos(gt_trajectory)
         # Convert rotation parametrization
         _, traj_len, nhand, _ = gt_trajectory.shape
         gt_trajectory = self.convert_rot(
@@ -223,38 +222,28 @@ class DenoiseActor(nn.Module):
                 noisy_trajectory,
                 timesteps, fixed_inputs
             )
-            loss_dict = {'pos':0, 'rot':0, 'openness':0, 'total':0}
+
             # Compute loss
             for layer_pred in pred:
                 pos = layer_pred[..., :3]
                 rot = layer_pred[..., 3:-1]
                 openess = layer_pred[..., -1:]
-                denoise_target = self.position_scheduler.prepare_target(noise, gt_trajectory)
-                pos_target = denoise_target[..., :3]
-                rot_target = denoise_target[..., 3:]
-                pos_loss = F.l1_loss(pos, pos_target, reduction='mean')
-                rot_loss = F.l1_loss(rot, rot_target, reduction='mean')
-                openness_loss = F.binary_cross_entropy_with_logits(openess, gt_openess)
+                denoise_target = self.position_scheduler.prepare_target(
+                    noise, gt_trajectory
+                )
                 loss = (
-                    30 * pos_loss
-                    + 10 * rot_loss
-                    + 1 * openness_loss
+                    30 * F.l1_loss(pos, denoise_target[..., :3], reduction='mean')
+                    + 10 * F.l1_loss(rot, denoise_target[..., 3:], reduction='mean')
+                    + F.binary_cross_entropy_with_logits(openess, gt_openess)
                 )
                 total_loss = total_loss + loss
-                loss_dict['pos'] += pos_loss
-                loss_dict['rot'] += rot_loss
-                loss_dict['openness'] += openness_loss
-                
-        loss_dict['pos'] /= self._lv2_batch_size
-        loss_dict['rot'] /= self._lv2_batch_size
-        loss_dict['openness'] /= self._lv2_batch_size
-        loss_dict['total'] = total_loss / self._lv2_batch_size
-        return total_loss / self._lv2_batch_size, loss_dict
+        return total_loss / self._lv2_batch_size
 
     def normalize_pos(self, signal):
         _min = self.workspace_normalizer[0]
         _max = self.workspace_normalizer[1]
         diff = _max - _min
+
         out = signal.clone()
         out[..., :self.nrm_dim] = (
             (signal[..., :self.nrm_dim] - _min) / diff * 2.0
@@ -502,6 +491,7 @@ class TransformerHead(nn.Module):
             list of (B, trajectory_length, nhand, 3+6+X)
         """
         _, traj_len, nhand, _ = trajectory.shape
+
         # Trajectory features
         if nhand > 1:
             traj_feats = traj_feats + self.hand_embed.weight[None, None]

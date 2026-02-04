@@ -27,39 +27,18 @@ def read_zarr_with_cache(fname, mem_gb=16):
     return zarr.open_group(cached_store, mode="r")
 
 
-def convert_quaternion_format(data, from_format: str = 'wxyz', to_format: str = 'xyzw', *, inplace: bool = True):
-    """
-    Convert quaternion format between wxyz and xyzw.
-    Args:
-        data: Tensor with shape (..., 8) where indices 3:7 contain quaternion
-              or shape (..., 7) where indices 3:7 contain quaternion
-    """
-    if from_format == to_format:
-        return data
-    if not inplace:
-        data = data.clone()
-    quat = data[..., 3:7].clone()
-    if from_format == 'wxyz' and to_format == 'xyzw':
-        data[..., 3:7] = quat[..., [1, 2, 3, 0]]  # [x, y, z, w]
-    elif from_format == 'xyzw' and to_format == 'wxyz':
-        data[..., 3:7] = quat[..., [3, 0, 1, 2]]  # [w, x, y, z]
-    else:
-        raise ValueError(f"Invalid conversion: {from_format} -> {to_format}")
-    return data
-
-
 def to_relative_action(actions, anchor_action, qform='xyzw'):
     """
     Compute delta actions where the first delta is relative to anchor,
     and subsequent deltas are relative to the previous timestep.
 
     Args:
-        actions: (B, nhands, T, 8)  — future trajectory
-        anchor_action: (B, nhands, 1, 8) — current pose to treat as timestep -1
+        actions: (..., N, 8)  — future trajectory
+        anchor_action: (..., 1, 8) — current pose to treat as timestep -1
         qform: 'xyzw' or 'wxyz' — quaternion format
 
     Returns:
-        delta_actions: (B, nhands, N, 8)
+        delta_actions: (..., N, 8)
     """
     assert actions.shape[-1] == 8
     # Stitch anchor in front and shift everything by one
@@ -82,4 +61,4 @@ def to_relative_action(actions, anchor_action, qform='xyzw'):
 
     gripper = actions[..., -1:]
 
-    return torch.cat([rel_pos, rel_orn, gripper], -1)  # (B, nhands, T, 8)
+    return torch.cat([rel_pos, rel_orn, gripper], -1)  # (..., N, 8)

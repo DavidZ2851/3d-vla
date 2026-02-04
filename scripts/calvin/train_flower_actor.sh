@@ -1,21 +1,37 @@
+#!/bin/bash
+#SBATCH --job-name=flowervla
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=400G
+#SBATCH --gres=gpu:1
+#SBATCH --time=48:00:00
+#SBATCH --partition=general
+#SBATCH --output=/data/user_data/%u/logs/%x_%j.out
+#SBATCH --error=/data/user_data/%u/logs/%x_%j.err
+#SBATCH --constraint="L40|L40S"
+
+export WANDB_MODE=online   # or "offline" / "disabled"
+export WANDB_API_KEY=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
+
 main_dir=CALVIN
 
-DATA_PATH=/data/user_data/ngkanats
+DATA_PATH=/data/group_data/katefgroup/VLA
 
-train_data_dir=$DATA_PATH/zarr_datasets/CALVIN_10th_zarr/train_rechunked8.zarr
-eval_data_dir=$DATA_PATH/zarr_datasets/CALVIN_zarr/val_rechunked8.zarr
-train_instructions=instructions/calvin/train_instructions.json
+train_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/val_rechunked8_safe.zarr  # TODO: just for debug
+eval_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/val_rechunked8_safe.zarr
+train_instructions=instructions/calvin/val_instructions.json  # TODO: just for debug
 val_instructions=instructions/calvin/val_instructions.json
 
 dataset=Calvin10th
-num_workers=4
+num_workers=1
 memory_limit=6
 B=8
 B_val=8
 chunk_size=8
 
 # Training/testing arguments, change these for HPT
-val_freq=5000
+val_freq=100  # 5000
 eval_only=false
 lr=2e-5
 lr_scheduler=tristage_flower

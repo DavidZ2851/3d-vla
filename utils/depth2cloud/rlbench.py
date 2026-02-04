@@ -41,20 +41,7 @@ class RLBenchDepth2Cloud:
         # depth is (B, H, W), extrinsics (B, 4, 4), intrinsics (B, 3, 3)
         # output is (B, 3, H, W)
         b, h, w = depth.shape
-        #uv1 = self.uniforms[None]  # (1, 3, H, W)  # TODO: for custom image shape
-        y_range = torch.arange(h, dtype=torch.float32, device=depth.device)
-        x_range = torch.arange(w, dtype=torch.float32, device=depth.device)
-        # indexing='xy' 对应 (W, H)，生成的 x 是宽方向，y 是高方向
-        # 注意：这里我们要对应你的旧代码逻辑 (u, v)，即 (x, y)
-        x, y = torch.meshgrid(x_range, y_range, indexing='xy') 
-        # --- 稳妥的纯 Torch 写法 (对齐你原来的 numpy 逻辑) ---
-        u = torch.arange(w, dtype=torch.float32, device=depth.device).unsqueeze(0).repeat(h, 1)
-        v = torch.arange(h, dtype=torch.float32, device=depth.device).unsqueeze(1).repeat(1, w)
-        ones = torch.ones_like(u)
-        
-        # 组合成 (3, H, W) 并增加 Batch 维度 -> (1, 3, H, W)
-        uv1 = torch.stack([u, v, ones], dim=0).unsqueeze(0)
-        uv1 = uv1.to(depth.dtype)
+        uv1 = self.uniforms[None]  # (1, 3, H, W)
         pc = uv1 * depth[:, None]  # (B, 3, H, W)
         pc = torch.cat([pc, torch.ones_like(pc[:, :1])], dim=1)  # (B, 4, H, W)
         pc = pc.reshape(b, 4, -1)  # (B, 4, HW)

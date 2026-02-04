@@ -12,9 +12,8 @@ from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange, tqdm
-
 import wandb
-WANDB_AVAILABLE = True
+
 from modeling.encoder.text import fetch_tokenizers
 from ..common_utils import count_parameters
 from ..depth2cloud import fetch_depth2cloud
@@ -22,7 +21,7 @@ from ..data_preprocessors import fetch_data_preprocessor
 from ..ema import EMA
 from ..schedulers import fetch_scheduler
 from .utils import compute_metrics
-
+from .. import pytorch3d_transforms as pytorch3d_transforms
 
 class BaseTrainTester:
     """Train/test a trajectory optimization algorithm."""
@@ -42,13 +41,12 @@ class BaseTrainTester:
 
         if dist.get_rank() == 0 and not self.args.eval_only:
             self.writer = SummaryWriter(log_dir=args.log_dir)
-            if WANDB_AVAILABLE:
-                wandb.init(
-                    project="3d-vla",
-                    name=str(args.run_log_dir) if hasattr(args, 'run_log_dir') else None,
-                    dir=str(args.log_dir),
-                    resume="allow"
-                )
+            wandb.init(
+                project="3d-vla",
+                name=str(args.run_log_dir) if hasattr(args, 'run_log_dir') else None,
+                dir=str(args.log_dir),
+                resume="allow"
+            )
 
     def get_datasets(self):
         """Initialize datasets."""
@@ -171,7 +169,7 @@ class BaseTrainTester:
             num_workers=self.args.num_workers
         )
 
-        # Loop and compute action min-max for position
+        # Loop and compute action min-max
         min_, max_ = torch.ones(ndims) * 10000, -torch.ones(ndims) * 10000
         for sample in tqdm(data_loader):
             action = sample["action"][..., :ndims].reshape([-1, ndims])
@@ -180,7 +178,6 @@ class BaseTrainTester:
 
         min_ = min_ - self.args.workspace_normalizer_buffer
         max_ = max_ + self.args.workspace_normalizer_buffer
-        #print('[DEBUG] workspace normalizer after relative min max: ', min_, max_)
 
         return nn.Parameter(torch.stack([min_, max_]), requires_grad=False)
 
@@ -241,7 +238,7 @@ class BaseTrainTester:
         self.tokenizer = fetch_tokenizers(self.args.backbone)
         if not os.path.exists(self.args.checkpoint):
             normalizer = self.get_workspace_normalizer()
-            model.workspace_normalizer.copy_(normalizer)  # update normalizer min max to floweractor model
+            model.workspace_normalizer.copy_(normalizer)
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
         # Get optimizer
@@ -307,25 +304,9 @@ class BaseTrainTester:
                 train_sampler.set_epoch(epoch)
                 iter_loader = iter(train_loader)
                 sample = next(iter_loader)
-            
-            loss_dict = self.train_one_step(model, optimizer, scaler, lr_scheduler, sample)
+
+            self.train_one_step(model, optimizer, scaler, lr_scheduler, sample)
             self.ema.step(model, ema_model, self.args.use_ema, step_id)
-
-            values = {'train/mean/'+k: v.mean().item() for k, v in loss_dict.items()}
-            if dist.get_rank() == 0:
-                if step_id > -1:
-                    if WANDB_AVAILABLE and wandb.run is not None:
-                        wandb.log(values, step=step_id)
-
-            if (step_id + 1) % 100 == 0 and dist.get_rank() == 0:
-                model.eval()
-                self.evaluate_nsteps(
-                    ema_model if self.args.use_ema else model,
-                    train_loader, step_id,
-                    val_iters=10,
-                    split='train'
-                )
-                model.train()
 
             if (step_id + 1) % self.args.val_freq == 0 and dist.get_rank() == 0:
                 print("Train evaluation.......")
@@ -336,17 +317,18 @@ class BaseTrainTester:
                     val_iters=10,
                     split='train'
                 )
-                print("Test evaluation.......")
-                new_loss = self.evaluate_nsteps(
-                    ema_model if self.args.use_ema else model,
-                    val_loader, step_id,
-                    val_iters=1250
-                )
-                # save model
-                best_loss = self.save_checkpoint(
-                    model, ema_model, optimizer, step_id,
-                    new_loss, best_loss
-                )
+                # TODO: for debug, let's skip validation
+                # print("Test evaluation.......")
+                # new_loss = self.evaluate_nsteps(
+                #     ema_model if self.args.use_ema else model,
+                #     val_loader, step_id,
+                #     val_iters=1250
+                # )
+                # # save model
+                # best_loss = self.save_checkpoint(
+                #     model, ema_model, optimizer, step_id,
+                #     new_loss, best_loss
+                # )
                 model.train()
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
@@ -358,22 +340,23 @@ class BaseTrainTester:
 
     def _model_forward(self, model, sample, training=True):
         action, action_mask, rgbs, rgb2d, pcds, instr, prop = self.prepare_batch(
-            sample, augment=False
+            sample, augment=training
         )
         if self.args.pre_tokenize:
             instr = self.tokenizer(instr).cuda(non_blocking=True)
-        with torch.autocast(device_type="cuda", dtype=torch.float32):  # TODO: for debug bfloat16
-            return model(
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            out = model(
                 action, action_mask, rgbs, rgb2d, pcds, instr, prop,
                 run_inference=not training
-            )  # training: out, loss_dict; inference: unnormalized relative trajectory
+            )
+        return out  # loss if training, else action
 
     def train_one_step(self, model, optimizer, scaler, lr_scheduler, sample):
         """Run a single training step."""
         optimizer.zero_grad()
 
         # Forward pass
-        loss, loss_dict = self._model_forward(model, sample)
+        loss = self._model_forward(model, sample)
 
         # Backward pass
         scaler.scale(loss).backward()
@@ -388,7 +371,6 @@ class BaseTrainTester:
 
         # Step the lr scheduler
         lr_scheduler.step()
-        return loss_dict
 
     @torch.inference_mode()
     def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val'):
@@ -402,19 +384,34 @@ class BaseTrainTester:
                 break
 
             pred_action = self._model_forward(model, sample, training=False)
-            gt_action = sample["action"].cuda(non_blocking=True)  # unnormalized relative action
+            gt_action = sample["action"].cuda(non_blocking=True)
+            # TODO: for debug, let's only compare relative results
+            # geniesim3.0 dataset
+            current_proprio = sample["proprioception"].cuda(non_blocking=True)[:, -1:, :, :]
             if self.args.relative_action:
-                proprio_input = sample["proprioception"].cuda(non_blocking=True)  # (batch, history, nhands, 8)
-                last_proprio = proprio_input[:, -1:, :, :]  # (batch, 1, nhands, 8)
                 pred_action = relative_to_absolute(
-                    pred_action,
-                    last_proprio
+                    pred_action,  # (B, T, nhands, 8)
+                    current_proprio,  # (B, 1, nhands, 8)
+                    'wxyz'
                 )
                 gt_action = relative_to_absolute(
-                    gt_action,
-                    last_proprio
+                    gt_action,  # (B, T, nhands, 8)
+                    current_proprio,  # (B, 1, nhands, 8)
+                    'wxyz'
                 )
-            #print("[DEBUG] pred and gt before compute metrics: ", pred_action[0,1,:,:], gt_action[0,1,:,:])
+
+            # calvin dataset
+            # TODO: for calvin debug, let's only compare relative results
+            # if self.args.relative_action:
+            #     pred_action = relative_to_absolute(
+            #         pred_action[:, :, 0],
+            #         sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
+            #     )
+            #     gt_action = relative_to_absolute(
+            #         gt_action[:, :, 0],
+            #         sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
+            #     )
+
             losses, losses_B = compute_metrics(pred_action, gt_action)
 
             # Gather global statistics
@@ -440,10 +437,7 @@ class BaseTrainTester:
             if step_id > -1:
                 for key, val in values.items():
                     self.writer.add_scalar(key, val, step_id)
-                
-                # Log to wandb
-                if WANDB_AVAILABLE and wandb.run is not None:
-                    wandb.log(values, step=step_id)
+                wandb.log(values, step=step_id)
 
             # Also log to terminal
             print(f"Step {step_id}:")
@@ -556,8 +550,48 @@ def base_collate_fn(batch):
 def actions_collate_fn(batch):
     return {"action": torch.cat([item["action"] for item in batch])}
 
+# calvin dataset
+# def relative_to_absolute(action, proprio):
+#     # action (B, T, 8), proprio (B, 1, 7)
+#     pos = proprio[..., :3] + action[..., :3].cumsum(1)
+#     orn = proprio[..., 3:6] + action[..., 3:6].cumsum(1)
+#     orn = (orn + torch.pi) % (2 * torch.pi) - torch.pi
+#     return torch.cat([pos, orn, action[..., 6:]], -1)
+
+# geniesim3.0 dataset
 def relative_to_absolute(action, proprio, qform='wxyz'):
-    from .. import pytorch3d_transforms as pytorch3d_transforms
+    # action (B, T, nhands, 8), proprio (B, 1, nhands, 8)
+    pos = proprio[..., :3] + action[..., :3].cumsum(1)
+    if qform in ['xyzw', 'wxyz']:
+        rel_orn = action[..., 3:7]  # (B, T, 2, 4)
+        curr_orn = proprio[..., 3:7]  # Initial state (B, 1, 2, 4)
+        abs_orns = []
+        num_steps = rel_orn.shape[1]
+        for t in range(num_steps):
+            q_rel = rel_orn[:, t:t+1] 
+            if qform == 'xyzw':
+                q_rel_wxyz = q_rel[..., [3, 0, 1, 2]]
+                curr_orn_wxyz = curr_orn[..., [3, 0, 1, 2]]
+                # absolute_t = relative_t * absolute_{t-1}
+                next_orn_wxyz = pytorch3d_transforms.quaternion_multiply(
+                    q_rel_wxyz, 
+                    curr_orn_wxyz
+                )
+                next_orn = next_orn_wxyz[..., [1, 2, 3, 0]]
+            elif qform == 'wxyz':
+                next_orn = pytorch3d_transforms.quaternion_multiply(q_rel, curr_orn)
+            abs_orns.append(next_orn)
+            curr_orn = next_orn
+        orn = torch.cat(abs_orns, dim=1)
+    elif qform == 'euler':
+        orn = proprio[..., 3:6] + action[..., 3:6].cumsum(1)
+        orn = (orn + torch.pi) % (2 * torch.pi) - torch.pi
+    else:
+        assert False
+    return torch.cat([pos, orn, action[..., -1:]], -1)
+
+def relative_to_absolute_bug(action, proprio, qform='wxyz'):
+    # action (B, T, nhands, 8), proprio (B, 1, nhands, 8)
     pos = proprio[..., :3] + action[..., :3].cumsum(1)
     if qform == 'xyzw':
         # pytorch3d takes wxyz quaternion, the input is xyzw
@@ -573,7 +607,6 @@ def relative_to_absolute(action, proprio, qform='wxyz'):
     elif qform == 'euler':
         orn = proprio[..., 3:6] + action[..., 3:6].cumsum(1)
         orn = (orn + torch.pi) % (2 * torch.pi) - torch.pi
-        return torch.cat([pos, orn, action[..., 6:]], -1)
     else:
         assert False
-    return torch.cat([pos, orn, action[..., 7:]], -1)
+    return torch.cat([pos, orn, action[..., -1:]], -1)

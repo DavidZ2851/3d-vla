@@ -222,7 +222,6 @@ class TransformerHead(nn.Module):
 
         # Concatenate scene feature and language features
         rgb3d_feats = torch.cat((rgb3d_feats, instr_feats), 1)
-        #fake_instr_pos = torch.ones_like(instr_pos) * 100.0  # for debug
         rgb3d_pos = torch.cat((rgb3d_pos, instr_pos), 1)
 
         # Positional embeddings

@@ -185,7 +185,7 @@ def rollout(env, model, task_oracle, subtask, lang, verbose=True):
         # Prepare input
         obs = model.preprocess(obs, env)
         # Forward pass
-        with torch.autocast(device_type="cuda", dtype=torch.float32):  # TODO: for debug bfloat16
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             trajectory = model.step(obs, lang)
         # Execute
         for act_ind in range(trajectory.shape[1]):

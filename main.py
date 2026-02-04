@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+
 import torch
 
 from datasets import fetch_dataset_class
@@ -65,7 +66,6 @@ def parse_arguments():
         ('num_shared_attn_layers', int, 4),
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_xyzw'),
-        ('input_quat_format', str, None),  # quaternion format in input data: 'wxyz' or 'xyzw'. If None, uses dataset default
         ('denoise_timesteps', int, 10),
         ('denoise_model', str, "rectified_flow")
     ]
@@ -82,53 +82,45 @@ def suppress_output_on_non_main():
 
 
 if __name__ == '__main__':
-    rank = int(os.environ.get("LOCAL_RANK", 0))  # or RANK
-    try:
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-        # Arguments
-        args = parse_arguments()
-        print("Arguments:")
-        print(args)
-        print("-" * 100)
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    # Arguments
+    args = parse_arguments()
+    print("Arguments:")
+    print(args)
+    print("-" * 100)
 
-        log_dir = args.base_log_dir / args.exp_log_dir / args.run_log_dir
-        args.log_dir = log_dir
-        log_dir.mkdir(exist_ok=True, parents=True)
-        print("Logging:", log_dir)
-        print(
-            "Available devices (CUDA_VISIBLE_DEVICES):",
-            os.environ.get("CUDA_VISIBLE_DEVICES")
-        )
-        print("Device count:", torch.cuda.device_count())
-        args.local_rank = int(os.environ["LOCAL_RANK"])
-        suppress_output_on_non_main()
+    log_dir = args.base_log_dir / args.exp_log_dir / args.run_log_dir
+    args.log_dir = log_dir
+    log_dir.mkdir(exist_ok=True, parents=True)
+    print("Logging:", log_dir)
+    print(
+        "Available devices (CUDA_VISIBLE_DEVICES):",
+        os.environ.get("CUDA_VISIBLE_DEVICES")
+    )
+    print("Device count:", torch.cuda.device_count())
+    args.local_rank = int(os.environ["LOCAL_RANK"])
+    suppress_output_on_non_main()
 
-        # DDP initialization
-        torch.cuda.set_device(args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
-        torch.backends.cudnn.enabled = True
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    # DDP initialization
+    torch.cuda.set_device(args.local_rank)
+    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-        # Select dataset and model classes
-        dataset_class = fetch_dataset_class(args.dataset)
-        model_class = fetch_model_class(args.model_type)
+    # Select dataset and model classes
+    dataset_class = fetch_dataset_class(args.dataset)
+    model_class = fetch_model_class(args.model_type)
 
-        # Run
-        TrainTester = fetch_train_tester(args.dataset)
-        train_tester = TrainTester(args, dataset_class, model_class)
-        train_tester.main()
+    # Run
+    TrainTester = fetch_train_tester(args.dataset)
+    train_tester = TrainTester(args, dataset_class, model_class)
+    train_tester.main()
 
-        # Safe program termination
-        if torch.distributed.is_initialized():
-            torch.cuda.empty_cache()
-            torch.distributed.destroy_process_group()
-    except Exception:
-        import traceback
-        print(f"Exception in rank {rank}:", file=sys.stderr)
-        traceback.print_exc()
-        sys.stderr.flush()
-        raise
+    # Safe program termination
+    if torch.distributed.is_initialized():
+        torch.cuda.empty_cache()
+        torch.distributed.destroy_process_group()

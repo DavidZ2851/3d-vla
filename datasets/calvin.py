@@ -1,5 +1,6 @@
 from .base import BaseDataset
-
+from .utils import to_relative_action
+import torchvision.transforms as T
 
 class CALVINDataset(BaseDataset):
     """CALVIN dataset."""
@@ -7,6 +8,7 @@ class CALVINDataset(BaseDataset):
     train_copies = 1
     quat_format= 'wxyz'
     camera_inds = None
+    max_samples=13  # TODO: overfit on 104 datapoints
 
     def __init__(
         self,
@@ -28,6 +30,12 @@ class CALVINDataset(BaseDataset):
             chunk_size=chunk_size
         )
 
+    def __len__(self):
+        total_samples = len(self.annos['action']) // self.chunk_size
+        if self.max_samples is not None:
+            return self.copies * min(self.max_samples, total_samples)
+        return self.copies * total_samples
+    
     def _get_task(self, idx):
         return ['calvin'] * self.chunk_size
 
@@ -37,6 +45,18 @@ class CALVINDataset(BaseDataset):
             for t_ in self.annos['instr_id'][idx:idx + self.chunk_size]
         ]
 
+    def _get_action(self, idx):
+        if self._relative_action:
+            if 'rel_action' in self.annos:
+                return self._get_attr_by_idx(idx, 'rel_action', False)
+            else:
+                action = self._get_attr_by_idx(idx, 'action', False)
+                prop = self._get_proprioception(idx)[:,-1:,:]
+                action = to_relative_action(action, prop, self.quat_format)
+        else:
+            action = self._get_attr_by_idx(idx, 'action', False)
+        return action
+    
     def __getitem__(self, idx):
         """
         C is the chunk size.
@@ -52,7 +72,10 @@ class CALVINDataset(BaseDataset):
             - action: (C, T=10, 1, 3+3+1)
         """
         # First detect which copy we fall into
-        idx = idx % (len(self.annos['action']) // self.chunk_size)
+        # idx = idx % (len(self.annos['action']) // self.chunk_size)
+        total_samples = len(self.annos['action']) // self.chunk_size
+        effective_size = min(self.max_samples, total_samples) if self.max_samples is not None else total_samples
+        idx = idx % effective_size
         # and then which chunk
         idx = idx * self.chunk_size
         if self._actions_only:
