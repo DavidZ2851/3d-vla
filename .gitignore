@@ -33,6 +33,7 @@ temp/
 /calvin/
 
 # data directory
+instructions/
 data/
 observations/
 test.py

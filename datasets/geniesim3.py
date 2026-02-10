@@ -10,7 +10,7 @@ class GenieSim3Dataset(BaseDataset):
     train_copies = 1
     quat_format = 'wxyz'
     camera_inds = [0]
-    max_samples=25  # TODO: num of chunks to be used
+    max_samples = 10
 
     def __init__(
         self,
@@ -40,7 +40,7 @@ class GenieSim3Dataset(BaseDataset):
                 self.max_samples = None
 
     def _get_task(self, idx):
-        return ['bimanual_lift_ball'] * self.chunk_size
+        return ['geniesim'] * self.chunk_size
 
     def _get_instr(self, idx):
         # Use instr_id from zarr to map to instructions list

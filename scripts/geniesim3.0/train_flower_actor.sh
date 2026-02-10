@@ -16,27 +16,27 @@ export WANDB_API_KEY=wandb_v1_5XMh8RwiRYiNK9evDg0XSRGb9jr_lNho5y9LpqVyamQhxBkjXl
 
 # ---- Data paths (edit as needed) ----
 DATA_PATH=/data/group_data/katefgroup/VLA
-train_data_dir=$DATA_PATH/zarr_datasets/geniesim3.0_zarr/train_rechunked4.zarr
-eval_data_dir=$DATA_PATH/zarr_datasets/geniesim3.0_zarr/val_rechunked4.zarr
-train_instructions=$DATA_PATH/zarr_datasets/geniesim3.0_zarr/instructions/geniesim3/train_instructions.json
-val_instructions=$DATA_PATH/zarr_datasets/geniesim3.0_zarr/instructions/geniesim3/val_instructions.json
+train_data_dir=$DATA_PATH/zarr_datasets/geniesim3.0_zarr/train_rechunked8.zarr
+eval_data_dir=$DATA_PATH/zarr_datasets/geniesim3.0_zarr/val_rechunked8.zarr
+train_instructions=instructions/geniesim3/train_instructions.json
+val_instructions=instructions/geniesim3/val_instructions.json
 
 
 # ---- Dataset / loader ----
 dataset="GenieSim3.0"
-num_workers=4
+num_workers=32
 memory_limit=8
-B=4
-B_val=4
-chunk_size=4
+B=8
+B_val=8
+chunk_size=8
 
 # ---- Training ----
-val_freq=100
+val_freq=2000
 eval_only=false
-lr=2e-5
+lr=5e-5
 lr_scheduler=tristage_flower
 wd=0.05
-train_iters=50000
+train_iters=200000
 use_compile=false
 use_ema=true
 
@@ -66,7 +66,7 @@ denoise_model=rectified_flow
 
 
 main_dir=geniesim3.0
-run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone
+run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
 checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
 # checkpoint=flower.pth
 

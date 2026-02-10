@@ -300,6 +300,16 @@ class BaseTrainTester:
             except StopIteration:
                 # when the iterator is exhausted, we need to reset it
                 # and increment the epoch
+                if dist.get_rank() == 0:
+                    model.eval()
+                    self.evaluate_nsteps(
+                        ema_model if self.args.use_ema else model,
+                        train_loader, step_id, 
+                        val_iters=10,    
+                        split='train_epoch',
+                        epoch=epoch
+                    )
+                    model.train()
                 epoch += 1
                 train_sampler.set_epoch(epoch)
                 iter_loader = iter(train_loader)
@@ -317,18 +327,18 @@ class BaseTrainTester:
                     val_iters=10,
                     split='train'
                 )
-                # TODO: for debug, let's skip validation
-                # print("Test evaluation.......")
-                # new_loss = self.evaluate_nsteps(
-                #     ema_model if self.args.use_ema else model,
-                #     val_loader, step_id,
-                #     val_iters=1250
-                # )
-                # # save model
-                # best_loss = self.save_checkpoint(
-                #     model, ema_model, optimizer, step_id,
-                #     new_loss, best_loss
-                # )
+                if (step_id + 1) % 20000 == 0:  # frequently evaluate on val and save ckpt
+                    print("Test evaluation.......")
+                    new_loss = self.evaluate_nsteps(
+                        ema_model if self.args.use_ema else model,
+                        val_loader, step_id,
+                        val_iters=500  # was 1250, decrease to prevent timeout on other gpus
+                    )
+                    # save model
+                    best_loss = self.save_checkpoint(
+                        model, ema_model, optimizer, step_id,
+                        new_loss, best_loss
+                    )
                 model.train()
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
@@ -373,7 +383,7 @@ class BaseTrainTester:
         lr_scheduler.step()
 
     @torch.inference_mode()
-    def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val'):
+    def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val', epoch=None):
         """Run a given number of evaluation steps."""
         values = {}
         device = next(model.parameters()).device
@@ -385,33 +395,31 @@ class BaseTrainTester:
 
             pred_action = self._model_forward(model, sample, training=False)
             gt_action = sample["action"].cuda(non_blocking=True)
-            # TODO: for debug, let's only compare relative results
-            # geniesim3.0 dataset
-            current_proprio = sample["proprioception"].cuda(non_blocking=True)[:, -1:, :, :]
-            if self.args.relative_action:
-                pred_action = relative_to_absolute(
-                    pred_action,  # (B, T, nhands, 8)
-                    current_proprio,  # (B, 1, nhands, 8)
-                    'wxyz'
-                )
-                gt_action = relative_to_absolute(
-                    gt_action,  # (B, T, nhands, 8)
-                    current_proprio,  # (B, 1, nhands, 8)
-                    'wxyz'
-                )
-
-            # calvin dataset
-            # TODO: for calvin debug, let's only compare relative results
+            # TODO: skip relative to absolute evaluation for speed
+            # current_proprio = sample["proprioception"].cuda(non_blocking=True)[:, -1:, :, :]
             # if self.args.relative_action:
-            #     pred_action = relative_to_absolute(
-            #         pred_action[:, :, 0],
-            #         sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
-            #     )
-            #     gt_action = relative_to_absolute(
-            #         gt_action[:, :, 0],
-            #         sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
-            #     )
-
+            #     if self.args.rotation_format == 'euler':  # calvin dataset
+            #         pred_action = relative_to_absolute(
+            #             pred_action[:, :, 0],
+            #             sample["proprioception"].cuda(non_blocking=True)[:, :, 0],
+            #             'euler'
+            #         )
+            #         gt_action = relative_to_absolute(
+            #             gt_action[:, :, 0],
+            #             sample["proprioception"].cuda(non_blocking=True)[:, :, 0],
+            #             'euler'
+            #         )
+            #     else:  # geniesim3.0 dataset
+            #         pred_action = relative_to_absolute(
+            #             pred_action,  # (B, T, nhands, 8)
+            #             current_proprio,  # (B, 1, nhands, 8)
+            #             'wxyz' if self.args.rotation_format == 'quat_wxyz' else 'xyzw'
+            #         )
+            #         gt_action = relative_to_absolute(
+            #             gt_action,  # (B, T, nhands, 8)
+            #             current_proprio,  # (B, 1, nhands, 8)
+            #             'wxyz'
+            #         )
             losses, losses_B = compute_metrics(pred_action, gt_action)
 
             # Gather global statistics
@@ -422,14 +430,15 @@ class BaseTrainTester:
                 values[key] = torch.cat([values[key], l.unsqueeze(0)])
 
             # Gather per-task statistics
-            tasks = np.array(sample["task"])
-            for n, l in losses_B.items():
-                for task in np.unique(tasks):
-                    key = f"{split}-loss/{task}/{n}"
-                    l_task = l[tasks == task].mean()
-                    if key not in values:
-                        values[key] = torch.Tensor([]).to(device)
-                    values[key] = torch.cat([values[key], l_task.unsqueeze(0)])
+            # TODO: skip per-task statistics for speed
+            # tasks = np.array(sample["task"])
+            # for n, l in losses_B.items():
+            #     for task in np.unique(tasks):
+            #         key = f"{split}-loss/{task}/{n}"
+            #         l_task = l[tasks == task].mean()
+            #         if key not in values:
+            #             values[key] = torch.Tensor([]).to(device)
+            #         values[key] = torch.cat([values[key], l_task.unsqueeze(0)])
 
         # Log all statistics
         values = {k: v.mean().item() for k, v in values.items()}
@@ -437,6 +446,8 @@ class BaseTrainTester:
             if step_id > -1:
                 for key, val in values.items():
                     self.writer.add_scalar(key, val, step_id)
+                if epoch is not None:
+                    values["epoch"] = epoch
                 wandb.log(values, step=step_id)
 
             # Also log to terminal
@@ -550,17 +561,31 @@ def base_collate_fn(batch):
 def actions_collate_fn(batch):
     return {"action": torch.cat([item["action"] for item in batch])}
 
-# calvin dataset
-# def relative_to_absolute(action, proprio):
-#     # action (B, T, 8), proprio (B, 1, 7)
-#     pos = proprio[..., :3] + action[..., :3].cumsum(1)
-#     orn = proprio[..., 3:6] + action[..., 3:6].cumsum(1)
-#     orn = (orn + torch.pi) % (2 * torch.pi) - torch.pi
-#     return torch.cat([pos, orn, action[..., 6:]], -1)
-
 # geniesim3.0 dataset
-def relative_to_absolute(action, proprio, qform='wxyz'):
+def relative_to_absolute_rough(action, proprio, qform='wxyz'):
     # action (B, T, nhands, 8), proprio (B, 1, nhands, 8)
+    pos = proprio[..., :3] + action[..., :3].cumsum(1)
+    if qform == 'xyzw':
+        # pytorch3d takes wxyz quaternion, the input is xyzw
+        orn = pytorch3d_transforms.quaternion_multiply(
+            action[..., [6, 3, 4, 5]],
+            proprio[..., [6,3,4,5]]
+        )[..., [1, 2, 3, 0]]
+    elif qform == 'wxyz':
+        orn = pytorch3d_transforms.quaternion_multiply(
+            action[..., 3:7],
+            proprio[..., 3:7]
+        )
+    elif qform == 'euler':
+        orn = proprio[..., 3:6] + action[..., 3:6].cumsum(1)
+        orn = (orn + torch.pi) % (2 * torch.pi) - torch.pi
+    else:
+        assert False
+    return torch.cat([pos, orn, action[..., -1:]], -1)
+
+def relative_to_absolute(action, proprio, qform='wxyz'):
+    # wxyz/xyzw: action (B, T, nhands, 8), proprio (B, 1, nhands, 8)
+    # euler: action (B, T, 8), proprio (B, 1, 7)
     pos = proprio[..., :3] + action[..., :3].cumsum(1)
     if qform in ['xyzw', 'wxyz']:
         rel_orn = action[..., 3:7]  # (B, T, 2, 4)
@@ -583,30 +608,10 @@ def relative_to_absolute(action, proprio, qform='wxyz'):
             abs_orns.append(next_orn)
             curr_orn = next_orn
         orn = torch.cat(abs_orns, dim=1)
-    elif qform == 'euler':
+    elif qform == 'euler':  # calvin dataset
         orn = proprio[..., 3:6] + action[..., 3:6].cumsum(1)
         orn = (orn + torch.pi) % (2 * torch.pi) - torch.pi
-    else:
-        assert False
-    return torch.cat([pos, orn, action[..., -1:]], -1)
-
-def relative_to_absolute_bug(action, proprio, qform='wxyz'):
-    # action (B, T, nhands, 8), proprio (B, 1, nhands, 8)
-    pos = proprio[..., :3] + action[..., :3].cumsum(1)
-    if qform == 'xyzw':
-        # pytorch3d takes wxyz quaternion, the input is xyzw
-        orn = pytorch3d_transforms.quaternion_multiply(
-            action[..., [6, 3, 4, 5]],
-            proprio[..., [6,3,4,5]]
-        )[..., [1, 2, 3, 0]]
-    elif qform == 'wxyz':
-        orn = pytorch3d_transforms.quaternion_multiply(
-            action[..., 3:7],
-            proprio[..., 3:7]
-        )
-    elif qform == 'euler':
-        orn = proprio[..., 3:6] + action[..., 3:6].cumsum(1)
-        orn = (orn + torch.pi) % (2 * torch.pi) - torch.pi
+        return torch.cat([pos, orn, action[..., 6:]], -1)
     else:
         assert False
     return torch.cat([pos, orn, action[..., -1:]], -1)
