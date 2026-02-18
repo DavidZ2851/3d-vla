@@ -67,7 +67,8 @@ def parse_arguments():
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_xyzw'),
         ('denoise_timesteps', int, 10),
-        ('denoise_model', str, "rectified_flow")
+        ('denoise_model', str, "rectified_flow"),
+        ('finetune', str2bool, False)  # NOTE: for finetune
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
@@ -84,6 +85,8 @@ def suppress_output_on_non_main():
 if __name__ == '__main__':
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    if torch.cuda.is_available():
+        torch.set_flush_denormal(True)
     # Arguments
     args = parse_arguments()
     print("Arguments:")

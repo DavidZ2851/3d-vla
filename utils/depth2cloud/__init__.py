@@ -11,5 +11,5 @@ def fetch_depth2cloud(dataset_name):
     if 'calvin' in dataset_name:
         return CALVINDepth2Cloud((200, 200))
     if 'geniesim' in dataset_name:
-        return RLBenchDepth2Cloud((256, 256))
+        return RLBenchDepth2Cloud((400, 640))
     return None

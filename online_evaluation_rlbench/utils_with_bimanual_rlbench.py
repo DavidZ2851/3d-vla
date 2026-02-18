@@ -56,7 +56,7 @@ class Mover:
             # Peract2 takes (right, left) action, but we predict (left, right)
             action_collision = action_collision[::-1]
             action_collision = action_collision.ravel()
-            obs, reward, terminate = self._task.step(action_collision, ret_obs=True)
+            obs, reward, terminate = self._task.step(action_collision)  #  ret_obs=True
 
             # Check if we reached the desired pose (planner may be inaccurate)
             l_pos = obs.left.gripper_pose[:3]
@@ -425,7 +425,7 @@ class ReplayRLBenchEnv(RLBenchEnv):
         max_tries=1,
         prediction_len=50,
         num_history=1,
-        record_video=True
+        record_video=False
     ):
         from data_processing.rlbench_utils import keypoint_discovery
         success_rate = 0

@@ -1,3 +1,13 @@
+#!/bin/bash
+#SBATCH --job-name=eval_peract2_finetune_last5tasks
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=500G
+#SBATCH --gres=gpu:1
+#SBATCH --time=48:00:00
+#SBATCH --partition=general
+#SBATCH --output=/data/user_data/ziyinx/logs/%x_%j.out
+#SBATCH --error=/data/user_data/ziyinx/logs/%x_%j.err
+
 exp=bimanual_reproduce
 tasks=(
     bimanual_push_box
@@ -14,19 +24,14 @@ tasks=(
     bimanual_handover_item_easy
     bimanual_take_tray_out_of_oven
 )
-tasks=(
-    bimanual_straighten_rope
-)
-
 
 # Testing arguments
-checkpoint=train_logs/Peract2/reproduce_denoise3d-Peract2_3dfront_3dwrist-C120-B64-lr1e-4-constant-H3-rectified_flow-DT10/best.pth
-checkpoint_alias=reproduce_denoise3d-Peract2_3dfront_3dwrist-C120-B64-lr1e-4-constant-H3-rectified_flow-DT10
-# checkpoint=train_logs/Peract2/flower_actor-Peract2_3dfront_3dwrist-C1024-B8-lr2e-5-constant-H3-rectified_flow-florence2-finetuned_true/best.pth
-# checkpoint_alias=flower_actor-Peract2_3dfront_3dwrist-C1024-B8-lr2e-5-constant-H3-rectified_flow-florence2-finetuned_true
-checkpoint=train_logs/Peract2/k2k_flower_actor_3d-Peract2TCSingle-C120-B16-lr1e-4-constant-H1-rectified_flow-florence2-finetuned_false/best.pth
-checkpoint_alias=k2k_flower_actor_3d-Peract2TCSingle-C120-B16-lr1e-4-constant-H1-rectified_flow-florence2-finetuned_false
-
+# scratch
+# checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/peract2/flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-scratch2_resume/last.pth
+# checkpoint_alias=flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-scratch2_resume
+# finetune
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/peract2/flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-finetune2_resume/last.pth
+checkpoint_alias=flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-finetune2_resume
 num_episodes=100
 max_tries=2
 max_steps=25
@@ -36,7 +41,8 @@ seed=0
 replay=true
 
 # Dataset arguments
-data_dir=/data/group_data/katefgroup/VLA/peract2_raw_squash/train/
+# data_dir=/data/group_data/katefgroup/VLA/peract2_raw_squash/train/  # maybe for replay train data
+data_dir=/data/group_data/katefgroup/datasets/peract2/peract2_test/  # load eval env layouts
 dataset=Peract2_3dfront_3dwrist
 image_size=256,256
 
@@ -45,12 +51,13 @@ model_type=flower_actor_3d
 bimanual=true
 prediction_len=50
 backbone=florence2
-fps_subsampling_factor=4
-embedding_dim=120
-num_attn_heads=8
+fps_subsampling_factor=1  # was 4
+embedding_dim=1024  # was 120
+num_attn_heads=16  # was 8
 num_vis_instr_attn_layers=3
+num_shared_attn_layers=16
 num_history=1
-relative_action=false
+relative_action=true  # NOTE: was false both original eval and train, change to true to align with my train
 rotation_format=quat_xyzw
 denoise_timesteps=5
 denoise_model=rectified_flow
@@ -83,8 +90,9 @@ for ((i=0; i<$num_ckpts; i++)); do
         --relative_action $relative_action \
         --rotation_format $rotation_format \
         --denoise_timesteps $denoise_timesteps \
-        --denoise_model $denoise_model
+        --denoise_model $denoise_model \
+        --num_shared_attn_layers $num_shared_attn_layers
 done
 
 python online_evaluation_rlbench/collect_results.py \
-    --folder eval_logs/$exp/$checkpoint_alias/seed$seed/
+    --folder eval_logs/$exp/$checkpoint_alias/seed$seed

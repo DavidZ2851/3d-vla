@@ -236,8 +236,8 @@ class BaseTrainTester:
         # Get model
         model = self.get_model()
         self.tokenizer = fetch_tokenizers(self.args.backbone)
-        if not os.path.exists(self.args.checkpoint):
-            normalizer = self.get_workspace_normalizer()
+        if self.args.finetune or not os.path.exists(self.args.checkpoint):  # NOTE: for finetune we need normalization for current dataset
+            normalizer = self.get_workspace_normalizer()  # calculate workspace normalizer from loaded dataset
             model.workspace_normalizer.copy_(normalizer)
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
@@ -267,6 +267,10 @@ class BaseTrainTester:
         start_iter, best_loss = 0, None
         if self.args.checkpoint:
             start_iter, best_loss = self.load_checkpoint(model, ema_model, optimizer)
+            if self.args.finetune:  # if finetune, we must use workspace normalizer for current dataset and copy to model
+                model.module.workspace_normalizer.copy_(normalizer)
+                if self.args.use_ema:
+                    ema_model.module.workspace_normalizer.copy_(normalizer)
         print(model.module.workspace_normalizer)
 
         # Eval only
@@ -298,18 +302,17 @@ class BaseTrainTester:
             try:
                 sample = next(iter_loader)
             except StopIteration:
-                # when the iterator is exhausted, we need to reset it
-                # and increment the epoch
-                if dist.get_rank() == 0:
-                    model.eval()
-                    self.evaluate_nsteps(
-                        ema_model if self.args.use_ema else model,
-                        train_loader, step_id, 
-                        val_iters=10,    
-                        split='train_epoch',
-                        epoch=epoch
-                    )
-                    model.train()
+                # when the iterator is exhausted, we need to reset it and increment the epoch
+                # if dist.get_rank() == 0:  # NOTE: comment epoch evaluation as overfitting experiment too slow
+                #     model.eval()
+                #     self.evaluate_nsteps(
+                #         ema_model if self.args.use_ema else model,
+                #         train_loader, step_id, 
+                #         val_iters=10,    
+                #         split='train_epoch',
+                #         epoch=epoch
+                #     )
+                #     model.train()
                 epoch += 1
                 train_sampler.set_epoch(epoch)
                 iter_loader = iter(train_loader)
@@ -330,7 +333,7 @@ class BaseTrainTester:
                 if (step_id + 1) % 20000 == 0:  # frequently evaluate on val and save ckpt
                     print("Test evaluation.......")
                     new_loss = self.evaluate_nsteps(
-                        ema_model if self.args.use_ema else model,
+                        ema_model.module if self.args.use_ema else model.module,
                         val_loader, step_id,
                         val_iters=500  # was 1250, decrease to prevent timeout on other gpus
                     )
@@ -418,7 +421,7 @@ class BaseTrainTester:
             #         gt_action = relative_to_absolute(
             #             gt_action,  # (B, T, nhands, 8)
             #             current_proprio,  # (B, 1, nhands, 8)
-            #             'wxyz'
+            #             'wxyz' if self.args.rotation_format == 'quat_wxyz' else 'xyzw'
             #         )
             losses, losses_B = compute_metrics(pred_action, gt_action)
 
@@ -455,7 +458,7 @@ class BaseTrainTester:
             for key, value in values.items():
                 print(f"{key}: {value:.03f}")
 
-        return -values[f'{split}-losses/mean/traj_pos_acc_001']
+        return values[f'{split}-losses/mean/traj_pos_acc_001']  # NOTE: was negative, seems wrong
 
     def load_checkpoint(self, model, ema_model, optimizer):
         """Load from checkpoint."""
@@ -483,11 +486,15 @@ class BaseTrainTester:
         # EMA weights
         if model_dict.get("ema_weight") is not None:
             ema_model.load_state_dict(model_dict["ema_weight"], strict=True)
-        # Useful for resuming training
-        # if 'optimizer' in model_dict and not self.args.eval_only:
-        #     optimizer.load_state_dict(model_dict["optimizer"])
-        start_iter = model_dict.get("iter", 0)
-        best_loss = model_dict.get("best_loss", None)
+        if self.args.finetune:  # NOTE: for finetune we only load weights but reset iter and best_loss
+            print("=> [FINETUNE MODE] Resetting iter, optimizer, and best_loss.")
+            start_iter = 0
+            best_loss = None
+        else:  # resume
+            start_iter = model_dict.get("iter", 0)
+            best_loss = model_dict.get("best_loss", None)
+            if 'optimizer' in model_dict and not self.args.eval_only:
+                optimizer.load_state_dict(model_dict["optimizer"])
 
         print("=> loaded successfully '{}' (step {})".format(
             self.args.checkpoint, model_dict.get("iter", 0)

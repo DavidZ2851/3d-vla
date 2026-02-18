@@ -15,6 +15,10 @@ class RLBenchDataPreprocessor(DataPreprocessor):
             custom_imsize=custom_imsize,
             depth2cloud=depth2cloud
         )
+        if isinstance(orig_imsize, int):
+            orig_imsize_h, orig_imsize_w = orig_imsize, orig_imsize
+        else:  # Tuple (400, 640) for geniesim3.0 dataset
+            orig_imsize_h, orig_imsize_w = orig_imsize
         self.aug = K.AugmentationSequential(
             # K.RandomHorizontalFlip(p=0.5),
             K.RandomAffine(
@@ -26,7 +30,7 @@ class RLBenchDataPreprocessor(DataPreprocessor):
             ),
             # K.RandomRotation((-5, 5), p=0.3),
             K.RandomResizedCrop(
-                size=(orig_imsize, orig_imsize),
+                size=(orig_imsize_h, orig_imsize_w),
                 scale=(0.95, 1.05),
                 p=0.1
             )

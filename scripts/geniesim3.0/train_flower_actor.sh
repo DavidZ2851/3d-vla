@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=flowervla
+#SBATCH --job-name=flowervla_overfit
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=400G
+#SBATCH --mem=500G
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=general
@@ -15,16 +15,16 @@ export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
 
 # ---- Data paths (edit as needed) ----
-DATA_PATH=/data/group_data/katefgroup/VLA
+DATA_PATH=/data/user_data/ziyinx/datasets
 train_data_dir=$DATA_PATH/zarr_datasets/geniesim3.0_zarr/train_rechunked8.zarr
-eval_data_dir=$DATA_PATH/zarr_datasets/geniesim3.0_zarr/val_rechunked8.zarr
+eval_data_dir=/data/group_data/katefgroup/VLA/zarr_datasets/geniesim3.0_zarr/val_rechunked8.zarr
 train_instructions=instructions/geniesim3/train_instructions.json
 val_instructions=instructions/geniesim3/val_instructions.json
 
 
 # ---- Dataset / loader ----
 dataset="GenieSim3.0"
-num_workers=32
+num_workers=8
 memory_limit=8
 B=8
 B_val=8
@@ -45,10 +45,10 @@ model_type=flower_actor_3d
 bimanual=true
 keypose_only=false
 pre_tokenize=true
-custom_img_size=256
+custom_img_size=256  # unused
 
 backbone=florence2
-finetune_backbone=true
+finetune_backbone=false  # freeze florence2 during pretraining
 finetune_text_encoder=false
 fps_subsampling_factor=1
 
@@ -73,7 +73,7 @@ checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
 ngpus=4
 master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))
 
-torchrun --nproc_per_node $ngpus --master_port $RANDOM \
+torchrun --nproc_per_node $ngpus --master_port $master_port \
     /data/user_data/ziyinx/analogical_manipulation_clean/main.py \
     --train_data_dir $train_data_dir \
     --eval_data_dir $eval_data_dir \
@@ -100,7 +100,6 @@ torchrun --nproc_per_node $ngpus --master_port $RANDOM \
     --bimanual $bimanual \
     --keypose_only $keypose_only \
     --pre_tokenize $pre_tokenize \
-    --custom_img_size $custom_img_size \
     --backbone $backbone \
     --finetune_backbone $finetune_backbone \
     --finetune_text_encoder $finetune_text_encoder \
@@ -114,4 +113,5 @@ torchrun --nproc_per_node $ngpus --master_port $RANDOM \
     --relative_action $relative_action \
     --rotation_format $rotation_format \
     --denoise_timesteps $denoise_timesteps \
-    --denoise_model $denoise_model
+    --denoise_model $denoise_model \
+    #--custom_img_size $custom_img_size  # NOTE: use raw geniesim image size

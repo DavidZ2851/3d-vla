@@ -45,6 +45,7 @@ def parse_arguments():
         ('embedding_dim', int, 144),
         ('num_attn_heads', int, 9),
         ('num_vis_instr_attn_layers', int, 2),
+        ('num_shared_attn_layers', int, 16),
         ('num_history', int, 0),
         # Model arguments: head
         ('relative_action', str2bool, False),
@@ -70,6 +71,7 @@ def load_models(args):
         num_attn_heads=args.num_attn_heads,
         nhist=args.num_history,
         nhand=2 if args.bimanual else 1,
+        num_shared_attn_layers=args.num_shared_attn_layers,
         relative=args.relative_action,
         rotation_format=args.rotation_format,
         denoise_timesteps=args.denoise_timesteps,

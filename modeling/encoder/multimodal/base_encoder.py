@@ -157,22 +157,25 @@ class Encoder(nn.Module):
         # rgb3d_feats = self.cond_linear(self.cond_norm(rgb3d_feats))
         instr_feats = self.cond_linear(self.cond_norm(instr_feats))
         nc = rgb3d.shape[1]
-        h_ = int(math.sqrt(rgb3d_feats.shape[2] // nc))
+        #h_ = int(math.sqrt(rgb3d_feats.shape[2] // nc))  # NOTE: modify this to accept rectangular input
+        h_feat_rgb = math.ceil(rgb3d.shape[-2] / 32)
+        w_feat_rgb = math.ceil(rgb3d.shape[-1] / 32)
         rgb3d_feats = self.vit_fpn({
-            'res5': einops.rearrange(rgb3d_feats[:, 3], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_, w=h_),
-            'res4': einops.rearrange(rgb3d_feats[:, 2], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_, w=h_),
-            'res3': einops.rearrange(rgb3d_feats[:, 1], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_, w=h_),
-            'res2': einops.rearrange(rgb3d_feats[:, 0], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_, w=h_)
+            'res5': einops.rearrange(rgb3d_feats[:, 3], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb),
+            'res4': einops.rearrange(rgb3d_feats[:, 2], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb),
+            'res3': einops.rearrange(rgb3d_feats[:, 1], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb),
+            'res2': einops.rearrange(rgb3d_feats[:, 0], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb)
         })
+        h_feat_pcd, w_feat_pcd = rgb3d_feats.shape[-2:]
         rgb3d_feats = einops.rearrange(rgb3d_feats, "(b nc) c h w -> b (nc h w) c", nc=nc)
 
         # Point cloud
         num_cameras = pcd.shape[1]
-        h_ = int(math.sqrt(rgb3d_feats.shape[1] // num_cameras))
+        #h_ = int(math.sqrt(rgb3d_feats.shape[1] // num_cameras))
         # Interpolate point cloud to get the corresponding locations
         pcd = F.interpolate(
             einops.rearrange(pcd, "bt ncam c h w -> (bt ncam) c h w"),
-            (h_, h_),
+            (h_feat_pcd, w_feat_pcd),  # NOTE: was (h_, h_), modify to accept rectangular input
             mode='bilinear'
         )
         # Merge different cameras

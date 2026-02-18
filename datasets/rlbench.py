@@ -236,6 +236,21 @@ class Peract2Dataset(RLBenchDataset):
     train_copies = 10
     camera_inds2d = None
 
+    def _get_action(self, idx):
+        if self._relative_action and 'rel_action' in self.annos:
+            rel_action = self._get_attr_by_idx(idx, 'rel_action', False)
+            hand_action = rel_action[:, :, :-1, :]
+            return hand_action
+        action = self._get_attr_by_idx(idx, 'action', False)
+        hand_action = action[:, :, :2, :]  # the first two dims are definitely hands
+        if self._relative_action:
+            prop = self._get_proprioception(idx)
+            anchor_action = prop[:, -1, :, :].unsqueeze(-2)  # (chunk_size, nhand, 1, 8)
+            hand_action = hand_action.transpose(1, 2)  # (chunk_size, nhand, T, 8)
+            from .utils import to_relative_action
+            hand_action = to_relative_action(hand_action, anchor_action, 'xyzw')
+            hand_action = hand_action.transpose(1, 2)  # (chunk_size, T, nhand, 8)
+        return hand_action
 
 class Peract2SingleCamDataset(RLBenchDataset):
     """RLBench dataset under Peract2 setup."""

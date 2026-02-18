@@ -16,5 +16,5 @@ def fetch_data_preprocessor(dataset_name):
     if 'calvin' in dataset_name:
         return partial(CALVINDataPreprocessor, orig_imsize=200)
     if 'geniesim' in dataset_name:
-        return partial(RLBenchDataPreprocessor, orig_imsize=256)
+        return partial(RLBenchDataPreprocessor, orig_imsize=(400, 640))
     return None

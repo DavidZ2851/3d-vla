@@ -2,6 +2,47 @@ from .base import BaseDataset
 from scipy.spatial.transform import Rotation as R
 from utils.pytorch3d_transforms import quaternion_to_matrix, matrix_to_quaternion
 import torch
+from torch.nn import functional as F
+
+ORIGINAL_HEIGHT = 400
+ORIGINAL_WIDTH = 640
+LOAD_IMG_SIZE = 256
+
+def resize_intrinsics(K, orig_w, orig_h, new_size):
+    new_w = new_size
+    new_h = new_size
+    scale_x = new_w / orig_w
+    scale_y = new_h / orig_h
+    K_new = K.clone()
+    K_new[..., 0, 0] *= scale_x  # fx
+    K_new[..., 1, 1] *= scale_y  # fy
+    K_new[..., 0, 2] *= scale_x  # cx
+    K_new[..., 1, 2] *= scale_y  # cy
+    return K_new
+
+def _resize_rgb_to_load_size(rgb, target_size):
+    """Resize rgb (chunk_size, n_cam, 3, H, W) to (..., target_size, target_size)."""
+    *batch_dims, C, H, W = rgb.shape
+    if H == target_size and W == target_size:
+        return rgb
+    rgb_flat = rgb.reshape(-1, C, H, W)
+    rgb_resized = F.interpolate(
+        rgb_flat, (target_size, target_size),
+        mode='bilinear', antialias=True, align_corners=False
+    )
+    return rgb_resized.reshape(*batch_dims, C, target_size, target_size)
+
+def _resize_depth_to_load_size(depth, target_size):
+    """Resize depth (chunk_size, n_cam, H, W) to (..., target_size, target_size)."""
+    *batch_dims, H, W = depth.shape
+    if H == target_size and W == target_size:
+        return depth
+    depth_flat = depth.reshape(-1, 1, H, W)
+    depth_resized = F.interpolate(
+        depth_flat, (target_size, target_size),
+        mode='bilinear', align_corners=False
+    )
+    return depth_resized.squeeze(1).reshape(*batch_dims, target_size, target_size)
 
 class GenieSim3Dataset(BaseDataset):
     """GenieSim3.0 dataset for bimanual manipulation."""
@@ -10,7 +51,7 @@ class GenieSim3Dataset(BaseDataset):
     train_copies = 1
     quat_format = 'wxyz'
     camera_inds = [0]
-    max_samples = 10
+    max_samples = 13
 
     def __init__(
         self,
@@ -20,7 +61,7 @@ class GenieSim3Dataset(BaseDataset):
         relative_action=False,
         mem_limit=8,
         actions_only=False,
-        chunk_size=4,
+        chunk_size=8,
     ):
         super().__init__(
             root=root,
@@ -62,8 +103,17 @@ class GenieSim3Dataset(BaseDataset):
     def _get_extrinsics(self, idx):
         return self._get_attr_by_idx(idx, 'extrinsics', True)
 
+    def _get_rgb(self, idx, key='rgb'):
+        rgb = self._get_attr_by_idx(idx, key, True)
+        return rgb  #_resize_rgb_to_load_size(rgb, LOAD_IMG_SIZE)
+
+    def _get_depth(self, idx, key='depth'):
+        depth = self._get_attr_by_idx(idx, key, True)
+        return depth  #_resize_depth_to_load_size(depth, LOAD_IMG_SIZE)
+
     def _get_intrinsics(self, idx):
-        return self._get_attr_by_idx(idx, 'intrinsics', True)
+        K = self._get_attr_by_idx(idx, 'intrinsics', True)
+        return K  #resize_intrinsics(K, ORIGINAL_WIDTH, ORIGINAL_HEIGHT, LOAD_IMG_SIZE)
     
     def _get_proprioception(self, idx):
         """

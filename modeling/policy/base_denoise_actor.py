@@ -74,9 +74,28 @@ class DenoiseActor(nn.Module):
         self.nrm_dim = int(self.workspace_normalizer.size(-1))
 
     def encode_inputs(self, rgb3d, rgb2d, pcd, instruction, proprio):
+        encoder_input_proprio = proprio
+        # NOTE: fix for flower_actor_2d
+        if hasattr(self.encoder, "proprio_feat"):
+            layer = self.encoder.proprio_feat
+            if isinstance(layer, nn.Linear) and layer.in_features > 8:
+                is_input_quat_8dim = (proprio.shape[-1] == 8)
+                if is_input_quat_8dim:
+                    pos = proprio[..., :3]
+                    quat = proprio[..., 3:7]
+                    gripper = proprio[..., 7:]
+                    if self._rotation_format == 'quat_xyzw':
+                        quat = quat[..., [3, 0, 1, 2]] 
+                    mat = quaternion_to_matrix(quat)
+                    batch_dims = mat.shape[:-2]
+                    mat_flat = mat.flatten(0, -3)
+                    rot6d_flat = get_ortho6d_from_rotation_matrix(mat_flat) # -> (N, 6)
+                    rot6d = rot6d_flat.view(*batch_dims, 6)
+                    encoder_input_proprio = torch.cat([pos, rot6d, gripper], dim=-1)
+        # NOTE: fix end
         fixed_inputs = self.encoder(
             rgb3d, rgb2d, pcd, instruction,
-            proprio.flatten(1, 2)
+            encoder_input_proprio.flatten(1, 2)
         )
         # Query trajectory (for relative trajectory prediction)
         query_trajectory = proprio[:, -1:]
