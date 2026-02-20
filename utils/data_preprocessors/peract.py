@@ -7,7 +7,7 @@ from .base import DataPreprocessor
 class PeractDataPreprocessor(DataPreprocessor):
 
     def __init__(self, keypose_only=False, num_history=1,
-                 orig_imsize=256, custom_imsize=None, depth2cloud=None):
+                 orig_imsize=128, custom_imsize=None, depth2cloud=None):
         super().__init__(
             keypose_only=keypose_only,
             num_history=num_history,
@@ -29,19 +29,24 @@ class PeractDataPreprocessor(DataPreprocessor):
             )
         ).cuda()
 
-    def process_obs(self, rgbs, pcds, augment=False):
+    def process_obs(self, rgbs, depth, extrinsics, intrinsics, augment=False):
         """
         RGBs of shape (B, ncam, 3, h_i, w_i),
         depths of shape (B, ncam, h_i, w_i).
         Assume the 3d cameras go before 2d cameras.
         """
+        pcds = self.depth2cloud(
+            depth.cuda(non_blocking=True).to(torch.bfloat16),
+            extrinsics.cuda(non_blocking=True).to(torch.bfloat16),
+            intrinsics.cuda(non_blocking=True).to(torch.bfloat16)
+        )
         # Handle non-wrist cameras, which may require augmentations
         if augment:
             b, nc, _, h, w = rgbs.shape
             # Augment in half precision
             obs = torch.cat((
                 rgbs.cuda(non_blocking=True).half() / 255,
-                pcds.cuda(non_blocking=True).half()
+                pcds[:, :rgbs.size(1)].half()
             ), 2)  # (B, ncam, 6, H, W)
             obs = obs.reshape(-1, 6, h, w)
             obs = self.aug(obs)
@@ -51,6 +56,5 @@ class PeractDataPreprocessor(DataPreprocessor):
         else:
             # Simply convert to full precision
             rgb_3d = rgbs.cuda(non_blocking=True).float() / 255
-            pcd_3d = pcds.cuda(non_blocking=True).float()
-
+            pcd_3d = pcds[:, :rgb_3d.size(1)].float()
         return rgb_3d, pcd_3d

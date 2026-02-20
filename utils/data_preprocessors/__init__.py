@@ -10,7 +10,7 @@ def fetch_data_preprocessor(dataset_name):
     if 'peract2' in dataset_name:
         return partial(RLBenchDataPreprocessor, orig_imsize=256)
     if 'peract' in dataset_name:
-        return partial(PeractDataPreprocessor, orig_imsize=256)
+        return partial(PeractDataPreprocessor, orig_imsize=128)
     if 'rlbench' in dataset_name:
         return partial(RLBenchDataPreprocessor, orig_imsize=128)
     if 'calvin' in dataset_name:

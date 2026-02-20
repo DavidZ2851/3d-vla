@@ -32,6 +32,8 @@ tmp/
 
 # third-party modules
 /calvin/
+PyRep_peract2/
+RLBench_peract2/
 PyRep/
 RLBench/
 

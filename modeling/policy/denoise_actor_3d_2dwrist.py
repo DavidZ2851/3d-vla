@@ -48,7 +48,7 @@ class DenoiseActor(BaseDenoiseActor):
             output_level=output_level,
             upsample=upsample,
             embedding_dim=embedding_dim,
-            nhist=nhist * nhand,
+            nhist=nhist * 2,  # NOTE: build model with always 2 hands (was nhist=nhist * nhand)
             num_attn_heads=num_attn_heads,
             num_vis_instr_attn_layers=num_vis_instr_attn_layers,
             fps_subsampling_factor=fps_subsampling_factor,
@@ -59,7 +59,7 @@ class DenoiseActor(BaseDenoiseActor):
         # Action decoder, runs at every denoising timestep
         self.prediction_head = TransformerHead(
             embedding_dim=embedding_dim,
-            nhist=nhist * nhand,
+            nhist=nhist * 2,  # NOTE: build model with always 2 hands (was nhist=nhist * nhand)
             num_attn_heads=num_attn_heads
         )
 

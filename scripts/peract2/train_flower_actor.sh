@@ -66,11 +66,12 @@ denoise_model=rectified_flow
 
 main_dir=peract2
 run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/peract2/flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-job6343256/last.pth #$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
-finetune=false
-# if load finetune_ckpt:
-# checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true/best.pth
-# finetune=true
+# train from scratch:
+# checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
+# finetune=false
+# load finetune_ckpt:
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-job6390414/last.pth
+finetune=true
 
 ngpus=4
 master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))

@@ -37,6 +37,7 @@ class DenoiseActor(nn.Module):
         self._rotation_format = rotation_format
         self._relative = relative
         self._lv2_batch_size = lv2_batch_size
+        self._nhand = nhand  # NOTE: only depends on args.bimanual, True->2, False->1
 
         # Vision-language encoder, runs only once
         self.encoder = None  # Implement this!
@@ -48,7 +49,7 @@ class DenoiseActor(nn.Module):
         )
         self.prediction_head = TransformerHead(
             embedding_dim=embedding_dim,
-            nhist=nhist * nhand,
+            nhist=nhist * 2,  # NOTE: build model with always 2 hands (was nhist=nhist * nhand)
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
             rot_dim=3 if rotation_format == 'euler' else 6
@@ -138,7 +139,7 @@ class DenoiseActor(nn.Module):
             fps_scene_pos=fps_scene_pos
         )
 
-    def conditional_sample(self, trajectory, device, fixed_inputs):
+    def conditional_sample(self, trajectory, device, fixed_inputs, valid_mask=None):
         # Set schedulers
         self.position_scheduler.set_timesteps(self.n_steps, device=device)
         self.rotation_scheduler.set_timesteps(self.n_steps, device=device)
@@ -161,11 +162,13 @@ class DenoiseActor(nn.Module):
                 t_ind, trajectory[..., 3:]
             ).prev_sample
             trajectory = torch.cat((pos, rot), -1)
-
-        return torch.cat((trajectory, out[..., -1:]), -1)
+            trajectory = trajectory * valid_mask
+        gripper_out = out[..., -1:] * valid_mask
+        return torch.cat((trajectory, gripper_out), -1)
 
     def compute_trajectory(self, trajectory_mask,
                            rgb3d, rgb2d, pcd, instruction, proprio):
+        valid_mask = (~trajectory_mask)[..., None].float()  # (B,T,H,1)
         # Encode observations, states, instructions
         fixed_inputs = self.encode_inputs(
             rgb3d, rgb2d, pcd, instruction, proprio
@@ -177,10 +180,12 @@ class DenoiseActor(nn.Module):
             size=tuple(trajectory_mask.shape) + (out_dim,),
             device=trajectory_mask.device
         )
+        trajectory = trajectory * valid_mask  # NOTE: ensure padded hand input all zeros
         trajectory = self.conditional_sample(
             trajectory,
             device=trajectory_mask.device,
-            fixed_inputs=fixed_inputs
+            fixed_inputs=fixed_inputs,
+            valid_mask=valid_mask
         )
 
         # Back to quaternion
@@ -192,10 +197,11 @@ class DenoiseActor(nn.Module):
         trajectory = self.unnormalize_pos(trajectory)
         # Convert gripper status to probaility
         trajectory[..., -1] = trajectory[..., -1].sigmoid()
+        trajectory = trajectory * valid_mask  # NOTE: ensure padded hand output zeros
 
         return trajectory
 
-    def compute_loss(self, gt_trajectory,
+    def compute_loss(self, gt_trajectory, trajectory_mask,
                      rgb3d, rgb2d, pcd, instruction, proprio):
         # Encode observations, states, instructions
         fixed_inputs = self.encode_inputs(
@@ -216,6 +222,7 @@ class DenoiseActor(nn.Module):
         # Loop lv2_batch_size times and sample different noises with same input
         # Trick to effectively increase the batch size without re-encoding
         total_loss = 0
+        valid_mask = (~trajectory_mask)[..., None].float()  # (B, T, 2, 1)
         for _ in range(self._lv2_batch_size):
             # Sample noise
             noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
@@ -235,6 +242,7 @@ class DenoiseActor(nn.Module):
                 timesteps
             )
             noisy_trajectory = torch.cat((pos, rot), -1)
+            noisy_trajectory = noisy_trajectory * valid_mask
 
             # Predict the noise residual
             pred = self.policy_forward_pass(
@@ -250,10 +258,19 @@ class DenoiseActor(nn.Module):
                 denoise_target = self.position_scheduler.prepare_target(
                     noise, gt_trajectory
                 )
+                # pos_loss = F.l1_loss(pos, denoise_target[..., :3], reduction='mean')
+                # rot_loss = F.l1_loss(rot, denoise_target[..., 3:], reduction='mean')
+                # openness_loss = F.binary_cross_entropy_with_logits(openess, gt_openess)
+                pos_loss = F.l1_loss(pos, denoise_target[..., :3], reduction='none')
+                pos_loss = (pos_loss * valid_mask).sum() / valid_mask.sum()  # NOTE: ensure padded hand doesn't include in loss
+                rot_loss = F.l1_loss(rot, denoise_target[..., 3:], reduction='none')
+                rot_loss = (rot_loss * valid_mask).sum() / valid_mask.sum()
+                openness_loss = F.binary_cross_entropy_with_logits(openess, gt_openess, reduction='none')
+                openness_loss = (openness_loss * valid_mask).sum() / valid_mask.sum()
                 loss = (
-                    30 * F.l1_loss(pos, denoise_target[..., :3], reduction='mean')
-                    + 10 * F.l1_loss(rot, denoise_target[..., 3:], reduction='mean')
-                    + F.binary_cross_entropy_with_logits(openess, gt_openess)
+                    30 * pos_loss
+                    + 10 * rot_loss
+                    + openness_loss
                 )
                 total_loss = total_loss + loss
         return total_loss / self._lv2_batch_size
@@ -371,7 +388,7 @@ class DenoiseActor(nn.Module):
 
         # Training, use gt_trajectory to compute loss
         return self.compute_loss(
-            gt_trajectory,
+            gt_trajectory, trajectory_mask,
             rgb3d, rgb2d, pcd, instruction, proprio
         )
 

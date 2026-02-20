@@ -1,6 +1,4 @@
-import random
-
-import numpy as np
+import random, numpy as np, torch
 
 from .base import BaseDataset
 
@@ -154,6 +152,26 @@ class DatPeractDataset(RLBenchDataset):
     train_copies = 10
     camera_inds2d = None
 
+    def _get_proprioception(self, idx):
+        original_proprio = self._get_attr_by_idx(idx, 'proprioception', False)  # (B, T_his, nhand=1, 8)
+        zero_pad = torch.zeros_like(original_proprio)
+        return torch.cat([original_proprio, zero_pad], dim=2)  # (B, T_his, 2, 8)
+
+    def _get_action(self, idx):
+        if self._relative_action and 'rel_action' in self.annos:
+            return self._get_attr_by_idx(idx, 'rel_action', False)
+        original_action = self._get_attr_by_idx(idx, 'action', False)  # (B, T_pred, nhand=1, 8)
+        zero_pad = torch.zeros_like(original_action)
+        action_padded = torch.cat([original_action, zero_pad], dim=2)  # (B, T_pred, 2, 8)
+        if self._relative_action:
+            prop = self._get_proprioception(idx)
+            anchor_action = prop[:, -1, :, :].unsqueeze(-2)  # (B, 2, 1, 8)
+            hand_action = action_padded.transpose(1, 2)  # (B, 2, T, 8)
+            from .utils import to_relative_action
+            hand_action = to_relative_action(hand_action, anchor_action, self.quat_format)  # xyzw
+            hand_action = hand_action.transpose(1, 2)  # (B, T, 2, 8)
+        return hand_action
+
     def __getitem__(self, idx):
         """
         self.annos: {
@@ -177,9 +195,11 @@ class DatPeractDataset(RLBenchDataset):
             "task": self._get_task(idx),  # [str]
             "instr": self._get_instr(idx),  # [str]
             "rgb": self._get_rgb(idx),  # tensor(n_cam3d, 3, H, W)
-            "pcd": self._get_attr_by_idx(idx, 'pcd', True),  # tensor(n_cam3d, H, W)
+            "depth": self._get_depth(idx),  # tensor(n_cam3d, H, W)
             "proprioception": self._get_proprioception(idx),  # tensor(1, 8)
             "action": self._get_action(idx),  # tensor(T, 8)
+            "extrinsics": self._get_extrinsics(idx),  # tensor(n_cam3d, 4, 4)
+            "intrinsics": self._get_intrinsics(idx)  # tensor(n_cam3d, 3, 3)
         }
 
 

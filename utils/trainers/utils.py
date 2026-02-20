@@ -1,4 +1,4 @@
-def compute_metrics(pred, gt):
+def compute_metrics(pred, gt, nhand=2):
     # pred/gt are (B, L, 3+rot+1)
     pos_l2 = ((pred[..., :3] - gt[..., :3]) ** 2).sum(-1).sqrt()
     # symmetric quaternion eval
@@ -11,17 +11,31 @@ def compute_metrics(pred, gt):
     tr = 'traj_'
 
     # Trajectory metrics
-    ret_1, ret_2 = {
-        tr + 'pos_l2': pos_l2.mean(),
-        tr + 'pos_acc_001': (pos_l2 < 0.01).float().mean(),
-        tr + 'rot_l1': quat_l1.mean(),
-        tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(),
-        tr + 'gripper': openess.flatten().float().mean()
-    }, {
-        tr + 'pos_l2': pos_l2.mean(-1),
-        tr + 'pos_acc_001': (pos_l2 < 0.01).float().mean(-1),
-        tr + 'rot_l1': quat_l1.mean(-1),
-        tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(-1)
-    }
+    if nhand == 1:
+        ret_1, ret_2 = {
+            tr + 'pos_l2': pos_l2.mean(),
+            tr + 'pos_acc_001': ((pos_l2 < 0.01).float().mean()-0.5)*2,
+            tr + 'rot_l1': quat_l1.mean(),
+            tr + 'rot_acc_0025': ((quat_l1 < 0.025).float().mean()-0.5)*2,
+            tr + 'gripper': openess.flatten().float().mean()
+        }, {
+            tr + 'pos_l2': pos_l2.mean(-1),
+            tr + 'pos_acc_001': ((pos_l2 < 0.01).float().mean(-1)-0.5)*2,
+            tr + 'rot_l1': quat_l1.mean(-1),
+            tr + 'rot_acc_0025': ((quat_l1 < 0.025).float().mean(-1)-0.5)*2
+        }
+    else: # nhand == 2
+        ret_1, ret_2 = {
+            tr + 'pos_l2': pos_l2.mean(),
+            tr + 'pos_acc_001': (pos_l2 < 0.01).float().mean(),
+            tr + 'rot_l1': quat_l1.mean(),
+            tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(),
+            tr + 'gripper': openess.flatten().float().mean()
+        }, {
+            tr + 'pos_l2': pos_l2.mean(-1),
+            tr + 'pos_acc_001': (pos_l2 < 0.01).float().mean(-1),
+            tr + 'rot_l1': quat_l1.mean(-1),
+            tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(-1)
+        }
 
     return ret_1, ret_2

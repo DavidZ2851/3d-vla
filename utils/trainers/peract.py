@@ -10,12 +10,14 @@ class PeractTrainTester(BaseTrainTester):
         sample["action"] = self.preprocessor.process_actions(sample["action"])
         proprio = self.preprocessor.process_proprio(sample["proprioception"])
         rgbs, pcds = self.preprocessor.process_obs(
-            sample["rgb"], sample["pcd"],
+            sample["rgb"], sample["depth"], sample["extrinsics"], sample["intrinsics"],
             augment=augment
         )
+        mask = torch.zeros(sample["action"].shape[:-1], dtype=bool, device='cuda')  # (B, T, 2)
+        mask[...,1] = True  # mask out the second "fake" hand
         return (
             sample["action"],
-            torch.zeros(sample["action"].shape[:-1], dtype=bool, device='cuda'),
+            mask,
             rgbs,
             None,
             pcds,

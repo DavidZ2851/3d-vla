@@ -423,7 +423,7 @@ class BaseTrainTester:
             #             current_proprio,  # (B, 1, nhands, 8)
             #             'wxyz' if self.args.rotation_format == 'quat_wxyz' else 'xyzw'
             #         )
-            losses, losses_B = compute_metrics(pred_action, gt_action)
+            losses, losses_B = compute_metrics(pred_action, gt_action, nhand=2 if self.args.bimanual else 1)
 
             # Gather global statistics
             for n, l in losses.items():
