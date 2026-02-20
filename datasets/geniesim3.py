@@ -51,7 +51,7 @@ class GenieSim3Dataset(BaseDataset):
     train_copies = 1
     quat_format = 'wxyz'
     camera_inds = [0]
-    max_samples = 13
+    max_samples = None
 
     def __init__(
         self,

@@ -102,7 +102,7 @@ class DenoiseActor(nn.Module):
         query_trajectory = proprio[:, -1:]
         return (query_trajectory,) + fixed_inputs
 
-    def policy_forward_pass(self, trajectory, timestep, fixed_inputs):
+    def policy_forward_pass(self, trajectory, timestep, fixed_inputs, valid_mask=None):
         # Parse inputs
         (
             query_trajectory,
@@ -150,7 +150,7 @@ class DenoiseActor(nn.Module):
             out = self.policy_forward_pass(
                 trajectory,
                 t * torch.ones(len(trajectory)).to(device).long(),
-                fixed_inputs
+                fixed_inputs, valid_mask=valid_mask
             )
             out = out[-1]  # keep only last layer's output
             pos = self.position_scheduler.step(
@@ -218,11 +218,12 @@ class DenoiseActor(nn.Module):
         gt_trajectory = self.convert_rot(
             gt_trajectory.flatten(1, 2)
         ).unflatten(1, (traj_len, nhand))
+        valid_mask = (~trajectory_mask)[..., None].float()  # (B, T, 2, 1)
+        gt_trajectory = gt_trajectory * valid_mask
 
         # Loop lv2_batch_size times and sample different noises with same input
         # Trick to effectively increase the batch size without re-encoding
         total_loss = 0
-        valid_mask = (~trajectory_mask)[..., None].float()  # (B, T, 2, 1)
         for _ in range(self._lv2_batch_size):
             # Sample noise
             noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
@@ -242,12 +243,12 @@ class DenoiseActor(nn.Module):
                 timesteps
             )
             noisy_trajectory = torch.cat((pos, rot), -1)
-            noisy_trajectory = noisy_trajectory * valid_mask
 
             # Predict the noise residual
             pred = self.policy_forward_pass(
                 noisy_trajectory,
-                timesteps, fixed_inputs
+                timesteps, fixed_inputs,
+                valid_mask=valid_mask
             )
 
             # Compute loss

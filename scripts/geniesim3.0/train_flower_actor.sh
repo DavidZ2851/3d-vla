@@ -36,7 +36,7 @@ eval_only=false
 lr=5e-5
 lr_scheduler=tristage_flower
 wd=0.05
-train_iters=200000
+train_iters=400000
 use_compile=false
 use_ema=true
 
@@ -68,7 +68,7 @@ denoise_model=rectified_flow
 main_dir=geniesim3.0
 run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
 # train from scratch:
-# checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
+#checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
 # resume:
 checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-job6390414/last.pth
 

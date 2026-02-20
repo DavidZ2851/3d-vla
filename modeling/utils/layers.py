@@ -177,7 +177,7 @@ class AttentionLayer(DummyLayer):
         seq1 = self._norm(seq1, self.norm_q, not self.pre_norm)
         return seq1
 
-
+# TODO: 注意引入手的attention mask
 class AttentionModule(nn.Module):
     """Stacking of attention and feed-forward layers."""
 
@@ -306,7 +306,7 @@ class DoubleCrossAttentionModule(nn.Module):
             output.append(seq)
         return output
 
-
+# TODO: 注意引入手的attention mask
 class DoubleCrossSelfAttentionModule(nn.Module):
     """Stacking of two attention and one feed-forward layers."""
 
