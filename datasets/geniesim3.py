@@ -51,9 +51,9 @@ class GenieSim3Dataset(BaseDataset):
     train_copies = 1
     quat_format = 'wxyz'
     camera_inds = [0]
-    max_samples = None
+    max_samples = 10 # None
 
-    def __init__(
+    def __init__( 
         self,
         root,
         instructions,
@@ -101,7 +101,20 @@ class GenieSim3Dataset(BaseDataset):
         return ['instruction'] * self.chunk_size
 
     def _get_extrinsics(self, idx):
-        return self._get_attr_by_idx(idx, 'extrinsics', True)
+        extrinsics = self._get_attr_by_idx(idx, 'extrinsics', True).clone()
+        # Check the 3rd row, 3rd column for the Z-axis direction
+        wrong_mask = extrinsics[..., 2, 2] > 0 
+        if wrong_mask.any():
+            # Matrix to rotate 180 degrees around the local X-axis
+            fix_matrix = torch.tensor([
+                [1.0,  0.0,  0.0, 0.0],
+                [0.0, -1.0,  0.0, 0.0],
+                [0.0,  0.0, -1.0, 0.0],
+                [0.0,  0.0,  0.0, 1.0]
+            ], dtype=extrinsics.dtype, device=extrinsics.device)
+            # Right-multiply to apply the rotation in the local camera frame
+            extrinsics[wrong_mask] = extrinsics[wrong_mask] @ fix_matrix
+        return extrinsics
 
     def _get_rgb(self, idx, key='rgb'):
         rgb = self._get_attr_by_idx(idx, key, True)
