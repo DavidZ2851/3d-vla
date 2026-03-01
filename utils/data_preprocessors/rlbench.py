@@ -42,7 +42,7 @@ class RLBenchDataPreprocessor(DataPreprocessor):
         nhist_ = proprio.size(1)
         assert nhist_ >= self.num_history, "not enough proprio timesteps"
         # the first proprio is the current state
-        proprio = proprio[:, -1*max(self.num_history, 1):]  # NOTE: geniesim3.0 assumes last proprio is the current state
+        proprio = proprio[:, -1*max(self.num_history, 1):]  # NOTE: geniesim3.0 and peract2 assume last proprio to be current timestep
         return proprio
 
     def process_obs(self, rgbs, rgb2d, depth, extrinsics, intrinsics,

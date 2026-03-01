@@ -1,5 +1,15 @@
 #!/bin/bash
-
+#SBATCH --job-name=peract_finetune
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=500G
+#SBATCH --gres=gpu:4
+#SBATCH --time=48:00:00
+#SBATCH --partition=general
+#SBATCH --output=/data/user_data/%u/logs/%x_%j.out
+#SBATCH --error=/data/user_data/%u/logs/%x_%j.err
+#SBATCH --constraint="L40S"
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
@@ -21,7 +31,7 @@ B_val=4
 chunk_size=4
 
 # ---- Training ----
-val_freq=10
+val_freq=2000
 eval_only=false
 lr=5e-5
 lr_scheduler=tristage_flower
@@ -58,13 +68,13 @@ denoise_model=rectified_flow
 main_dir=peract
 run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
 # train from scratch:
-checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
-finetune=false
+# checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
+# finetune=false
 # load finetune_ckpt:
-# checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-job6390414/last.pth
-# finetune=true
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-fullpretrain/last.pth
+finetune=true
 
-ngpus=1
+ngpus=4
 master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))
 
 torchrun --nproc_per_node $ngpus --master_port $master_port \

@@ -20,9 +20,14 @@ class CALVINTrainTester(BaseTrainTester):
 
     @torch.no_grad()
     def get_workspace_normalizer(self):
+        # return nn.Parameter(torch.tensor([
+        #     [-0.02, -0.02, -0.02, -0.05, -0.05, -0.05],
+        #     [ 0.02,  0.02,  0.02,  0.05,  0.05,  0.05]
+        # ]), requires_grad=False)
+        # NOTE: use 6d for euler, no need to normalize rot
         return nn.Parameter(torch.tensor([
-            [-0.02, -0.02, -0.02, -0.05, -0.05, -0.05],
-            [ 0.02,  0.02,  0.02,  0.05,  0.05,  0.05]
+            [-0.02, -0.02, -0.02],
+            [ 0.02,  0.02,  0.02]
         ]), requires_grad=False)
 
     @torch.no_grad()
@@ -48,6 +53,10 @@ class CALVINTrainTester(BaseTrainTester):
     def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val'):
         """Run a given number of evaluation steps."""
         if split == 'train':
+            return super().evaluate_nsteps(
+                model, loader, step_id, val_iters, split
+            )
+        elif split == 'val':
             return super().evaluate_nsteps(
                 model, loader, step_id, val_iters, split
             )

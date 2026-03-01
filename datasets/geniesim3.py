@@ -1,6 +1,4 @@
 from .base import BaseDataset
-from scipy.spatial.transform import Rotation as R
-from utils.pytorch3d_transforms import quaternion_to_matrix, matrix_to_quaternion
 import torch
 from torch.nn import functional as F
 
@@ -51,7 +49,7 @@ class GenieSim3Dataset(BaseDataset):
     train_copies = 1
     quat_format = 'wxyz'
     camera_inds = [0]
-    max_samples = 10 # None
+    max_samples = None
 
     def __init__( 
         self,

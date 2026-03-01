@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn.functional as F
+import utils.pytorch3d_transforms as pytorch3d_transforms
 
 from rlbench.observation_config import ObservationConfig, CameraConfig
 from rlbench.environment import Environment
@@ -97,6 +98,8 @@ class Actioner:
     def __init__(self, policy=None, backbone='clip'):
         self._policy = policy
         self._policy.eval()
+        self._relative = bool(getattr(self._policy, "_relative", True))
+        self._rotation_format = getattr(self._policy, "_rotation_format", "quat_xyzw")
         self._instr = None
         self.tokenizer = fetch_tokenizers(backbone)
 
@@ -129,10 +132,53 @@ class Actioner:
             None,
             pcds,
             self._instr,
-            gripper.unflatten(-1, (2, -1)),  # (1, nhist, nhand=2, 7)
+            gripper.unflatten(-1, (2, -1)),  # (1, nhist, nhand=2, 8)
             run_inference=True
         )
 
+    @property
+    def uses_relative_actions(self):
+        return self._relative
+
+    def relative_to_absolute_actions(self, rel_actions, anchor_action):
+        """
+        Convert relative actions to absolute world-frame actions.
+        Args:
+            rel_actions: (T, 2, 8) tensor in xyz + quat + gripper format
+            anchor_action: (2, 8) current absolute state for left/right hands
+        """
+        if not self._relative:
+            return rel_actions
+        abs_actions = []
+        prev = anchor_action.clone()
+        for t in range(rel_actions.shape[0]):
+            nxt = rel_actions[t].clone()
+            nxt[:, :3] = prev[:, :3] + rel_actions[t, :, :3]
+            if self._rotation_format == "quat_xyzw":
+                q_rel_wxyz = rel_actions[t, :, 3:7][:, [3, 0, 1, 2]]
+                q_prev_wxyz = prev[:, 3:7][:, [3, 0, 1, 2]]
+                q_next_wxyz = pytorch3d_transforms.quaternion_multiply(
+                    q_rel_wxyz, q_prev_wxyz
+                )
+                q_next_wxyz = q_next_wxyz / q_next_wxyz.norm(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-8)
+                nxt[:, 3:7] = q_next_wxyz[:, [1, 2, 3, 0]]
+            elif self._rotation_format == "quat_wxyz":
+                q_next = pytorch3d_transforms.quaternion_multiply(
+                    rel_actions[t, :, 3:7], prev[:, 3:7]
+                )
+                q_next = q_next / q_next.norm(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-8)
+                nxt[:, 3:7] = q_next
+            else:
+                raise ValueError(
+                    f"Unsupported rotation format for relative eval: {self._rotation_format}"
+                )
+            abs_actions.append(nxt)
+            prev = nxt
+        return torch.stack(abs_actions, dim=0)
 
 class RLBenchEnv:
 
@@ -141,21 +187,23 @@ class RLBenchEnv:
         data_path,
         task_str=None,
         image_size=(256, 256),
-        apply_rgb=False,
-        apply_depth=False,
-        apply_pc=False,
+        apply_rgb=True,
+        apply_depth=True,
+        apply_pc=True,
         headless=False,
-        apply_cameras=("over_shoulder_left", "over_shoulder_right", "wrist_left", "wrist_right", "front"),
+        apply_cameras=("wrist_left", "wrist_right", "front"),
         collision_checking=False
     ):
 
         # setup required inputs
         self.data_path = data_path
         self.apply_cameras = apply_cameras
+        self.headless = headless
 
         # setup RLBench environments
         self.obs_config = self.create_obs_config(
-            image_size, apply_rgb, apply_depth, apply_pc, apply_cameras
+            image_size, apply_rgb, apply_depth, apply_pc, apply_cameras,
+            headless=headless
         )
 
         self.action_mode = BimanualMoveArmThenGripper(
@@ -186,7 +234,6 @@ class RLBenchEnv:
             obs.left.gripper_pose, [obs.left.gripper_open],
             obs.right.gripper_pose, [obs.right.gripper_open]
         ])).float().unsqueeze(0)  # 1, D
-
         return rgb, pcd, gripper
 
     def evaluate_task_on_multiple_variations(
@@ -276,7 +323,6 @@ class RLBenchEnv:
             max_reward = 0.0
 
             for step_id in range(max_steps):
-
                 # Fetch the current observation and predict one action
                 rgb, pcd, gripper = self.get_rgb_pcd_gripper_from_obs(obs)
                 if record_video:
@@ -307,36 +353,32 @@ class RLBenchEnv:
                 # Update the observation based on the predicted action
                 try:
                     # Execute entire predicted trajectory step by step
-                    actions = output[-1].cpu().numpy()
+                    actions = output[-1].detach().cpu()  # (T, nhand=2, 8)
+                    if actioner.uses_relative_actions:
+                        anchor = gripper[0].detach().cpu().view(2, 8)
+                        actions = actioner.relative_to_absolute_actions(actions, anchor)
+                    actions = actions.numpy()
                     actions[..., -1] = actions[..., -1].round()
-
                     # execute
-                    print(step_id, actions.shape, actions)
+                    #print(step_id, actions.shape, actions)
                     for action in tqdm(actions):
                         obs, reward, _ = move(action, collision_checking=False)
                         # if record_video:
                         #     rgb, _, _ = self.get_rgb_pcd_gripper_from_obs(obs)
                         #     frames.append((rgb[0].cpu().numpy()[0].transpose(1, 2, 0) * 255).astype(np.uint8))
-
                     max_reward = max(max_reward, reward)
-
                     if reward == 1:
                         success_rate += 1
                         break
-                    if step_id > -1:
-                        break
-
                 except (IKError, ConfigurationPathError, InvalidActionError) as e:
                     print(task_str, demo, step_id, success_rate, e)
                     reward = 0
-
             total_reward += max_reward
             if record_video:
                 rgb, _, _ = self.get_rgb_pcd_gripper_from_obs(obs)
                 frames.append((rgb[0].cpu().numpy()[0].transpose(1, 2, 0) * 255).astype(np.uint8))
             if reward == 0:
                 step_id += 1
-
             print(
                 task_str,
                 "Variation",
@@ -351,20 +393,16 @@ class RLBenchEnv:
                 f"SR: {total_reward:.2f}/{demo_id+1}",
                 "# valid demos", demo_id + 1
             )
-
             if record_video:
                 from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
                 clip = ImageSequenceClip(frames, fps=1)
-                clip.write_videofile(f"{task_str}_{demo_id}.mp4", codec="libx264")
-            pigos
-
+                clip.write_videofile(f"eval_logs/bimanual_reproduce/{task_str}_{demo_id}.mp4", codec="libx264")
         # Compensate for failed demos
         valid = len(var_demos) > 0
-
         return success_rate, valid, len(var_demos)
 
     def create_obs_config(
-        self, image_size, apply_rgb, apply_depth, apply_pc, apply_cameras, **kwargs
+        self, image_size, apply_rgb, apply_depth, apply_pc, apply_cameras, headless=False, **kwargs
     ):
         """
         Set up observation config for RLBench environment.
@@ -379,6 +417,24 @@ class RLBenchEnv:
         unused_cams = CameraConfig()
         unused_cams.set_all(False)
 
+        # Headless clusters frequently return black frames with OPENGL3.
+        # Prefer OPENGL in headless mode and allow explicit env override.
+        render_mode = RenderMode.OPENGL if headless else RenderMode.OPENGL3
+        render_mode_override = os.environ.get("RLBENCH_RENDER_MODE", "").strip().upper()
+        if render_mode_override:
+            mode_map = {
+                "OPENGL": RenderMode.OPENGL,
+                "OPENGL3": RenderMode.OPENGL3,
+                "OPENGL_AUXILIARY": RenderMode.OPENGL_AUXILIARY,
+            }
+            if render_mode_override in mode_map:
+                render_mode = mode_map[render_mode_override]
+            else:
+                print(
+                    f"Unknown RLBENCH_RENDER_MODE={render_mode_override}, "
+                    f"using default {render_mode}."
+                )
+
         # Define a config for a used camera with the given image size and flags
         used_cams = CameraConfig(
             rgb=apply_rgb,
@@ -386,7 +442,7 @@ class RLBenchEnv:
             depth=apply_depth,
             mask=False,
             image_size=image_size,
-            render_mode=RenderMode.OPENGL3,  # note OPENGL3 for Peract2!
+            render_mode=render_mode,
             **kwargs
         )
 

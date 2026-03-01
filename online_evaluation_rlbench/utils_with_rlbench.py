@@ -20,6 +20,7 @@ from pyrep.const import RenderMode
 
 from modeling.encoder.text import fetch_tokenizers, fetch_text_encoders
 from online_evaluation_rlbench.get_stored_demos import get_stored_demos
+import utils.pytorch3d_transforms as pytorch3d_transforms
 
 
 def task_file_to_task_class(task_file):
@@ -55,9 +56,9 @@ class Mover:
             action_collision[:-1] = action
             if collision_checking:
                 action_collision[-1] = 0
-            print('target action:', target)
+            #print('target action:', target)
             obs, reward, terminate = self._task.step(action_collision)
-            print('actual action:', obs.gripper_pose)
+            #print('actual action:', obs.gripper_pose)
 
             # Check if we reached the desired pose (planner may be inaccurate)
             pos = obs.gripper_pose[:3]
@@ -93,6 +94,8 @@ class Actioner:
     def __init__(self, policy=None, backbone='clip'):
         self._policy = policy.cuda()
         self._policy.eval()
+        self._relative = bool(getattr(self._policy, "_relative", True))
+        self._rotation_format = getattr(self._policy, "_rotation_format", "quat_xyzw")
         self._instr = None
         self.tokenizer = fetch_tokenizers(backbone)
         self.encoder, _ = fetch_text_encoders('clip')
@@ -101,9 +104,8 @@ class Actioner:
 
     def load_episode(self, descriptions):
         instr = [random.choice(descriptions)]
-        print(instr)
         self._instr = self.tokenizer(instr).cuda(non_blocking=True)
-        self._instr = self.encoder(self._instr)
+        #self._instr = self.encoder(self._instr)
 
     def predict(self, rgbs, pcds, gripper, prediction_len=1):
         """
@@ -116,16 +118,65 @@ class Actioner:
         Returns:
             (1, prediction_len, 8)
         """
-        return self._policy(
+        real = gripper[:, :, None, :]              # (B, nhist, 1, 8)
+        fake = torch.zeros_like(real)               # (B, nhist, 1, 8)
+        fake[..., 6] = 1.0                          # identity quat w=1
+        proprio_2hand = torch.cat([real, fake], 2)  # (B, nhist, 2, 8)
+        pred = self._policy(
             None,
-            torch.full([1, prediction_len, 1], False).cuda(non_blocking=True),
+            torch.full([1, prediction_len, 2], False).cuda(non_blocking=True),
             rgbs,
             None,
             pcds,
             self._instr,
-            gripper[:, :, None, :7],
+            proprio_2hand,
             run_inference=True
-        ).view(1, prediction_len, 8)
+        ).view(1, prediction_len, 2, 8)
+        return pred[:,:,:1,:]  # (1, prediction_len, nhand=1, 8)
+    
+    @property
+    def uses_relative_actions(self):
+        return self._relative
+
+    def relative_to_absolute_actions(self, rel_actions, anchor_action):
+        """
+        Convert relative actions to absolute world-frame actions.
+        Args:
+            rel_actions: (T, 1, 8) tensor in xyz + quat + gripper format
+            anchor_action: (1, 8) current absolute state for left/right hands
+        """
+        if not self._relative:
+            return rel_actions
+        abs_actions = []
+        prev = anchor_action.clone()
+        for t in range(rel_actions.shape[0]):
+            nxt = rel_actions[t].clone()
+            nxt[:, :3] = prev[:, :3] + rel_actions[t, :, :3]
+            if self._rotation_format == "quat_xyzw":
+                q_rel_wxyz = rel_actions[t, :, 3:7][:, [3, 0, 1, 2]]
+                q_prev_wxyz = prev[:, 3:7][:, [3, 0, 1, 2]]
+                q_next_wxyz = pytorch3d_transforms.quaternion_multiply(
+                    q_rel_wxyz, q_prev_wxyz
+                )
+                q_next_wxyz = q_next_wxyz / q_next_wxyz.norm(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-8)
+                nxt[:, 3:7] = q_next_wxyz[:, [1, 2, 3, 0]]
+            elif self._rotation_format == "quat_wxyz":
+                q_next = pytorch3d_transforms.quaternion_multiply(
+                    rel_actions[t, :, 3:7], prev[:, 3:7]
+                )
+                q_next = q_next / q_next.norm(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-8)
+                nxt[:, 3:7] = q_next
+            else:
+                raise ValueError(
+                    f"Unsupported rotation format for relative eval: {self._rotation_format}"
+                )
+            abs_actions.append(nxt)
+            prev = nxt
+        return torch.stack(abs_actions, dim=0)
 
 
 class RLBenchEnv:
@@ -322,7 +373,6 @@ class RLBenchEnv:
                 gripper_input = F.pad(
                     gripper_input, (0, 0, npad, 0), mode='replicate'
                 )
-
                 output = actioner.predict(
                     rgbs_input,
                     pcds_input,
@@ -333,12 +383,16 @@ class RLBenchEnv:
                 # Update the observation based on the predicted action
                 try:
                     # Execute entire predicted trajectory step by step
-                    actions = output[-1].cpu().numpy()
-                    actions[:, -1] = actions[:, -1].round()
+                    actions = output[-1].cpu()  # (T=1, nhand=1, dim=8)
+                    if actioner.uses_relative_actions:
+                        anchor = gripper[0].detach().cpu().view(1, 8)
+                        actions = actioner.relative_to_absolute_actions(actions, anchor)
+                    actions = actions.numpy()
+                    actions[..., -1] = actions[..., -1].round()
 
                     # execute
                     for action in actions:
-                        obs, reward, _ = move(action, collision_checking=False)
+                        obs, reward, _ = move(action[0], collision_checking=False)
 
                     max_reward = max(max_reward, reward)
 
@@ -377,7 +431,7 @@ class RLBenchEnv:
             if record_video:
                 from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
                 clip = ImageSequenceClip(frames, fps=1)
-                clip.write_videofile(f"{task_str}_{demo_id}.mp4", codec="libx264")
+                clip.write_videofile(f"eval_logs/peract_reproduce/{task_str}_{demo_id}.mp4", codec="libx264")
 
         # Compensate for failed demos
         valid = len(var_demos) > 0

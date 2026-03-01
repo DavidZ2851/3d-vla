@@ -1,14 +1,14 @@
 from .base import BaseDataset
 from .utils import to_relative_action
-import torchvision.transforms as T
+import torchvision.transforms as T, torch
 
 class CALVINDataset(BaseDataset):
     """CALVIN dataset."""
     cameras = ("front", "wrist")
     train_copies = 1
-    quat_format= 'wxyz'
+    quat_format= 'euler'
     camera_inds = None
-    max_samples=13  # TODO: overfit on 104 datapoints
+    max_samples=None
 
     def __init__(
         self,
@@ -45,17 +45,23 @@ class CALVINDataset(BaseDataset):
             for t_ in self.annos['instr_id'][idx:idx + self.chunk_size]
         ]
 
+    def _get_proprioception(self, idx):
+        original_proprio = self._get_attr_by_idx(idx, 'proprioception', False)  # (B, T_his=1, nhand=1, dim=7)
+        zero_pad = torch.zeros_like(original_proprio)  # euler default (0,0,0) means no rotation
+        return torch.cat([original_proprio, zero_pad], dim=2)  # (B, T_his=1, nhand=2, 7)
+
     def _get_action(self, idx):
+        if self._relative_action and 'rel_action' in self.annos:
+            rel_action = self._get_attr_by_idx(idx, 'rel_action', False)  # （B, T_pred=10, nhand=1, 7）
+            zero_pad = torch.zeros_like(rel_action)  # euler default (0,0,0) means no rotation
+            action_padded = torch.cat([rel_action, zero_pad], dim=2)  # (B, T_pred=10, nhand=2, 7)
+            return action_padded
+        original_action = self._get_attr_by_idx(idx, 'action', False)  # (B, T_pred, nhand=1, 7)
+        zero_pad = torch.zeros_like(original_action)
+        action_padded = torch.cat([original_action, zero_pad], dim=2)  # (B, T_pred, 2, 7)
         if self._relative_action:
-            if 'rel_action' in self.annos:
-                return self._get_attr_by_idx(idx, 'rel_action', False)
-            else:
-                action = self._get_attr_by_idx(idx, 'action', False)
-                prop = self._get_proprioception(idx)[:,-1:,:]
-                action = to_relative_action(action, prop, self.quat_format)
-        else:
-            action = self._get_attr_by_idx(idx, 'action', False)
-        return action
+            return ValueError("No implementation for euler relative calculation")
+        return action_padded
     
     def __getitem__(self, idx):
         """

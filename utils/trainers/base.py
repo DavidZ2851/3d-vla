@@ -319,7 +319,6 @@ class BaseTrainTester:
                 iter_loader = iter(train_loader)
                 sample = next(iter_loader)
 
-            # self._log_geniesim_sample_rgb(sample, step_id)  # for geniesim overfit debug
             self.train_one_step(model, optimizer, scaler, lr_scheduler, sample)
             self.ema.step(model, ema_model, self.args.use_ema, step_id)
 
@@ -413,10 +412,28 @@ class BaseTrainTester:
             step=step_id
         )
 
-    def _plot_geniesim_action_trajs(self, abs_pred_action_sample, abs_gt_action_sample):
-        """Create one figure with predicted and GT hand trajectories only."""
+    def _plot_geniesim_action_trajs(
+        self, pcd_sample, rgb_sample, abs_pred_action_sample, abs_gt_action_sample
+        ):
+        """Create one figure with point cloud and GT/pred hand trajectories."""
         fig = plt.figure(figsize=(8, 8))
         ax = fig.add_subplot(111, projection='3d')
+
+        pcd0 = pcd_sample[0].detach().float().cpu().permute(1, 2, 0).reshape(-1, 3).numpy()
+        rgb0 = rgb_sample[0].detach().float().cpu().permute(1, 2, 0).reshape(-1, 3).numpy()
+        if rgb0.max() > 1.0:
+            rgb0 = rgb0 / 255.0
+        valid = np.isfinite(pcd0).all(axis=-1)
+        valid &= (np.linalg.norm(pcd0, axis=-1) > 1e-8)
+        points = pcd0[valid]
+        colors = np.clip(rgb0[valid], 0.0, 1.0)
+        if points.shape[0] > 0:
+            num_vis = min(points.shape[0], 50000)
+            idx = np.random.choice(points.shape[0], num_vis, replace=False)
+            ax.scatter(
+                points[idx, 0], points[idx, 1], points[idx, 2],
+                c=colors[idx], s=0.5, alpha=0.35
+            )
 
         pred_traj = abs_pred_action_sample.detach().float().cpu().numpy()
         gt_traj = abs_gt_action_sample.detach().float().cpu().numpy()
@@ -426,32 +443,32 @@ class BaseTrainTester:
         pred_left_xyz = pred_traj[:, 0, :3]
         ax.plot(
             gt_left_xyz[:, 0], gt_left_xyz[:, 1], gt_left_xyz[:, 2],
-            color='orange', linewidth=2, label='GT Left'
+            color='green', linewidth=2, linestyle=':', label='GT Left'
         )
         ax.plot(
             pred_left_xyz[:, 0], pred_left_xyz[:, 1], pred_left_xyz[:, 2],
-            color='magenta', linewidth=2, linestyle='--', label='Pred Left'
+            color='red', linewidth=2, linestyle=':', label='Pred Left'
         )
-        ax.scatter(gt_left_xyz[0, 0], gt_left_xyz[0, 1], gt_left_xyz[0, 2], color='orange', s=20)
-        ax.scatter(pred_left_xyz[0, 0], pred_left_xyz[0, 1], pred_left_xyz[0, 2], color='magenta', s=20)
+        ax.scatter(gt_left_xyz[0, 0], gt_left_xyz[0, 1], gt_left_xyz[0, 2], color='green', s=80)
+        ax.scatter(pred_left_xyz[0, 0], pred_left_xyz[0, 1], pred_left_xyz[0, 2], color='red', s=80)
         if nhands > 1:
             gt_right_xyz = gt_traj[:, 1, :3]
             pred_right_xyz = pred_traj[:, 1, :3]
             ax.plot(
                 gt_right_xyz[:, 0], gt_right_xyz[:, 1], gt_right_xyz[:, 2],
-                color='blue', linewidth=2, label='GT Right'
+                color='green', linewidth=2, linestyle='-', label='GT Right'
             )
             ax.plot(
                 pred_right_xyz[:, 0], pred_right_xyz[:, 1], pred_right_xyz[:, 2],
-                color='cyan', linewidth=2, linestyle='--', label='Pred Right'
+                color='red', linewidth=2, linestyle='-', label='Pred Right'
             )
-            ax.scatter(gt_right_xyz[0, 0], gt_right_xyz[0, 1], gt_right_xyz[0, 2], color='blue', s=20)
-            ax.scatter(pred_right_xyz[0, 0], pred_right_xyz[0, 1], pred_right_xyz[0, 2], color='cyan', s=20)
+            ax.scatter(gt_right_xyz[0, 0], gt_right_xyz[0, 1], gt_right_xyz[0, 2], color='green', s=80)
+            ax.scatter(pred_right_xyz[0, 0], pred_right_xyz[0, 1], pred_right_xyz[0, 2], color='red', s=80)
 
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
-        ax.set_title('GenieSim inference: GT/Pred hand trajectories')
+        ax.set_title('GenieSim inference: point cloud + GT/Pred trajectories')
         ax.legend(loc='upper right', fontsize=8)
         ax.set_box_aspect([1, 1, 1])
         fig.tight_layout()
@@ -472,6 +489,10 @@ class BaseTrainTester:
         if "proprioception" not in sample or sample["proprioception"] is None:
             return
 
+        _, _, rgbs, _, pcds, _, _ = self.prepare_batch(sample, augment=False)
+        if rgbs is None or pcds is None:
+            return
+
         pred_action_vis = pred_action
         gt_action_vis = gt_action
         if self.args.relative_action:
@@ -486,12 +507,14 @@ class BaseTrainTester:
         wandb_images = []
         batch_size = pred_action_vis.shape[0]
         for b in range(batch_size):
-            fig = self._plot_geniesim_action_trajs(pred_action_vis[b], gt_action_vis[b])
+            fig = self._plot_geniesim_action_trajs(
+                pcds[b], rgbs[b], pred_action_vis[b], gt_action_vis[b]
+            )
             wandb_images.append(wandb.Image(fig, caption=f"sample_{b}"))
             plt.close(fig)
 
         if wandb_images:
-            wandb.log({f"{split}/geniesim_infer_action_trajs": wandb_images}, step=step_id)
+            wandb.log({f"{split}/geniesim_infer_pcd_action_trajs": wandb_images}, step=step_id)
 
     @torch.inference_mode()
     def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val', epoch=None):
@@ -506,8 +529,9 @@ class BaseTrainTester:
 
             pred_action = self._model_forward(model, sample, training=False)
             gt_action = sample["action"].cuda(non_blocking=True)
-            # self._log_geniesim_infer_visualizations(sample, pred_action, gt_action, step_id, split)  # for geniesim overfit debug
-            # TODO: skip relative to absolute evaluation for speed
+            #self._log_geniesim_sample_rgb(sample, step_id)  # for geniesim3.0 debug
+            #self._log_geniesim_infer_visualizations(sample, pred_action, gt_action, step_id, split)  # for geniesim3.0 debug
+            # NOTE: skip relative to absolute evaluation for speed
             # current_proprio = sample["proprioception"].cuda(non_blocking=True)[:, -1:, :, :]
             # if self.args.relative_action:
             #     if self.args.rotation_format == 'euler':  # calvin dataset
@@ -532,7 +556,7 @@ class BaseTrainTester:
             #             current_proprio,  # (B, 1, nhands, 8)
             #             'wxyz' if self.args.rotation_format == 'quat_wxyz' else 'xyzw'
             #         )
-            losses, losses_B = compute_metrics(pred_action, gt_action, nhand=2 if self.args.bimanual else 1)
+            losses = compute_metrics(pred_action, gt_action, nhand=2 if self.args.bimanual else 1)
 
             # Gather global statistics
             for n, l in losses.items():
@@ -540,17 +564,6 @@ class BaseTrainTester:
                 if key not in values:
                     values[key] = torch.Tensor([]).to(device)
                 values[key] = torch.cat([values[key], l.unsqueeze(0)])
-
-            # Gather per-task statistics
-            # TODO: skip per-task statistics for speed
-            # tasks = np.array(sample["task"])
-            # for n, l in losses_B.items():
-            #     for task in np.unique(tasks):
-            #         key = f"{split}-loss/{task}/{n}"
-            #         l_task = l[tasks == task].mean()
-            #         if key not in values:
-            #             values[key] = torch.Tensor([]).to(device)
-            #         values[key] = torch.cat([values[key], l_task.unsqueeze(0)])
 
         # Log all statistics
         values = {k: v.mean().item() for k, v in values.items()}

@@ -58,3 +58,12 @@ class PeractDataPreprocessor(DataPreprocessor):
             rgb_3d = rgbs.cuda(non_blocking=True).float() / 255
             pcd_3d = pcds[:, :rgb_3d.size(1)].float()
         return rgb_3d, pcd_3d
+    
+    def process_proprio(self, proprio):
+        """Proprio shape: (B, nhist, nhand, 3+rot+1)."""
+        proprio = proprio.cuda(non_blocking=True)
+        nhist_ = proprio.size(1)
+        assert nhist_ >= self.num_history, "not enough proprio timesteps"
+        # the first proprio is the current state
+        proprio = proprio[:, -1*max(self.num_history, 1):]  # NOTE: peract assumes last proprio to be current timestep
+        return proprio

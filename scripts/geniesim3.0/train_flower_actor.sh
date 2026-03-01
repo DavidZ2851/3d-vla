@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=flowervla_resume
+#SBATCH --job-name=flowervla
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
@@ -68,9 +68,9 @@ denoise_model=rectified_flow
 main_dir=geniesim3.0
 run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
 # train from scratch:
-#checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
+checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
 # resume:
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-job6390414/last.pth
+#checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-job6420162/last.pth
 
 ngpus=4
 master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))

@@ -51,16 +51,6 @@ class MultiheadCustomAttention(nn.MultiheadAttention):
             target_type=query.dtype,
             check_other=False,
         )
-        # merge key padding and attention masks
-        if key_padding_mask is not None:
-            bsz, src_len = key_padding_mask.shape
-            key_padding_mask = key_padding_mask.view(bsz, 1, 1, src_len)
-            key_padding_mask = key_padding_mask.expand(-1, self.num_heads, -1, -1)
-            key_padding_mask = key_padding_mask.reshape(bsz * self.num_heads, 1, src_len)
-            if attn_mask is None:
-                attn_mask = key_padding_mask
-            else:
-                attn_mask = attn_mask + key_padding_mask
 
         if self.batch_first and is_batched:
             # make sure that the transpose op does not affect the "is" property
@@ -79,7 +69,8 @@ class MultiheadCustomAttention(nn.MultiheadAttention):
             self.dropout, self.out_proj.weight, self.out_proj.bias,
             training=self.training,
             attn_mask=attn_mask,
-            rotary_pe=rotary_pe)
+            rotary_pe=rotary_pe,
+            key_padding_mask=key_padding_mask)
         if self.batch_first and is_batched:
             return attn_output.transpose(1, 0), attn_output_weights
         else:
@@ -98,7 +89,8 @@ def multi_head_attention_forward(query,
                                  out_proj_bias,
                                  training=True,
                                  attn_mask=None,
-                                 rotary_pe=None):
+                                 rotary_pe=None,
+                                 key_padding_mask=None):
     tgt_len, bsz, embed_dim = query.size()
     assert embed_dim == embed_dim_to_check
     assert list(query.size()) == [tgt_len, bsz, embed_dim]
@@ -119,6 +111,14 @@ def multi_head_attention_forward(query,
     q = einops.rearrange(q, "S B (H D) -> B H S D", H=num_heads, D=head_dim)
     k = einops.rearrange(k, "S B (H D) -> B H S D", H=num_heads, D=head_dim)
     v = einops.rearrange(v, "S B (H D) -> B H S D", H=num_heads, D=head_dim)
+
+    # merge key padding and attention masks
+    if key_padding_mask is not None:
+        key_padding_mask = key_padding_mask[:, None, None, :]  # (B, S_k)->(B,1,1,S_k)
+        if attn_mask is None:
+            attn_mask = key_padding_mask
+        else:
+            attn_mask = attn_mask + key_padding_mask
 
     # Compute attention output
     attn_output = F.scaled_dot_product_attention(

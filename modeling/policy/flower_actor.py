@@ -67,7 +67,7 @@ class FlowerActor3D(BaseDenoiseActor):
             nhist=nhist * 2,  # NOTE: build model with always 2 hands (was nhist=nhist * nhand)
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
-            rot_dim=3 if rotation_format == 'euler' else 6
+            rot_dim=6  #always 6d now, was: rot_dim=3 if rotation_format == 'euler' else 6
         )
 
 
@@ -175,11 +175,11 @@ class TransformerHead(nn.Module):
     def forward(self, traj_feats, trajectory, timesteps,
                 rgb3d_feats, rgb3d_pos, rgb2d_feats, rgb2d_pos,
                 instr_feats, instr_pos, proprio_feats,
-                fps_scene_feats, fps_scene_pos):
+                fps_scene_feats, fps_scene_pos, valid_mask=None):
         """
         Arguments:
-            traj_feats: (B, trajectory_length, nhand, F)
-            trajectory: (B, trajectory_length, nhand, 3+6+X)
+            traj_feats: (B, trajectory_length, nhand=2, F)
+            trajectory: (B, trajectory_length, nhand=2, 3+6+X)
             timesteps: (B, 1)
             rgb3d_feats: (B, N, F)
             rgb3d_pos: (B, N, 3)
@@ -187,9 +187,10 @@ class TransformerHead(nn.Module):
             rgb2d_pos: (B, N2d, 3)
             instr_feats: (B, L, F)
             instr_pos: (B, L, 3)
-            proprio_feats: (B, nhist*nhand, F)
+            proprio_feats: (B, nhist*nhand(2), F)
             fps_scene_feats: (B, M, F), M < N
             fps_scene_pos: (B, M, 3)
+            valid_mask: (B, trajectory_length, nhand=2, 1)
 
         Returns:
             list of (B, trajectory_length, nhand, 3+6+X)
@@ -202,6 +203,15 @@ class TransformerHead(nn.Module):
         traj_feats = einops.rearrange(traj_feats, 'b l h c -> b (l h) c')
         trajectory = einops.rearrange(trajectory, 'b l h c -> b (l h) c')
 
+        if valid_mask is not None:
+            token_mask = valid_mask.squeeze(-1)  # (B, T, nhand=2, 1) → (B, T, nhand=2)
+            token_mask = token_mask.reshape(token_mask.shape[0], -1)  # (B, T*2)
+            token_mask_float = token_mask.float()  # float mask for multiplication
+            token_mask_bool = token_mask == 0  # bool mask for attention
+        else:
+            token_mask_float = None
+            token_mask_bool = None
+
         # Trajectory features cross-attend to context features
         traj_time_pos = self.traj_time_emb(
             torch.arange(0, traj_len, device=traj_feats.device)
@@ -210,6 +220,7 @@ class TransformerHead(nn.Module):
         traj_feats = self.traj_lang_attention(
             seq1=traj_feats,
             seq2=instr_feats,
+            #seq1_token_mask=token_mask_float,
             seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
         )[-1]
         traj_feats = traj_feats + traj_time_pos
@@ -232,6 +243,8 @@ class TransformerHead(nn.Module):
         traj_feats = self.self_attn(
             seq=traj_feats,
             seq0=rgb3d_feats,
+            # seq_token_mask=token_mask_float,
+            # seq_token_mask_bool=token_mask_bool,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,
@@ -241,13 +254,13 @@ class TransformerHead(nn.Module):
         # Rotation head
         rotation = self.predict_rot(
             traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
-            time_embs, traj_feats.shape[1]
+            time_embs, traj_feats.shape[1], #token_mask_float=token_mask_float, token_mask_bool=token_mask_bool
         )
 
         # Position head
         position, position_features = self.predict_pos(
             traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
-            time_embs, traj_feats.shape[1]
+            time_embs, traj_feats.shape[1], #token_mask_float=token_mask_float, token_mask_bool=token_mask_bool
         )
 
         # Openess head from position head
@@ -274,10 +287,12 @@ class TransformerHead(nn.Module):
         return time_feats + curr_gripper_feats
 
     def predict_pos(self, traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
-                    time_embs, traj_len):
+                    time_embs, traj_len, token_mask_float=None, token_mask_bool=None):
         position_features = self.position_self_attn(
             seq=traj_feats,
             seq0=rgb3d_feats,
+            seq_token_mask=None, #token_mask_float,
+            seq_token_mask_bool=None, #token_mask_bool,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,
@@ -289,10 +304,12 @@ class TransformerHead(nn.Module):
         return position, position_features
 
     def predict_rot(self, traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
-                    time_embs, traj_len):
+                    time_embs, traj_len, token_mask_float=None, token_mask_bool=None):
         rotation_features = self.rotation_self_attn(
             seq=traj_feats,
             seq0=rgb3d_feats,
+            seq_token_mask=None, #token_mask_float,
+            seq_token_mask_bool=None, #token_mask_bool,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,

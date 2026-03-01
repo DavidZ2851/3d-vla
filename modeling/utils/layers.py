@@ -177,7 +177,7 @@ class AttentionLayer(DummyLayer):
         seq1 = self._norm(seq1, self.norm_q, not self.pre_norm)
         return seq1
 
-# TODO: 注意引入手的attention mask
+
 class AttentionModule(nn.Module):
     """Stacking of attention and feed-forward layers."""
 
@@ -199,6 +199,7 @@ class AttentionModule(nn.Module):
             ))
 
     def forward(self, seq1, seq2,
+                seq1_token_mask=None,
                 seq2_key_padding_mask=None,
                 seq1_pos=None, seq2_pos=None,
                 seq1_sem_pos=None, seq2_sem_pos=None,
@@ -228,7 +229,11 @@ class AttentionModule(nn.Module):
                 seq1_sem_pos, seq2_sem_pos,
                 ada_sgnl
             )
+            if seq1_token_mask is not None:
+                seq1 = seq1 * seq1_token_mask.unsqueeze(-1)
             seq1 = self.ffw_layers[i](seq1, ada_sgnl)
+            if seq1_token_mask is not None:
+                seq1 = seq1 * seq1_token_mask.unsqueeze(-1)
             output.append(seq1)
         return output
 
@@ -306,7 +311,7 @@ class DoubleCrossAttentionModule(nn.Module):
             output.append(seq)
         return output
 
-# TODO: 注意引入手的attention mask
+
 class DoubleCrossSelfAttentionModule(nn.Module):
     """Stacking of two attention and one feed-forward layers."""
 
@@ -333,6 +338,8 @@ class DoubleCrossSelfAttentionModule(nn.Module):
             ))
 
     def forward(self, seq, seq0,
+                seq_token_mask=None,
+                seq_token_mask_bool=None,
                 seq0_key_padding_mask=None,
                 seq_pos_0=None, seq0_pos=None, seq_pos_1=None,
                 seq_sem_pos_0=None, seq0_sem_pos=None,
@@ -344,6 +351,8 @@ class DoubleCrossSelfAttentionModule(nn.Module):
         Args:
             seq: tensor (B, S, C)
             seq0: tensor (B, S0, C)
+            seq_token_mask: tensor(float) (B, T*nhand),
+            seq_token_mask_bool: tensor(bool) (B, T*nhand),
             seq0_key_padding_mask: tensor (B, S0)
             seq_pos_0: (B, S, C) if not rotary, else (B, S, C, 2), first att
             seq0_pos: (B, S0, C) if not rotary, else (B, S0, C, 2)
@@ -357,6 +366,7 @@ class DoubleCrossSelfAttentionModule(nn.Module):
             tensor (B, S1, C)
         """
         output = []
+        self_kp_mask = seq_token_mask_bool if seq_token_mask_bool is not None else None
         for i in range(self.num_layers):
             seq = self.attn_layers_0[i](
                 seq, seq0,
@@ -365,14 +375,20 @@ class DoubleCrossSelfAttentionModule(nn.Module):
                 seq_sem_pos_0, seq0_sem_pos,
                 ada_sgnl
             )
+            if seq_token_mask is not None:    # zero fake hand tokens after hand->scene+text cross-attention
+                seq = seq * seq_token_mask.unsqueeze(-1)
             seq = self.attn_layers_1[i](
                 seq, seq,
-                None,
+                self_kp_mask,
                 seq_pos_1, seq_pos_1,
                 seq_sem_pos_1, seq_sem_pos_1,
                 ada_sgnl
             )
+            if seq_token_mask is not None:  # zero fake hand tokens after attention
+                seq = seq * seq_token_mask.unsqueeze(-1)
             seq = self.ffw_layers[i](seq, ada_sgnl)
+            if seq_token_mask is not None:  # zero fake hand tokens after ffn
+                seq = seq * seq_token_mask.unsqueeze(-1)
             output.append(seq)
         return output
 

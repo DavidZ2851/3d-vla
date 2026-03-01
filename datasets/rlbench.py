@@ -151,10 +151,18 @@ class DatPeractDataset(RLBenchDataset):
     camera_inds = None
     train_copies = 10
     camera_inds2d = None
+    max_samples = None
+
+    def __len__(self):
+        total_samples = len(self.annos['action']) // self.chunk_size
+        if self.max_samples is not None:
+            return self.copies * min(self.max_samples, total_samples)
+        return self.copies * total_samples
 
     def _get_proprioception(self, idx):
         original_proprio = self._get_attr_by_idx(idx, 'proprioception', False)  # (B, T_his, nhand=1, 8)
         zero_pad = torch.zeros_like(original_proprio)
+        zero_pad[..., 6] = 1
         return torch.cat([original_proprio, zero_pad], dim=2)  # (B, T_his, 2, 8)
 
     def _get_action(self, idx):
@@ -162,6 +170,7 @@ class DatPeractDataset(RLBenchDataset):
             return self._get_attr_by_idx(idx, 'rel_action', False)
         original_action = self._get_attr_by_idx(idx, 'action', False)  # (B, T_pred, nhand=1, 8)
         zero_pad = torch.zeros_like(original_action)
+        zero_pad[..., 6] = 1
         action_padded = torch.cat([original_action, zero_pad], dim=2)  # (B, T_pred, 2, 8)
         if self._relative_action:
             prop = self._get_proprioception(idx)
@@ -185,8 +194,10 @@ class DatPeractDataset(RLBenchDataset):
             intrinsics: (N, n_cam, 3, 3) float
         }
         """
+        total_samples = len(self.annos['action']) // self.chunk_size
+        effective_size = min(self.max_samples, total_samples) if self.max_samples is not None else total_samples
         # First detect which copy we fall into
-        idx = idx % (len(self.annos['action']) // self.chunk_size)
+        idx = idx % effective_size
         # and then which chunk
         idx = idx * self.chunk_size
         if self._actions_only:

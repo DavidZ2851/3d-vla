@@ -1,42 +1,39 @@
 #!/bin/bash
-#SBATCH --job-name=flowervla
+#SBATCH --job-name=calvin_scratch
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=400G
-#SBATCH --gres=gpu:1
+#SBATCH --mem=500G
+#SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40|L40S"
+#SBATCH --constraint="L40S"
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
 
-main_dir=CALVIN
-
 DATA_PATH=/data/group_data/katefgroup/VLA
-
-train_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/val_rechunked8_safe.zarr  # TODO: just for debug
-eval_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/val_rechunked8_safe.zarr
-train_instructions=instructions/calvin/val_instructions.json  # TODO: just for debug
+train_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/train_rechunked8.zarr
+eval_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/val_rechunked8.zarr
+train_instructions=instructions/calvin/train_instructions.json
 val_instructions=instructions/calvin/val_instructions.json
 
 dataset=Calvin10th
-num_workers=1
-memory_limit=6
+num_workers=8
+memory_limit=8
 B=8
 B_val=8
 chunk_size=8
 
 # Training/testing arguments, change these for HPT
-val_freq=100  # 5000
+val_freq=2000
 eval_only=false
-lr=2e-5
+lr=5e-5
 lr_scheduler=tristage_flower
 wd=0.05
-train_iters=50000
+train_iters=200000
 use_compile=false
 use_ema=true
 
@@ -64,14 +61,20 @@ relative_action=true
 denoise_timesteps=5
 denoise_model=rectified_flow
 
+main_dir=calvin
 run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone
+# train from scratch:
 checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
-# checkpoint=flower.pth
+finetune=false
+# load finetune_ckpt:
+# checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-fullpretrain/last.pth
+# finetune=true
 
-ngpus=1
+ngpus=4
+master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))
 
-torchrun --nproc_per_node $ngpus --master_port $RANDOM \
-    main.py \
+torchrun --nproc_per_node $ngpus --master_port $master_port \
+    /data/user_data/ziyinx/analogical_manipulation_clean/main.py \
     --train_data_dir $train_data_dir \
     --eval_data_dir $eval_data_dir \
     --train_instructions $train_instructions \
@@ -111,4 +114,5 @@ torchrun --nproc_per_node $ngpus --master_port $RANDOM \
     --relative_action $relative_action \
     --rotation_format $rotation_format \
     --denoise_timesteps $denoise_timesteps \
-    --denoise_model $denoise_model
+    --denoise_model $denoise_model \
+    --finetune $finetune

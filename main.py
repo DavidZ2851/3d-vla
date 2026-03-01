@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import datetime
 
 import torch
 
@@ -107,7 +108,7 @@ if __name__ == '__main__':
 
     # DDP initialization
     torch.cuda.set_device(args.local_rank)
-    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    torch.distributed.init_process_group(backend='nccl', init_method='env://', timeout=datetime.timedelta(hours=2))
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False

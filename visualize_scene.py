@@ -95,7 +95,7 @@ class RobotSceneVisualizer:
                 color_to_use = 'red' if hand_key == 'left' else 'blue'
                 self._draw_gripper_wireframe(ax, data['pos'], data['rot'], color_to_use, alpha=1.0)
         center_point = np.array([0.8, 0, 0.4])
-        eye_point = np.array([1.3, 0, 1])
+        eye_point = np.array([1.5, 0, 0.8])
         view_dir = center_point - eye_point
         view_dir = view_dir / np.linalg.norm(view_dir)
         elev = np.arcsin(-view_dir[2]) * 180 / np.pi
@@ -143,9 +143,7 @@ class RobotSceneVisualizer:
                                  [0.10, -0.04, 0.0] # 5: Right Finger Tip 
                                  ]).T # 3xN 
         
-        R_ee_tool = (R.from_euler('y', -90, degrees=True).as_matrix()
-            @ R.from_euler('x', -90, degrees=True).as_matrix())
-        rot_matrix = rot_matrix @ R_ee_tool
+        rot_matrix = rot_matrix
         world_points = rot_matrix @ local_points + pos.reshape(3, 1) 
         wp = world_points
         lines = [ [wp[:,1], wp[:,0]], # Wrist to base 

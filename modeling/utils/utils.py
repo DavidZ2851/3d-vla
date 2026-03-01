@@ -1,5 +1,6 @@
-import torch
+import torch, numpy as np
 import torch.nn.functional as F
+from scipy.spatial.transform import Rotation as R
 
 
 def normalise_quat(x: torch.Tensor):
@@ -195,3 +196,70 @@ def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
     index = index.expand(*quat_candidates.shape[:-2], 1, 4)  # [..., 1, 4]
     best_quat = torch.gather(quat_candidates, dim=-2, index=index).squeeze(-2)
     return best_quat.reshape(batch_dim + (4,))  # shape: [..., 4]
+
+def euler_xyz_to_matrix(euler: torch.Tensor):
+    """
+    input euler: (..., 3) in radians
+    return matrix: (..., 3, 3)
+    """
+    x, y, z = torch.unbind(euler, dim=-1)
+    cx = torch.cos(x)
+    sx = torch.sin(x)
+    cy = torch.cos(y)
+    sy = torch.sin(y)
+    cz = torch.cos(z)
+    sz = torch.sin(z)
+    # XYZ convention
+    Rx = torch.stack([
+        torch.ones_like(cx), torch.zeros_like(cx), torch.zeros_like(cx),
+        torch.zeros_like(cx), cx, -sx,
+        torch.zeros_like(cx), sx, cx
+    ], dim=-1).reshape(euler.shape[:-1] + (3, 3))
+    Ry = torch.stack([
+        cy, torch.zeros_like(cy), sy,
+        torch.zeros_like(cy), torch.ones_like(cy), torch.zeros_like(cy),
+        -sy, torch.zeros_like(cy), cy
+    ], dim=-1).reshape(euler.shape[:-1] + (3, 3))
+    Rz = torch.stack([
+        cz, -sz, torch.zeros_like(cz),
+        sz, cz, torch.zeros_like(cz),
+        torch.zeros_like(cz), torch.zeros_like(cz), torch.ones_like(cz)
+    ], dim=-1).reshape(euler.shape[:-1] + (3, 3))
+    return Rz @ Ry @ Rx
+
+def euler_to_6d(euler: torch.Tensor):
+    mat = euler_xyz_to_matrix(euler)
+    return get_ortho6d_from_rotation_matrix(
+        mat.reshape(-1, 3, 3)
+    ).reshape(euler.shape[:-1] + (6,))
+
+def matrix_to_euler_xyz(matrix: torch.Tensor):
+    """
+    XYZ convention
+    """
+    m00 = matrix[..., 0, 0]
+    m10 = matrix[..., 1, 0]
+    m11 = matrix[..., 1, 1]
+    m12 = matrix[..., 1, 2]
+    m20 = matrix[..., 2, 0]
+    m21 = matrix[..., 2, 1]
+    m22 = matrix[..., 2, 2]
+    sy = torch.sqrt(m00 * m00 + m10 * m10)
+    singular = sy < 1e-6
+    x = torch.atan2(m21, m22)
+    y = torch.atan2(-m20, sy)
+    z = torch.atan2(m10, m00)
+    # handle singularity
+    x_s = torch.atan2(-m12, m11)
+    y_s = torch.atan2(-m20, sy)
+    z_s = torch.zeros_like(z)
+    x = torch.where(singular, x_s, x)
+    y = torch.where(singular, y_s, y)
+    z = torch.where(singular, z_s, z)
+    return torch.stack([x, y, z], dim=-1)
+
+def rotate6d_to_euler(sixd: torch.Tensor):
+    mat = compute_rotation_matrix_from_ortho6d(
+        sixd.reshape(-1, 6)
+    ).reshape(sixd.shape[:-1] + (3, 3))
+    return matrix_to_euler_xyz(mat)

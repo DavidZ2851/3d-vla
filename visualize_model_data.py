@@ -1,5 +1,6 @@
 import os
 import random
+from tkinter import NONE
 import torch
 import torch.distributed as dist
 import numpy as np
@@ -8,7 +9,11 @@ import argparse
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 
-from utils.trainers.base import BaseTrainTester, actions_collate_fn
+from utils.trainers.base import (
+    BaseTrainTester,
+    actions_collate_fn,
+    relative_to_absolute as base_relative_to_absolute
+)
 from utils.data_preprocessors.rlbench import RLBenchDataPreprocessor
 from visualize_scene import RobotSceneVisualizer
 from utils.depth2cloud.rlbench import RLBenchDepth2Cloud
@@ -33,12 +38,12 @@ class MockArgs:
         self.dataset = 'geniesim3.0'
         self.keypose_only = False
         self.num_history = 1
-        self.custom_img_size = 256
-        self.train_data_dir = '/data/group_data/katefgroup/VLA/zarr_datasets/geniesim3.0_zarr/train_rechunked4.zarr'
-        self.eval_data_dir = '/data/group_data/katefgroup/VLA/zarr_datasets/geniesim3.0_zarr/val_rechunked4.zarr'
-        self.train_instructions = '/data/group_data/katefgroup/VLA/zarr_datasets/geniesim3.0_zarr/instructions/geniesim3/train_instructions.json'
-        self.val_instructions = '/data/group_data/katefgroup/VLA/zarr_datasets/geniesim3.0_zarr/instructions/geniesim3/val_instructions.json'
-        self.relative_action = True # TODO: debug relative_to_absolute函数
+        self.custom_img_size = None
+        self.train_data_dir = '/data/group_data/katefgroup/VLA/zarr_datasets/geniesim3.0_zarr/train_rechunked8.zarr'
+        self.eval_data_dir = '/data/group_data/katefgroup/VLA/zarr_datasets/geniesim3.0_zarr/val_rechunked8.zarr'
+        self.train_instructions = 'instructions/geniesim3/train_instructions.json'
+        self.val_instructions = 'instructions/geniesim3/val_instructions.json'
+        self.relative_action = False
         self.memory_limit = 0 # No limit
         self.chunk_size = 4
         self.batch_size = 1
@@ -61,31 +66,6 @@ class MockArgs:
         self.denoise_model = 'rectified_flow'
         self.lv2_batch_size = 1
         self.workspace_normalizer_buffer = 0
-
-# Helper function from base_trainer.py (recreated here for standalone usage)
-def relative_to_absolute(action, proprio):
-    """
-    Convert relative action to absolute action.
-    action: (B, T, nhands, 8)
-    proprio: (B, 1, nhands, 8) or (B, 1, 7) depending on structure
-    """
-    # Assuming action is (B, T, nhand, 8) and proprio is (B, 1, nhand, 8)
-    # 8 dims: x, y, z, rot_x, rot_y, rot_z, grip, ignore?
-    
-    # Check dimensions
-    if len(proprio.shape) == 3 and len(action.shape) == 4:
-         # Proprio might need unsqueeze if nhands dimension is missing in proprio
-         if proprio.shape[-1] != action.shape[-1]:
-             # Standard fallback if shapes mismatch drastically
-             return action 
-
-    pos = proprio[..., :3] + action[..., :3].cumsum(1)
-    
-    # Simple Euler addition with wrapping as seen in base_trainer snippet
-    orn = proprio[..., 3:6] + action[..., 3:6].cumsum(1)
-    orn = (orn + torch.pi) % (2 * torch.pi) - torch.pi
-    
-    return torch.cat([pos, orn, action[..., 6:]], -1)
 
 def run_visualization(dataset_cls, root_data_path):
     # 1. Setup
@@ -164,27 +144,51 @@ def run_visualization(dataset_cls, root_data_path):
         preprocessor = RLBenchDataPreprocessor(
             keypose_only=args.keypose_only,
             num_history=args.num_history,
-            orig_imsize=256,
-            custom_imsize=args.custom_img_size,
-            depth2cloud=RLBenchDepth2Cloud((256, 256))
+            orig_imsize=(400, 640),
+            custom_imsize=None,
+            depth2cloud=RLBenchDepth2Cloud((400, 640))
         )
 
         # Process Actions
         actions = preprocessor.process_actions(batch_sliced['action'])
         proprio = preprocessor.process_proprio(batch_sliced['proprioception'])
-        # For now, just visualize absolute actions
-        abs_actions = actions.cpu()
+        if args.relative_action:
+            # GenieSim stores quaternion in wxyz here.
+            abs_actions = base_relative_to_absolute(
+                actions, proprio[:, [-1]], qform='wxyz'
+            ).cpu()
+        else:
+            abs_actions = actions.cpu()
 
         # Process Observations (RGB/PCD)
         # process_obs expects (rgbs, rgb2d, depth, extrinsics, intrinsics, augment)
+        print('extrinsics', batch_sliced['extrinsics'])
+        print('depth_min', batch_sliced['depth'][0, 0, :30].min(), 'depth_max', batch_sliced['depth'][0, 0, :30].max(), 'depth_min', batch_sliced['depth'][0, 0,-30:].mean(), 'depth_max', batch_sliced['depth'][0, 0, -30:].max())
+        
+        extrinsics = batch_sliced['extrinsics'].clone()
+        # 寻找第三行第三列 > 0 的相机 (意味着Z轴指向上方)
+        wrong_mask = extrinsics[..., 2, 2] > 0 
+        # 如果存在错误的相机，则进行翻转修复
+        if wrong_mask.any():
+            fix_matrix = torch.tensor([
+                [1.0,  0.0,  0.0, 0.0],
+                [0.0, -1.0,  0.0, 0.0],
+                [0.0,  0.0, -1.0, 0.0],
+                [0.0,  0.0,  0.0, 1.0]
+            ], dtype=extrinsics.dtype, device=extrinsics.device)
+            # 右乘修复矩阵，绕相机局部 X 轴旋转 180 度
+            extrinsics[wrong_mask] = extrinsics[wrong_mask] @ fix_matrix
+            print(f"Fixed {wrong_mask.sum().item()} flipped extrinsics.")
+
         rgbs_proc, pcds_proc = preprocessor.process_obs(
             batch_sliced['rgb'],
             None,  # rgb2d is None, batch_sliced.get('rgb2d', None),
             batch_sliced['depth'],
-            batch_sliced['extrinsics'],
+            extrinsics,
             batch_sliced['intrinsics'],
             augment=False
         )
+        print('pcds x min', pcds_proc[0, 0, 0].min(), 'pcds x max', pcds_proc[0, 0, 0].max(), 'pcds y min', pcds_proc[0, 0, 1].min(), 'pcds y max', pcds_proc[0, 0, 1].max(), 'pcds z min', pcds_proc[0, 0, 2].min(), 'pcds z max', pcds_proc[0, 0, 2].max())
 
         # 5. Visualize
         print("Generating visualization...")
@@ -244,18 +248,14 @@ def run_visualization(dataset_cls, root_data_path):
 
         def get_matrix_from_wxyz(vec_8d):
             # Indices 3:7 are w,x,y,z
-            R_EE_TOOL = (
-                R.from_euler('y', -90, degrees=True).as_matrix()
-                @ R.from_euler('x', -90, degrees=True).as_matrix()
-            )
             quat_wxyz = vec_8d[3:7]
             # Scipy needs x,y,z,w
             quat_xyzw = quat_wxyz[[1, 2, 3, 0]]
-            return R.from_quat(quat_xyzw).as_matrix() @ R_EE_TOOL  # visualize_scene apply additional @R_EE_TOOL.T
+            return R.from_quat(quat_xyzw).as_matrix()
 
         # Color Gradients
         # t=0 -> t=T: Fade colors
-        for t in range(T):
+        for t in range(1):
             alpha = 1 - 0.7 * (t / float(T)) # Fade out
 
             if nhands > 0:
@@ -273,11 +273,20 @@ def run_visualization(dataset_cls, root_data_path):
         # Save visualization
         output_filename = f"vis_sample_{idx}.png"
         vis.visualize(filename=output_filename)
-        print(f"Done! Saved to {output_filename}")
+        
+        # Save corresponding RGB frame (GenieSim uses camera 0).
+        # batch_sliced['rgb']: (B, ncam, 3, H, W), uint8
+        rgb_frame = batch_sliced['rgb'][0, 0].detach().cpu().permute(1, 2, 0).numpy()
+        if rgb_frame.dtype != np.uint8:
+            rgb_frame = np.clip(rgb_frame, 0, 255).astype(np.uint8)
+        rgb_output_filename = f"vis_sample_{idx}_rgb.png"
+        plt.imsave(rgb_output_filename, rgb_frame)
+
+        print(f"Done! Saved to {output_filename} and {rgb_output_filename}")
     finally:
         cleanup_ddp()
 
 if __name__ == "__main__":
     from datasets.geniesim3 import GenieSim3Dataset as DatasetCls
-    DATA_PATH ='/data/group_data/katefgroup/VLA/zarr_datasets/geniesim3.0_zarr/train_rechunked4.zarr'     
+    DATA_PATH ='/data/group_data/katefgroup/VLA/zarr_datasets/geniesim3.0_zarr/train_rechunked8.zarr'     
     run_visualization(DatasetCls, DATA_PATH)

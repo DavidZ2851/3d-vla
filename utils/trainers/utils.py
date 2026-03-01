@@ -1,5 +1,5 @@
 def compute_metrics(pred, gt, nhand=2):
-    # pred/gt are (B, L, 3+rot+1)
+    # pred/gt are (B, L, nhand=2, xyz+rot+1)
     pos_l2 = ((pred[..., :3] - gt[..., :3]) ** 2).sum(-1).sqrt()
     # symmetric quaternion eval
     quat_l1 = (pred[..., 3:-1] - gt[..., 3:-1]).abs().sum(-1)
@@ -12,30 +12,26 @@ def compute_metrics(pred, gt, nhand=2):
 
     # Trajectory metrics
     if nhand == 1:
-        ret_1, ret_2 = {
-            tr + 'pos_l2': pos_l2.mean(),
-            tr + 'pos_acc_001': ((pos_l2 < 0.01).float().mean()-0.5)*2,
-            tr + 'rot_l1': quat_l1.mean(),
-            tr + 'rot_acc_0025': ((quat_l1 < 0.025).float().mean()-0.5)*2,
-            tr + 'gripper': openess.flatten().float().mean()
-        }, {
-            tr + 'pos_l2': pos_l2.mean(-1),
-            tr + 'pos_acc_001': ((pos_l2 < 0.01).float().mean(-1)-0.5)*2,
-            tr + 'rot_l1': quat_l1.mean(-1),
-            tr + 'rot_acc_0025': ((quat_l1 < 0.025).float().mean(-1)-0.5)*2
-        }
-    else: # nhand == 2
-        ret_1, ret_2 = {
-            tr + 'pos_l2': pos_l2.mean(),
-            tr + 'pos_acc_001': (pos_l2 < 0.01).float().mean(),
-            tr + 'rot_l1': quat_l1.mean(),
-            tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(),
-            tr + 'gripper': openess.flatten().float().mean()
-        }, {
-            tr + 'pos_l2': pos_l2.mean(-1),
-            tr + 'pos_acc_001': (pos_l2 < 0.01).float().mean(-1),
-            tr + 'rot_l1': quat_l1.mean(-1),
-            tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(-1)
-        }
-
-    return ret_1, ret_2
+        pos_l2 = pos_l2[..., 0]       # (B, L)
+        quat_l1 = quat_l1[..., 0]
+        openess = openess[..., 0]
+        # ret_1, ret_2 = {
+        #     tr + 'pos_l2': pos_l2.mean(),
+        #     tr + 'pos_acc_001': ((pos_l2 < 0.01).float().mean()-0.5)*2,
+        #     tr + 'rot_l1': quat_l1.mean(),
+        #     tr + 'rot_acc_0025': ((quat_l1 < 0.025).float().mean()-0.5)*2,
+        #     tr + 'gripper': openess.flatten().float().mean()
+        # }, {
+        #     tr + 'pos_l2': pos_l2.mean(-1),
+        #     tr + 'pos_acc_001': ((pos_l2 < 0.01).float().mean(-1)-0.5)*2,
+        #     tr + 'rot_l1': quat_l1.mean(-1),
+        #     tr + 'rot_acc_0025': ((quat_l1 < 0.025).float().mean(-1)-0.5)*2
+        # }
+    ret_1 = {
+        tr + 'pos_l2': pos_l2.mean(),
+        tr + 'pos_acc_001': (pos_l2 < 0.01).float().mean(),
+        tr + 'rot_l1': quat_l1.mean(),
+        tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(),
+        tr + 'gripper': openess.flatten().float().mean()
+    }
+    return ret_1

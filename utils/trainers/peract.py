@@ -14,7 +14,7 @@ class PeractTrainTester(BaseTrainTester):
             augment=augment
         )
         mask = torch.zeros(sample["action"].shape[:-1], dtype=bool, device='cuda')  # (B, T, 2)
-        mask[...,1] = True  # mask out the second "fake" hand
+        #mask[...,1] = True  # NOTE: mask out the second "fake" hand
         return (
             sample["action"],
             mask,
