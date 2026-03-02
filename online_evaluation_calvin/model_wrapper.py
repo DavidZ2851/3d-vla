@@ -61,13 +61,15 @@ class Model:
 
     @torch.no_grad()
     def preprocess(self, obs, env):
-        # proprio should be (B=1, nhist=1, nhand=1, 7)
-        proprio = self.preprocessor.process_actions(
+        real_proprio = self.preprocessor.process_actions(
             torch.from_numpy(np.concatenate([
                 obs['robot_obs'][:6],
                 (obs['robot_obs'][[-1]] + 1) / 2
             ], -1))[None, None, None].float()
-        )
+        )  # (B=1, nhist=1, nhand=1, 7)
+        fake_proprio = torch.zeros_like(real_proprio)
+        fake_proprio[..., -1] = 0.5
+        proprio = torch.cat([real_proprio, fake_proprio], 2)  # (B=1, nhist=1, nhand=2, 7)
         # rgbs, pcds are (B=1, ncam=2, 3, H, W)
         rgbs, pcds = self.preprocessor.process_obs(
             torch.from_numpy(obs["rgb_obs"]["rgb_static"].transpose(2, 0, 1)[None, None]),
@@ -86,7 +88,7 @@ class Model:
             obs: {
                 rgb: (B=1, ncam=2, 3, H, W),
                 pcd: (B=1, ncam=2, 3, H, W),
-                proprio: (B=1, nhist=1, nhand=1, 7)
+                proprio: (B=1, nhist=1, nhand=2, 7)
             }
             instruction: str, the instruction of the task
 
@@ -96,8 +98,7 @@ class Model:
         device = self.args.device
 
         # Process inputs
-        trajectory_mask = torch.full([self.args.pred_len], False).to(device)
-        trajectory_mask = trajectory_mask[None, :, None]
+        trajectory_mask = torch.full((1, self.args.pred_len, 2), False, device=device)
 
         instr = (
             [instruction,] if not self.args.pre_tokenize
@@ -107,18 +108,16 @@ class Model:
         # Forward pass
         trajectory = self.policy(
             None,
-            trajectory_mask,  # (1, T, 1)
+            trajectory_mask,  # (1, T, 2)
             obs['rgb'],  # (1, 2, 3, h, w)
             None,  # (1, 1, 3, 84, 84)
             obs['pcd'],  # (1, 2, 3, h, w)
             instr,
-            obs['proprio'],  # (1, nhist, 1, 7)
+            obs['proprio'],  # (1, nhist, 2, 7)
             run_inference=True
-        )  # (1, T, 1, 7)
-        trajectory = trajectory.view(1, self.args.pred_len, 7)  # (1, T, 7)
-        trajectory = trajectory.data.cpu().numpy()
-        trajectory[..., -1] = 2 * (trajectory[..., -1] >= 0.5).astype(int) - 1
-
+        ).view(1, self.args.pred_len, 2, 7)  # (1, T, nhand=2, 7)
+        trajectory = trajectory.data.cpu().numpy()[:,:,0,:]  # (1, T, 7)
+        trajectory[..., -1] = 2 * (trajectory[..., -1] >= 0.5).astype(int) - 1  # openness
         # Back to absolute actions
         if bool(self.args.relative_action):
             trajectory = self._to_abs(
