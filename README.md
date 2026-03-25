@@ -57,32 +57,6 @@ Remember to use the latest `calvin_env` module, which fixes bugs of `turn_off_le
 Maybe need to upgrade networkx and change np.float to float in urdfpy.
 May need to install pyhash2
 
-### Install RLBench locally
-```
-# Install open3D
-> pip install open3d
-
-# Install PyRep (https://github.com/stepjam/PyRep?tab=readme-ov-file#install)
-> git clone https://github.com/stepjam/PyRep.git 
-> cd PyRep/
-> wget https://www.coppeliarobotics.com/files/V4_1_0/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
-> tar -xf CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz;
-> echo "export COPPELIASIM_ROOT=$(pwd)/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04" >> $HOME/.bashrc; 
-> echo "export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:\$COPPELIASIM_ROOT" >> $HOME/.bashrc;
-> echo "export QT_QPA_PLATFORM_PLUGIN_PATH=\$COPPELIASIM_ROOT" >> $HOME/.bashrc;
-> source $HOME/.bashrc;
-> conda activate 3d_diffuser_actor
-> pip install -r requirements.txt; pip install -e .; cd ..
-
-# Install RLBench (Note: there are different forks of RLBench)
-# PerAct setup
-> git clone https://github.com/MohitShridhar/RLBench.git
-> cd RLBench; git checkout -b peract --track origin/peract; pip install -r requirements.txt; pip install -e .; cd ..;
-```
-
-Remember to modify the success condition of `close_jar` task in RLBench, as the original condition is incorrect.  See this [pull request](https://github.com/MohitShridhar/RLBench/pull/1) for more detail.  
-
-
 ### Install LeRobot (not in this repo)
 ```
 > git clone https://github.com/huggingface/lerobot.git
