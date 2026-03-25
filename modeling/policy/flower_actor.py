@@ -67,7 +67,7 @@ class FlowerActor3D(BaseDenoiseActor):
             nhist=nhist * 2,  # NOTE: build model with always 2 hands (was nhist=nhist * nhand)
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
-            rot_dim=6  #always 6d now, was: rot_dim=3 if rotation_format == 'euler' else 6
+            rot_dim=3 if rotation_format == 'euler' else 6  # NOTE: could change to always 6d
         )
 
 
@@ -195,7 +195,7 @@ class TransformerHead(nn.Module):
         Returns:
             list of (B, trajectory_length, nhand, 3+6+X)
         """
-        _, traj_len, nhand, _ = trajectory.shape
+        B, traj_len, nhand, _ = trajectory.shape
 
         # Trajectory features
         if nhand > 1:
@@ -206,8 +206,8 @@ class TransformerHead(nn.Module):
         if valid_mask is not None:
             token_mask = valid_mask.squeeze(-1)  # (B, T, nhand=2, 1) → (B, T, nhand=2)
             token_mask = token_mask.reshape(token_mask.shape[0], -1)  # (B, T*2)
-            token_mask_float = token_mask.float()  # float mask for multiplication
-            token_mask_bool = token_mask == 0  # bool mask for attention
+            token_mask_float = token_mask.float()  # float mask for multiplication, 1 for real, 0 for fake
+            token_mask_bool = token_mask == 0  # bool mask for attention, False for real, True for fake
         else:
             token_mask_float = None
             token_mask_bool = None
@@ -220,15 +220,22 @@ class TransformerHead(nn.Module):
         traj_feats = self.traj_lang_attention(
             seq1=traj_feats,
             seq2=instr_feats,
-            #seq1_token_mask=token_mask_float,
+            seq1_token_mask=token_mask_float,  # NOTE: (B, T*2) 1 for real, 0 for fake
             seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
         )[-1]
         traj_feats = traj_feats + traj_time_pos
         traj_xyz = trajectory[..., :3]
 
         # Denoising timesteps' embeddings
+        valid_mask_hist = None
+        if valid_mask is not None:
+            hand_valid = valid_mask[:, 0, :, 0]  # (B, 2)
+            valid_mask_hist = hand_valid[:, None, :]  # (B,1,2)
+            nhist = proprio_feats.shape[1]//2
+            valid_mask_hist = valid_mask_hist.expand(-1, nhist, -1)  # (B,nhist,nhand=2)
+            valid_mask_hist = valid_mask_hist.reshape(B, nhist*nhand).unsqueeze(-1).float()  # (B, nhist*nhand, 1)
         time_embs = self.encode_denoising_timestep(
-            timesteps, proprio_feats
+            timesteps, proprio_feats, valid_mask_hist  # NOTE: mask fake hand feature inside proprio_feats
         )
 
         # Concatenate scene feature and language features
@@ -236,15 +243,15 @@ class TransformerHead(nn.Module):
         rgb3d_pos = torch.cat((rgb3d_pos, instr_pos), 1)
 
         # Positional embeddings
-        rel_traj_pos = self.relative_pe_layer(traj_xyz)
+        rel_traj_pos = self.relative_pe_layer(traj_xyz)  # NOTE: fake hand doesn't influence this
         rel_scene_pos = self.relative_pe_layer(rgb3d_pos)
 
         # Self attention among gripper and sampled context
         traj_feats = self.self_attn(
             seq=traj_feats,
             seq0=rgb3d_feats,
-            # seq_token_mask=token_mask_float,
-            # seq_token_mask_bool=token_mask_bool,
+            seq_token_mask=token_mask_float,  # NOTE: mask shared cross and self attention for fake hand
+            seq_token_mask_bool=token_mask_bool,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,
@@ -254,13 +261,13 @@ class TransformerHead(nn.Module):
         # Rotation head
         rotation = self.predict_rot(
             traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
-            time_embs, traj_feats.shape[1], #token_mask_float=token_mask_float, token_mask_bool=token_mask_bool
+            time_embs, traj_feats.shape[1], token_mask_float=token_mask_float, token_mask_bool=token_mask_bool  # NOTE: mask fake hand attention for rot head
         )
 
         # Position head
         position, position_features = self.predict_pos(
             traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
-            time_embs, traj_feats.shape[1], #token_mask_float=token_mask_float, token_mask_bool=token_mask_bool
+            time_embs, traj_feats.shape[1], token_mask_float=token_mask_float, token_mask_bool=token_mask_bool  # NOTE: mask fake hand attention for pos head
         )
 
         # Openess head from position head
@@ -271,19 +278,22 @@ class TransformerHead(nn.Module):
                  .unflatten(1, (traj_len, nhand))
         ]
 
-    def encode_denoising_timestep(self, timestep, proprio_feats):
+    def encode_denoising_timestep(self, timestep, proprio_feats, valid_mask_hist=None):
         """
         Compute denoising timestep features and positional embeddings.
 
         Args:
             - timestep: (B,)
-
+            - proprio_feats: (B, nhist*nhand, F)
+            - valid_mask_hist: (B, nhist*nhand, 1)
         Returns:
             - time_feats: (B, F)
         """
         time_feats = self.time_emb(timestep)
-        proprio_feats = proprio_feats.flatten(1)
-        curr_gripper_feats = self.curr_gripper_emb(proprio_feats)
+        if valid_mask_hist is not None:
+            proprio_feats = proprio_feats * valid_mask_hist
+        proprio_feats = proprio_feats.flatten(1)  # (B, nhist*nhand, F) -> (B, nhist*nhand*F)
+        curr_gripper_feats = self.curr_gripper_emb(proprio_feats)  # (B, F)
         return time_feats + curr_gripper_feats
 
     def predict_pos(self, traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
@@ -291,8 +301,8 @@ class TransformerHead(nn.Module):
         position_features = self.position_self_attn(
             seq=traj_feats,
             seq0=rgb3d_feats,
-            seq_token_mask=None, #token_mask_float,
-            seq_token_mask_bool=None, #token_mask_bool,
+            seq_token_mask=token_mask_float,
+            seq_token_mask_bool=token_mask_bool,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,
@@ -308,8 +318,8 @@ class TransformerHead(nn.Module):
         rotation_features = self.rotation_self_attn(
             seq=traj_feats,
             seq0=rgb3d_feats,
-            seq_token_mask=None, #token_mask_float,
-            seq_token_mask_bool=None, #token_mask_bool,
+            seq_token_mask=token_mask_float,
+            seq_token_mask_bool=token_mask_bool,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,

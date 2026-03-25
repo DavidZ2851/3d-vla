@@ -1,6 +1,7 @@
 import random, numpy as np, torch
 
 from .base import BaseDataset
+from .utils import to_relative_action
 
 
 PERACT_TASKS = [
@@ -148,7 +149,7 @@ class DatPeractDataset(RLBenchDataset):
     """RLBench dataset under Peract setup."""
     tasks = PERACT_TASKS
     cameras = ("left_shoulder", "right_shoulder", "wrist", "front")
-    camera_inds = None
+    camera_inds = [3]  # TODO: use only front camera
     train_copies = 10
     camera_inds2d = None
     max_samples = None
@@ -176,10 +177,9 @@ class DatPeractDataset(RLBenchDataset):
             prop = self._get_proprioception(idx)
             anchor_action = prop[:, -1, :, :].unsqueeze(-2)  # (B, 2, 1, 8)
             hand_action = action_padded.transpose(1, 2)  # (B, 2, T, 8)
-            from .utils import to_relative_action
             hand_action = to_relative_action(hand_action, anchor_action, self.quat_format)  # xyzw
-            hand_action = hand_action.transpose(1, 2)  # (B, T, 2, 8)
-        return hand_action
+            action_padded = hand_action.transpose(1, 2)  # (B, T, 2, 8)
+        return action_padded
 
     def __getitem__(self, idx):
         """
@@ -291,6 +291,21 @@ class Peract2SingleCamDataset(RLBenchDataset):
     train_copies = 10
     camera_inds2d = None
 
+    def _get_action(self, idx):
+        if self._relative_action and 'rel_action' in self.annos:
+            rel_action = self._get_attr_by_idx(idx, 'rel_action', False)
+            hand_action = rel_action[:, :, :-1, :]
+            return hand_action
+        action = self._get_attr_by_idx(idx, 'action', False)
+        hand_action = action[:, :, :2, :]  # the first two dims are definitely hands
+        if self._relative_action:
+            prop = self._get_proprioception(idx)
+            anchor_action = prop[:, -1, :, :].unsqueeze(-2)  # (chunk_size, nhand, 1, 8)
+            hand_action = hand_action.transpose(1, 2)  # (chunk_size, nhand, T, 8)
+            from .utils import to_relative_action
+            hand_action = to_relative_action(hand_action, anchor_action, 'xyzw')
+            hand_action = hand_action.transpose(1, 2)  # (chunk_size, T, nhand, 8)
+        return hand_action
 
 class SinglePeract2Dataset(TaskRLBenchDataset):
     """RLBench dataset under Peract2 setup."""

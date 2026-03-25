@@ -76,7 +76,8 @@ class DenoiseActor(BaseDenoiseActor):
         pcd,
         instruction,
         proprio,
-        run_inference=False
+        run_inference=False,
+        instr_mask=None,
     ):
         """
         Arguments:
@@ -105,13 +106,19 @@ class DenoiseActor(BaseDenoiseActor):
         if run_inference:
             return self.compute_trajectory(
                 trajectory_mask,
-                rgb3d, rgb2d, pcd, instruction, proprio
+                rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=instr_mask
             )
 
         # Training, use gt_trajectory to compute loss
         return self.compute_loss(
             gt_trajectory,
-            rgb3d, rgb2d, pcd, instruction, proprio
+            trajectory_mask,
+            rgb3d,
+            rgb2d,
+            pcd,
+            instruction,
+            proprio,
+            instr_mask=instr_mask,
         )
 
 

@@ -30,12 +30,13 @@ chunk_size=8
 # Training/testing arguments, change these for HPT
 val_freq=2000
 eval_only=false
-lr=5e-5
+lr=1e-4
 lr_scheduler=tristage_flower
-wd=0.05
-train_iters=200000
+backbone_lr=1e-5
+wd=1e-10  # 0.05
+train_iters=600000
 use_compile=false
-use_ema=true
+use_ema=false  # true
 
 # Model arguments, change (some of) these for new architectures
 model_type=flower_actor_3d
@@ -49,11 +50,11 @@ finetune_backbone=true
 finetune_text_encoder=false
 fps_subsampling_factor=1
 
-C=1024
+C=256  # 1024
 num_attn_heads=16
-num_vis_instr_attn_layers=3
-num_history=1
-num_shared_attn_layers=16
+num_vis_instr_attn_layers=3  # unused by Florence2, only applied to CLIP.
+num_history=3  # 1
+num_shared_attn_layers=4  # 16
 
 workspace_normalizer_buffer=0.0
 rotation_format=euler
@@ -92,6 +93,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --eval_only $eval_only \
     --lr $lr \
     --lr_scheduler $lr_scheduler \
+    --backbone_lr $backbone_lr \
     --wd $wd \
     --train_iters $train_iters \
     --use_compile $use_compile \

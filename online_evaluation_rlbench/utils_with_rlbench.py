@@ -97,6 +97,7 @@ class Actioner:
         self._relative = bool(getattr(self._policy, "_relative", True))
         self._rotation_format = getattr(self._policy, "_rotation_format", "quat_xyzw")
         self._instr = None
+        self._instr_mask = None
         self.tokenizer = fetch_tokenizers(backbone)
         self.encoder, _ = fetch_text_encoders('clip')
         self.encoder.cuda()
@@ -104,7 +105,13 @@ class Actioner:
 
     def load_episode(self, descriptions):
         instr = [random.choice(descriptions)]
-        self._instr = self.tokenizer(instr).cuda(non_blocking=True)
+        tok_out = self.tokenizer(instr)
+        if isinstance(tok_out, torch.Tensor):
+            self._instr = tok_out.cuda(non_blocking=True)
+            self._instr_mask = None
+        else:
+            self._instr = tok_out.input_ids.cuda(non_blocking=True)
+            self._instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
         #self._instr = self.encoder(self._instr)
 
     def predict(self, rgbs, pcds, gripper, prediction_len=1):
@@ -122,15 +129,19 @@ class Actioner:
         fake = torch.zeros_like(real)               # (B, nhist, 1, 8)
         fake[..., 6] = 1.0                          # identity quat w=1
         proprio_2hand = torch.cat([real, fake], 2)  # (B, nhist, 2, 8)
+        # Peract: second hand is padded fake; must mask it so model matches training
+        trajectory_mask = torch.full([1, prediction_len, 2], False, device=rgbs.device, dtype=torch.bool)
+        trajectory_mask[..., 1] = True  # mask second (fake) hand
         pred = self._policy(
             None,
-            torch.full([1, prediction_len, 2], False).cuda(non_blocking=True),
+            trajectory_mask,
             rgbs,
             None,
             pcds,
             self._instr,
             proprio_2hand,
-            run_inference=True
+            run_inference=True,
+            instr_mask=self._instr_mask,
         ).view(1, prediction_len, 2, 8)
         return pred[:,:,:1,:]  # (1, prediction_len, nhand=1, 8)
     

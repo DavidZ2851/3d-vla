@@ -5,6 +5,7 @@ from .flower.model import FLOWERVLA
 from .flower.model_peract2 import FLOWERVLA as FLOWERVLARLB
 from .flower.model_peract2_3d import FLOWERVLA3D
 from .flower_actor import FlowerActor3D, FlowerActor2D
+from .flower_actor_qwen import QwenFlowerActor3D
 # from .old_diffuser_actor import DiffuserActor
 
 
@@ -25,6 +26,8 @@ def fetch_model_class(model_type):
         return FlowerActor3D
     if model_type == 'flower_actor_2d':
         return FlowerActor2D
+    if model_type == 'qwen_flower_actor_3d':
+        return QwenFlowerActor3D
     # if model_type == '3dda':
     #     return DiffuserActor
     return None

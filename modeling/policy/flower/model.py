@@ -579,7 +579,8 @@ class FLOWERVLA(nn.Module):
         pcd,
         instruction,
         proprio,
-        run_inference=False
+        run_inference=False,
+        instr_mask=None,
     ):
         """
         Arguments:

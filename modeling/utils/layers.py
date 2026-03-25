@@ -208,6 +208,7 @@ class AttentionModule(nn.Module):
         Args:
             seq1: tensor (B, S1, C)
             seq2: tensor (B, S2, C)
+            seq1_token_mask: tensor (B, S1)
             seq2_key_padding_mask: tensor (B, S2)
             seq1_pos: (B, S1, C) if not rotary, else (B, S1, C, 2)
             seq2_pos: (B, S2, C) if not rotary, else (B, S2, C, 2)
@@ -222,6 +223,8 @@ class AttentionModule(nn.Module):
         for i in range(self.num_layers):
             if self.is_self:
                 seq2 = seq1
+            if seq1_token_mask is not None:
+                seq1 = seq1 * seq1_token_mask.unsqueeze(-1)
             seq1 = self.attn_layers[i](
                 seq1, seq2,
                 seq2_key_padding_mask,
@@ -351,8 +354,8 @@ class DoubleCrossSelfAttentionModule(nn.Module):
         Args:
             seq: tensor (B, S, C)
             seq0: tensor (B, S0, C)
-            seq_token_mask: tensor(float) (B, T*nhand),
-            seq_token_mask_bool: tensor(bool) (B, T*nhand),
+            seq_token_mask: tensor(float) (B, T*nhand),  1 for real and 0 for fake
+            seq_token_mask_bool: tensor(bool) (B, T*nhand),  False for real and True for fake
             seq0_key_padding_mask: tensor (B, S0)
             seq_pos_0: (B, S, C) if not rotary, else (B, S, C, 2), first att
             seq0_pos: (B, S0, C) if not rotary, else (B, S0, C, 2)
@@ -368,6 +371,8 @@ class DoubleCrossSelfAttentionModule(nn.Module):
         output = []
         self_kp_mask = seq_token_mask_bool if seq_token_mask_bool is not None else None
         for i in range(self.num_layers):
+            if seq_token_mask is not None:
+                seq = seq * seq_token_mask.unsqueeze(-1)
             seq = self.attn_layers_0[i](
                 seq, seq0,
                 seq0_key_padding_mask,

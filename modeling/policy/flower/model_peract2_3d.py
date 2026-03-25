@@ -310,7 +310,8 @@ class FLOWERVLA3D(FLOWERVLA):
         pcd,
         instruction,
         proprio,
-        run_inference=False
+        run_inference=False,
+        instr_mask=None,
     ):
         """
         Arguments:

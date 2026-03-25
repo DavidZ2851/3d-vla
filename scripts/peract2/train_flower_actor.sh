@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=peract2_finetune_resume
+#SBATCH --job-name=peract2_finetune256
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=500G
+#SBATCH --mem=400G
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=general
@@ -22,27 +22,29 @@ train_instructions=instructions/peract2/instructions.json
 val_instructions=instructions/peract2/instructions.json
 
 # ---- Dataset / loader ----
-dataset="Peract2_3dfront_3dwrist"
+dataset="Peract2_3dfront" # "Peract2_3dfront_3dwrist"
 num_workers=4
 memory_limit=8
-B=4
-B_val=4
+B=32
+B_val=32
 chunk_size=1
+lv2_batch_size=2
 
 # ---- Training ----
 val_freq=2000
 eval_only=false
-lr=5e-5
-lr_scheduler=tristage_flower
-wd=0.05
+lr=1e-4
+lr_scheduler=constant  # tristage_flower
+backbone_lr=1e-5
+wd=1e-10  # 0.05
 train_iters=600000
 use_compile=false
-use_ema=true
+use_ema=false  # true
 
 # ---- Model ----
 model_type=flower_actor_3d
 bimanual=true
-keypose_only=false
+keypose_only=true
 pre_tokenize=true
 custom_img_size=256
 
@@ -51,15 +53,15 @@ finetune_backbone=true
 finetune_text_encoder=false
 fps_subsampling_factor=1
 
-C=1024
+C=256  # 1024
 num_attn_heads=16
 num_vis_instr_attn_layers=3
-num_history=1
-num_shared_attn_layers=16
+num_history=3  # 1
+num_shared_attn_layers=4  # 16
 
 workspace_normalizer_buffer=0.0
 rotation_format=quat_xyzw
-relative_action=true
+relative_action=false  # true
 denoise_timesteps=5
 denoise_model=rectified_flow
 
@@ -67,11 +69,11 @@ denoise_model=rectified_flow
 main_dir=peract2
 run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
 # train from scratch:
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/peract2/flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-job6464932/last.pth #$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
-finetune=false
+# checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
+# finetune=false
 # load finetune_ckpt:
-# checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-fullpretrain/last.pth
-# finetune=true
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C256-B8-lr1e-4-constant-H3-rectified_flow-florence2-finetuned_true_smaller/iter220k.pth
+finetune=true
 
 ngpus=4
 master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))
@@ -87,6 +89,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --memory_limit $memory_limit \
     --batch_size $B \
     --batch_size_val $B_val \
+    --lv2_batch_size $lv2_batch_size \
     --chunk_size $chunk_size \
     --exp_log_dir $main_dir \
     --run_log_dir ${run_log_dir} \
@@ -95,6 +98,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --eval_only $eval_only \
     --lr $lr \
     --lr_scheduler $lr_scheduler \
+    --backbone_lr $backbone_lr \
     --wd $wd \
     --train_iters $train_iters \
     --use_compile $use_compile \

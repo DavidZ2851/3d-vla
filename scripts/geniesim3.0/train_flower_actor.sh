@@ -1,15 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=flowervla
+#SBATCH --job-name=pretrain_C256
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=500G
+#SBATCH --mem=400G
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40S"
+#SBATCH --constraint="A100_40GB|L40S"
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
@@ -29,16 +29,18 @@ memory_limit=8
 B=8
 B_val=8
 chunk_size=8
+lv2_batch_size=4
 
 # ---- Training ----
 val_freq=2000
 eval_only=false
-lr=5e-5
-lr_scheduler=tristage_flower
-wd=0.05
-train_iters=400000
+lr=1e-4
+lr_scheduler=constant  # tristage_flower
+backbone_lr=1e-5
+wd=1e-10  # 0.05
+train_iters=600000
 use_compile=false
-use_ema=true
+use_ema=false  # true
 
 # ---- Model ----
 model_type=flower_actor_3d
@@ -48,19 +50,19 @@ pre_tokenize=true
 custom_img_size=256  # unused
 
 backbone=florence2
-finetune_backbone=false  # freeze florence2 during pretraining
+finetune_backbone=true
 finetune_text_encoder=false
 fps_subsampling_factor=1
 
-C=1024
+C=256  # 1024
 num_attn_heads=16
-num_vis_instr_attn_layers=3
-num_history=1
-num_shared_attn_layers=16
+num_vis_instr_attn_layers=3  # unused by Florence2, only applied to CLIP.
+num_history=3  # 1
+num_shared_attn_layers=4  # 16
 
 workspace_normalizer_buffer=0.0
 rotation_format=quat_wxyz
-relative_action=true
+relative_action=false  # true
 denoise_timesteps=5
 denoise_model=rectified_flow
 
@@ -86,6 +88,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --memory_limit $memory_limit \
     --batch_size $B \
     --batch_size_val $B_val \
+    --lv2_batch_size $lv2_batch_size \
     --chunk_size $chunk_size \
     --exp_log_dir $main_dir \
     --run_log_dir ${run_log_dir} \
@@ -94,6 +97,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --eval_only $eval_only \
     --lr $lr \
     --lr_scheduler $lr_scheduler \
+    --backbone_lr $backbone_lr \
     --wd $wd \
     --train_iters $train_iters \
     --use_compile $use_compile \

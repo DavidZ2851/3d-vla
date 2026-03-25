@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=peract_finetune
+#SBATCH --job-name=peract_scratch64
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
@@ -9,7 +9,7 @@
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40S"
+#SBATCH --constraint="A100_40GB"
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
@@ -26,41 +26,41 @@ val_instructions=instructions/peract/instructions.json
 dataset="PeractDat"
 num_workers=8
 memory_limit=8
-B=4
-B_val=4
+B=64
+B_val=64
 chunk_size=4
 
 # ---- Training ----
 val_freq=2000
 eval_only=false
-lr=5e-5
-lr_scheduler=tristage_flower
-wd=0.05
-train_iters=200000
+lr=1e-4  # 5e-5
+lr_scheduler=constant  # tristage_flower
+wd=1e-10  # 0.05
+train_iters=600000
 use_compile=false
-use_ema=true
+use_ema=false  #true
 
 # ---- Model ----
 model_type=flower_actor_3d
 bimanual=false
-keypose_only=false
+keypose_only=true
 pre_tokenize=true
 custom_img_size=128  # original rgbd size
 
 backbone=florence2
-finetune_backbone=true
+finetune_backbone=false  # true
 finetune_text_encoder=false
 fps_subsampling_factor=1
 
 C=1024
 num_attn_heads=16
 num_vis_instr_attn_layers=3
-num_history=1
-num_shared_attn_layers=16
+num_history=3  # 1
+num_shared_attn_layers=4  # 16
 
 workspace_normalizer_buffer=0.0
 rotation_format=quat_xyzw
-relative_action=true
+relative_action=true # -> false?
 denoise_timesteps=5
 denoise_model=rectified_flow
 
@@ -68,11 +68,11 @@ denoise_model=rectified_flow
 main_dir=peract
 run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
 # train from scratch:
-# checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
-# finetune=false
+checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
+finetune=false
 # load finetune_ckpt:
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-fullpretrain/last.pth
-finetune=true
+# checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/geniesim3.0/flower_actor_3d-GenieSim3.0-C1024-B8-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_false-fullpretrain/last.pth
+# finetune=true
 
 ngpus=4
 master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))

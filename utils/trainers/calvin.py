@@ -20,15 +20,15 @@ class CALVINTrainTester(BaseTrainTester):
 
     @torch.no_grad()
     def get_workspace_normalizer(self):
-        # return nn.Parameter(torch.tensor([
-        #     [-0.02, -0.02, -0.02, -0.05, -0.05, -0.05],
-        #     [ 0.02,  0.02,  0.02,  0.05,  0.05,  0.05]
-        # ]), requires_grad=False)
-        # NOTE: use 6d for euler, no need to normalize rot
         return nn.Parameter(torch.tensor([
-            [-0.02, -0.02, -0.02],
-            [ 0.02,  0.02,  0.02]
+            [-0.02, -0.02, -0.02, -0.05, -0.05, -0.05],
+            [ 0.02,  0.02,  0.02,  0.05,  0.05,  0.05]
         ]), requires_grad=False)
+        # NOTE: if use 6d for euler, no need to normalize rot
+        # return nn.Parameter(torch.tensor([
+        #     [-0.02, -0.02, -0.02],
+        #     [ 0.02,  0.02,  0.02]
+        # ]), requires_grad=False)
 
     @torch.no_grad()
     def prepare_batch(self, sample, augment=False):
@@ -143,10 +143,16 @@ class EvalWrapper:
         trajectory_mask = torch.full([self.pred_len], False).cuda(non_blocking=True)
         trajectory_mask = trajectory_mask[None, :, None]
 
-        instr = (
-            [instruction,] if not self.pre_tokenize
-            else self.tokenizer([instruction,]).cuda(non_blocking=True)
-        )
+        instr_mask = None
+        if not self.pre_tokenize:
+            instr = [instruction,]
+        else:
+            tok_out = self.tokenizer([instruction,])
+            if isinstance(tok_out, torch.Tensor):
+                instr = tok_out.cuda(non_blocking=True)
+            else:
+                instr = tok_out.input_ids.cuda(non_blocking=True)
+                instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
 
         # Forward pass
         trajectory = self.policy(
@@ -157,7 +163,8 @@ class EvalWrapper:
             obs['pcd'],  # (1, 2, 3, h, w)
             instr,
             obs['proprio'],  # (1, nhist, 1, 7)
-            run_inference=True
+            run_inference=True,
+            instr_mask=instr_mask,
         )  # (1, T, 1, 7)
         trajectory = trajectory.view(1, self.pred_len, 7)  # (1, T, 7)
         trajectory = trajectory.data.cpu().numpy()

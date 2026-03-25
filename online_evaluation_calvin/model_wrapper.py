@@ -67,9 +67,13 @@ class Model:
                 (obs['robot_obs'][[-1]] + 1) / 2
             ], -1))[None, None, None].float()
         )  # (B=1, nhist=1, nhand=1, 7)
-        fake_proprio = torch.zeros_like(real_proprio)
-        fake_proprio[..., -1] = 0.5
-        proprio = torch.cat([real_proprio, fake_proprio], 2)  # (B=1, nhist=1, nhand=2, 7)
+        proprio = real_proprio
+        
+        # NOTE: if pad to bimanual
+        # fake_proprio = torch.zeros_like(real_proprio)
+        # fake_proprio[..., -1] = 0.5
+        # proprio = torch.cat([real_proprio, fake_proprio], 2)  # (B=1, nhist=1, nhand=2, 7)
+        
         # rgbs, pcds are (B=1, ncam=2, 3, H, W)
         rgbs, pcds = self.preprocessor.process_obs(
             torch.from_numpy(obs["rgb_obs"]["rgb_static"].transpose(2, 0, 1)[None, None]),
@@ -88,7 +92,7 @@ class Model:
             obs: {
                 rgb: (B=1, ncam=2, 3, H, W),
                 pcd: (B=1, ncam=2, 3, H, W),
-                proprio: (B=1, nhist=1, nhand=2, 7)
+                proprio: (B=1, nhist=1, nhand=1(could pad to 2), 7)
             }
             instruction: str, the instruction of the task
 
@@ -98,24 +102,33 @@ class Model:
         device = self.args.device
 
         # Process inputs
-        trajectory_mask = torch.full((1, self.args.pred_len, 2), False, device=device)
+        trajectory_mask = torch.full((1, self.args.pred_len, 1), False, device=device)  
+        # NOTE: if pad to bimanual: 
+        # trajectory_mask = torch.full((1, self.args.pred_len, 2), False, device=device)
 
-        instr = (
-            [instruction,] if not self.args.pre_tokenize
-            else self.tokenizer([instruction,]).cuda(non_blocking=True)
-        )
+        instr_mask = None
+        if not self.args.pre_tokenize:
+            instr = [instruction,]
+        else:
+            tok_out = self.tokenizer([instruction,])
+            if isinstance(tok_out, torch.Tensor):
+                instr = tok_out.cuda(non_blocking=True)
+            else:
+                instr = tok_out.input_ids.cuda(non_blocking=True)
+                instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
 
         # Forward pass
         trajectory = self.policy(
             None,
-            trajectory_mask,  # (1, T, 2)
+            trajectory_mask,  # (1, T, 1 or pad to 2)
             obs['rgb'],  # (1, 2, 3, h, w)
             None,  # (1, 1, 3, 84, 84)
             obs['pcd'],  # (1, 2, 3, h, w)
             instr,
-            obs['proprio'],  # (1, nhist, 2, 7)
-            run_inference=True
-        ).view(1, self.args.pred_len, 2, 7)  # (1, T, nhand=2, 7)
+            obs['proprio'],  # (1, nhist, 1 or pad to 2, 7)
+            run_inference=True,
+            instr_mask=instr_mask,
+        ).view(1, self.args.pred_len, 1, 7)  # (1, T, nhand=1 or pad to 2, 7)  # NOTE: if pad to bimanual: ).view(1, self.args.pred_len, 2, 7)
         trajectory = trajectory.data.cpu().numpy()[:,:,0,:]  # (1, T, 7)
         trajectory[..., -1] = 2 * (trajectory[..., -1] >= 0.5).astype(int) - 1  # openness
         # Back to absolute actions

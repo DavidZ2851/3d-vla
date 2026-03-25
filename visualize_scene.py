@@ -95,7 +95,7 @@ class RobotSceneVisualizer:
                 color_to_use = 'red' if hand_key == 'left' else 'blue'
                 self._draw_gripper_wireframe(ax, data['pos'], data['rot'], color_to_use, alpha=1.0)
         center_point = np.array([0.8, 0, 0.4])
-        eye_point = np.array([1.5, 0, 0.8])
+        eye_point = np.array([1.0, 0, 0.8])
         view_dir = center_point - eye_point
         view_dir = view_dir / np.linalg.norm(view_dir)
         elev = np.arcsin(-view_dir[2]) * 180 / np.pi
@@ -135,14 +135,21 @@ class RobotSceneVisualizer:
         })
 
     def _draw_gripper_wireframe(self, ax, pos, rot_matrix, color, alpha=1.0):
-        local_points = np.array([ [0.0, 0.0, 0.0], # 0: Base Center 
-                                 [-0.08, 0.0, 0.0], # 1: Wrist back 
-                                 [0.02, 0.04, 0.0], # 2: Left Finger Base 
-                                 [0.10, 0.04, 0.0], # 3: Left Finger Tip 
-                                 [0.02, -0.04, 0.0],# 4: Right Finger Base 
-                                 [0.10, -0.04, 0.0] # 5: Right Finger Tip 
-                                 ]).T # 3xN 
-        
+        # local_points = np.array([ [0.0, 0.0, 0.0], # 0: Base Center 
+        #                          [-0.08, 0.0, 0.0], # 1: Wrist back 
+        #                          [0.02, 0.04, 0.0], # 2: Left Finger Base 
+        #                          [0.10, 0.04, 0.0], # 3: Left Finger Tip 
+        #                          [0.02, -0.04, 0.0],# 4: Right Finger Base 
+        #                          [0.10, -0.04, 0.0] # 5: Right Finger Tip 
+        #                          ]).T # 3xN
+        local_points = np.array([ 
+            [0.0, 0.0, 0.0],       # 0: Base Center 
+            [0.0, 0.0, -0.08],     # 1: Wrist back (往负Z方向退一点)
+            [0.0, 0.04, 0.02],     # 2: Left Finger Base (Z延伸，Y张开)
+            [0.0, 0.04, 0.10],     # 3: Left Finger Tip (沿着+Z到达指尖)
+            [0.0, -0.04, 0.02],    # 4: Right Finger Base 
+            [0.0, -0.04, 0.10]     # 5: Right Finger Tip 
+        ]).T # 3xN
         rot_matrix = rot_matrix
         world_points = rot_matrix @ local_points + pos.reshape(3, 1) 
         wp = world_points

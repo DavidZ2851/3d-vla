@@ -47,21 +47,27 @@ class CALVINDataset(BaseDataset):
 
     def _get_proprioception(self, idx):
         original_proprio = self._get_attr_by_idx(idx, 'proprioception', False)  # (B, T_his=1, nhand=1, dim=7)
-        zero_pad = torch.zeros_like(original_proprio)  # euler default (0,0,0) means no rotation
-        return torch.cat([original_proprio, zero_pad], dim=2)  # (B, T_his=1, nhand=2, 7)
+        return original_proprio
+        # NOTE: if use padding to two hands
+        # zero_pad = torch.zeros_like(original_proprio)  # euler default (0,0,0) means no rotation
+        # return torch.cat([original_proprio, zero_pad], dim=2)  # (B, T_his=1, nhand=2, 7)
 
     def _get_action(self, idx):
         if self._relative_action and 'rel_action' in self.annos:
             rel_action = self._get_attr_by_idx(idx, 'rel_action', False)  # （B, T_pred=10, nhand=1, 7）
-            zero_pad = torch.zeros_like(rel_action)  # euler default (0,0,0) means no rotation
-            action_padded = torch.cat([rel_action, zero_pad], dim=2)  # (B, T_pred=10, nhand=2, 7)
-            return action_padded
+            return rel_action
+            # NOTE: if use padding to two hands
+            # zero_pad = torch.zeros_like(rel_action)  # euler default (0,0,0) means no rotation
+            # action_padded = torch.cat([rel_action, zero_pad], dim=2)  # (B, T_pred=10, nhand=2, 7)
+            # return action_padded
         original_action = self._get_attr_by_idx(idx, 'action', False)  # (B, T_pred, nhand=1, 7)
-        zero_pad = torch.zeros_like(original_action)
-        action_padded = torch.cat([original_action, zero_pad], dim=2)  # (B, T_pred, 2, 7)
+        # NOTE: if use padding to two hands
+        # zero_pad = torch.zeros_like(original_action)
+        # action_padded = torch.cat([original_action, zero_pad], dim=2)  # (B, T_pred, 2, 7)
         if self._relative_action:
             return ValueError("No implementation for euler relative calculation")
-        return action_padded
+        return original_action
+        # return action_padded
     
     def __getitem__(self, idx):
         """
@@ -78,7 +84,6 @@ class CALVINDataset(BaseDataset):
             - action: (C, T=10, 1, 3+3+1)
         """
         # First detect which copy we fall into
-        # idx = idx % (len(self.annos['action']) // self.chunk_size)
         total_samples = len(self.annos['action']) // self.chunk_size
         effective_size = min(self.max_samples, total_samples) if self.max_samples is not None else total_samples
         idx = idx % effective_size

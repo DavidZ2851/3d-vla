@@ -1,6 +1,8 @@
 from .base import BaseDataset
 import torch
 from torch.nn import functional as F
+from utils.pytorch3d_transforms import *
+from scipy.spatial.transform import Rotation as R
 
 ORIGINAL_HEIGHT = 400
 ORIGINAL_WIDTH = 640
@@ -77,6 +79,14 @@ class GenieSim3Dataset(BaseDataset):
             else:
                 print(f"max_samples ({self.max_samples}) >= total samples ({total_samples}), using all datapoints")
                 self.max_samples = None
+        R_EE_TOOL = torch.tensor(
+            R.from_euler('y', -90, degrees=True).as_matrix()
+            @ R.from_euler('x', -90, degrees=True).as_matrix()
+        )
+        R_EE_TOOL_INV = R_EE_TOOL.T
+        R_roll_fix = torch.tensor([[0, 1, 0], [-1,0, 0], [0, 0, 1]], dtype=R_EE_TOOL.dtype, device=R_EE_TOOL.device)   # Rz(-90)
+        R_EE_TOOL_INV = R_EE_TOOL_INV @ R_roll_fix
+        self.R_EE_TOOL_INV_QUAT = matrix_to_quaternion(R_EE_TOOL_INV)
 
     def _get_task(self, idx):
         return ['geniesim'] * self.chunk_size
@@ -133,6 +143,9 @@ class GenieSim3Dataset(BaseDataset):
         """
         prop = self._get_attr_by_idx(idx, 'proprioception', False)
         hand_prop = prop[:, :, :2, :]
+        quat = hand_prop[..., 3:7]  # wxyz
+        quat_fixed = quaternion_multiply(hand_prop[..., 3:7], self.R_EE_TOOL_INV_QUAT.to(quat.device))
+        hand_prop[..., 3:7] = quat_fixed
         return hand_prop
 
     def _get_action(self, idx):
@@ -147,6 +160,9 @@ class GenieSim3Dataset(BaseDataset):
 
         action = self._get_attr_by_idx(idx, 'action', False)
         hand_action = action[:, :, :2, :]  # the first two dims are definitely hands
+        quat = hand_action[..., 3:7]  # wxyz
+        quat_fixed = quaternion_multiply(hand_action[..., 3:7], self.R_EE_TOOL_INV_QUAT.to(quat.device))
+        hand_action[..., 3:7] = quat_fixed
         if self._relative_action:
             prop = self._get_proprioception(idx)
             anchor_action = prop[:, -1, :, :].unsqueeze(-2)  # (chunk_size, nhand, 1, 8)

@@ -116,14 +116,20 @@ class Actioner:
         self._policy = policy
         self._policy.eval()
         self._instr = None
+        self._instr_mask = None
         self.tokenizer = fetch_tokenizers(backbone)
         self.encoder, _ = fetch_text_encoders('clip')
         self.encoder.cuda()
 
     def load_episode(self, descriptions):
         instr = [random.choice(descriptions)]
-        self._instr = self.tokenizer(instr).cuda(non_blocking=True)
-        self._instr = self.encoder(self._instr)
+        tok_out = self.tokenizer(instr)
+        if isinstance(tok_out, torch.Tensor):
+            self._instr = self.encoder(tok_out.cuda(non_blocking=True))
+            self._instr_mask = None
+        else:
+            self._instr = tok_out.input_ids.cuda(non_blocking=True)
+            self._instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
 
     def predict(self, rgbs, pcds, gripper, prediction_len=1):
         """
@@ -145,22 +151,10 @@ class Actioner:
             pcds,
             self._instr,
             gripper[:, :, None, :7],  # (1, nhist, nhand=1, 7)
-            run_inference=True
+            run_inference=True,
+            instr_mask=self._instr_mask,
         ).view(1, prediction_len, 8)
         return out
-        # torch.save(
-        #     [
-        #         out,
-        #         None,
-        #         torch.full([1, prediction_len, 1], False).to(rgbs.device),
-        #         rgbs,
-        #         None,
-        #         pcds,
-        #         self._instr,
-        #         gripper[:, :, None, :7]
-        #     ], "trajectory_n.pt"
-        # )
-        # jnj
 
     @property
     def device(self):
@@ -472,27 +466,6 @@ class RLBenchEnv:
         cameras = {}
         for name in camera_names:
             cameras[name] = used_cams
-        print(camera_names)
-        # kwargs = {}
-        # for n in camera_names:
-        #     kwargs[n] = used_cams
-
-        # obs_config = ObservationConfig(
-        #     front_camera=kwargs.get("front", unused_cams),
-        #     left_shoulder_camera=kwargs.get("left_shoulder", unused_cams),
-        #     right_shoulder_camera=kwargs.get("right_shoulder", unused_cams),
-        #     wrist_camera=kwargs.get("wrist", unused_cams),
-        #     overhead_camera=kwargs.get("overhead", unused_cams),
-        #     joint_forces=False,
-        #     joint_positions=False,
-        #     joint_velocities=True,
-        #     task_low_dim_state=False,
-        #     gripper_touch_forces=False,
-        #     gripper_pose=True,
-        #     gripper_open=True,
-        #     gripper_matrix=True,
-        #     gripper_joint_positions=True
-        # )
         obs_config = ObservationConfig(
             camera_configs=cameras,
             joint_forces=False,

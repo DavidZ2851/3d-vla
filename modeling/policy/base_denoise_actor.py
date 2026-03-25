@@ -46,7 +46,7 @@ class DenoiseActor(nn.Module):
 
         # Action decoder, runs at every denoising timestep
         self.traj_encoder = nn.Linear(
-            9,  # always XYZ + 6d (quat and euler are converted into 6d), was: 6 if rotation_format == 'euler' else 9,
+            6 if rotation_format == 'euler' else 9,  # NOTE: could change to XYZ + 6d (quat and euler are converted into 6d)
             embedding_dim
         )
         self.prediction_head = TransformerHead(
@@ -54,7 +54,7 @@ class DenoiseActor(nn.Module):
             nhist=nhist * 2,  # NOTE: build model with always 2 hands (was nhist=nhist * nhand)
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
-            rot_dim=6  # always 6d, was: rot_dim=3 if rotation_format == 'euler' else 6
+            rot_dim=3 if rotation_format == 'euler' else 6  # NOTE: could change to 6d
         )
 
         # Noise/denoise schedulers and hyperparameters
@@ -66,7 +66,7 @@ class DenoiseActor(nn.Module):
         # Normalization for the 3D space, will be loaded in the main process
         if rotation_format == 'euler':  # normalize pos+rot
             self.workspace_normalizer = nn.Parameter(
-                torch.Tensor([[0., 0., 0.], [1., 1., 1.]]),  # euler uses 6d now, was: torch.Tensor([[0., 0, 0, 0, 0, 0], [1., 1, 1, 1, 1, 1]]),
+                torch.Tensor([[0., 0, 0, 0, 0, 0], [1., 1, 1, 1, 1, 1]]),  # NOTE: could change to [[0,0,0],[1,1,1]] for 6d rot
                 requires_grad=False
             )
         else:
@@ -76,7 +76,7 @@ class DenoiseActor(nn.Module):
             )
         self.nrm_dim = int(self.workspace_normalizer.size(-1))
 
-    def encode_inputs(self, rgb3d, rgb2d, pcd, instruction, proprio):
+    def encode_inputs(self, rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=None):
         encoder_input_proprio = proprio
         # NOTE: fix for flower_actor_2d
         if hasattr(self.encoder, "proprio_feat"):
@@ -98,7 +98,8 @@ class DenoiseActor(nn.Module):
         # NOTE: fix end
         fixed_inputs = self.encoder(
             rgb3d, rgb2d, pcd, instruction,
-            encoder_input_proprio.flatten(1, 2)
+            encoder_input_proprio.flatten(1, 2),
+            instr_mask=instr_mask,
         )
         # Query trajectory (for relative trajectory prediction)
         query_trajectory = proprio[:, -1:]
@@ -167,15 +168,15 @@ class DenoiseActor(nn.Module):
         return torch.cat((trajectory, out[..., -1:]), -1)
 
     def compute_trajectory(self, trajectory_mask,
-                           rgb3d, rgb2d, pcd, instruction, proprio):
+                           rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=None):
         valid_mask = (~trajectory_mask)[..., None].float()  # (B,T,H,1)
         # Encode observations, states, instructions
         fixed_inputs = self.encode_inputs(
-            rgb3d, rgb2d, pcd, instruction, proprio
+            rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=instr_mask
         )
 
         # Sample from learned model starting from noise
-        out_dim = 9  # euler and quat all use 6d, was: out_dim = 6 if self._rotation_format == 'euler' else 9
+        out_dim = 6 if self._rotation_format == 'euler' else 9  # NOTE: could change to out_dim=9 when euler and quat all use 6d
         trajectory = torch.randn(
             size=tuple(trajectory_mask.shape) + (out_dim,),
             device=trajectory_mask.device
@@ -184,7 +185,7 @@ class DenoiseActor(nn.Module):
             trajectory,
             device=trajectory_mask.device,
             fixed_inputs=fixed_inputs,
-            valid_mask=valid_mask
+            # valid_mask=valid_mask  # NOTE NOTE: for action space alignment
         )
 
         # Back to quaternion and euler
@@ -196,15 +197,15 @@ class DenoiseActor(nn.Module):
         trajectory = self.unnormalize_pos(trajectory)
         # Convert gripper status to probaility
         trajectory[..., -1] = trajectory[..., -1].sigmoid()
-        trajectory = trajectory * valid_mask  # NOTE: ensure padded hand output zeros
+        # trajectory = trajectory * valid_mask  # NOTE NOTE: ensure padded hand output zeros
 
         return trajectory
 
     def compute_loss(self, gt_trajectory, trajectory_mask,
-                     rgb3d, rgb2d, pcd, instruction, proprio):
+                     rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=None):
         # Encode observations, states, instructions
         fixed_inputs = self.encode_inputs(
-            rgb3d, rgb2d, pcd, instruction, proprio
+            rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=instr_mask
         )
 
         # Process gt_trajectory
@@ -246,7 +247,7 @@ class DenoiseActor(nn.Module):
             pred = self.policy_forward_pass(
                 noisy_trajectory,
                 timesteps, fixed_inputs,
-                valid_mask=valid_mask
+                # valid_mask=valid_mask  # NOTE NOTE: for action space alignment
             )
 
             # Compute loss
@@ -260,8 +261,10 @@ class DenoiseActor(nn.Module):
                 pos_loss = F.l1_loss(pos, denoise_target[..., :3], reduction='mean')
                 rot_loss = F.l1_loss(rot, denoise_target[..., 3:], reduction='mean')
                 openness_loss = F.binary_cross_entropy_with_logits(openess, gt_openess)
+                
+                # NOTE NOTE: for action space alignment
                 # valid_mask_bool = valid_mask.bool()
-                # valid_count = valid_mask.sum()
+                # valid_count = valid_mask.sum().clamp(min=1)  # avoid div by zero if all masked
                 # pos_loss = F.l1_loss(pos, denoise_target[..., :3], reduction='none')
                 # pos_loss = torch.where(valid_mask_bool, pos_loss, torch.zeros_like(pos_loss))
                 # pos_loss = pos_loss.sum() / valid_count  # NOTE: ensure padded hand doesn't include in loss
@@ -271,6 +274,7 @@ class DenoiseActor(nn.Module):
                 # openness_loss = F.binary_cross_entropy_with_logits(openess, gt_openess, reduction='none')
                 # openness_loss = torch.where(valid_mask_bool, openness_loss, torch.zeros_like(openness_loss))
                 # openness_loss = openness_loss.sum() / valid_count
+                
                 loss = (
                     30 * pos_loss
                     + 10 * rot_loss
@@ -306,13 +310,15 @@ class DenoiseActor(nn.Module):
     def convert_rot(self, signal):
         # If Euler then no conversion
         if self._rotation_format == 'euler':
-            rot = signal[..., 3:6]
-            res = signal[..., 6:] if signal.size(-1) > 6 else None
-            rot6d = euler_to_6d(rot)
-            signal = torch.cat([signal[..., :3], rot6d], dim=-1)
-            if res is not None:
-                signal = torch.cat((signal, res), -1)
             return signal
+            # NOTE: if use euler->6d
+            # rot = signal[..., 3:6]
+            # res = signal[..., 6:] if signal.size(-1) > 6 else None
+            # rot6d = euler_to_6d(rot)
+            # signal = torch.cat([signal[..., :3], rot6d], dim=-1)
+            # if res is not None:
+            #     signal = torch.cat((signal, res), -1)
+            # return signal
         # Else assume quaternion
         rot = normalise_quat(signal[..., 3:7])
         res = signal[..., 7:] if signal.size(-1) > 7 else None
@@ -338,13 +344,15 @@ class DenoiseActor(nn.Module):
     def unconvert_rot(self, signal):
         # If Euler then no conversion
         if self._rotation_format == 'euler':
-            res = signal[..., 9:] if signal.size(-1) > 9 else None
-            rot6d = signal[..., 3:9]
-            euler = rotate6d_to_euler(rot6d)
-            signal = torch.cat([signal[..., :3], euler], dim=-1)
-            if res is not None:
-                signal = torch.cat((signal, res), -1)
             return signal
+            # NOTE: if use euler->6d->euler
+            # res = signal[..., 9:] if signal.size(-1) > 9 else None
+            # rot6d = signal[..., 3:9]
+            # euler = rotate6d_to_euler(rot6d)
+            # signal = torch.cat([signal[..., :3], euler], dim=-1)
+            # if res is not None:
+            #     signal = torch.cat((signal, res), -1)
+            # return signal
         # Else assume quaternion
         res = signal[..., 9:] if signal.size(-1) > 9 else None
         if len(signal.shape) == 3:
@@ -374,7 +382,8 @@ class DenoiseActor(nn.Module):
         pcd,
         instruction,
         proprio,
-        run_inference=False
+        run_inference=False,
+        instr_mask=None,
     ):
         """
         Arguments:
@@ -385,6 +394,7 @@ class DenoiseActor(nn.Module):
             pcd: (B, num_3d_cameras, 3, H, W) in world coordinates
             instruction: tokenized text instruction
             proprio: (B, nhist, nhand, 3+4+X)
+            instr_mask: optional (B, L) text padding mask for Qwen3-VL (1 = token, 0 = pad)
 
         Note:
             The input rotation is expressed either as:
@@ -399,13 +409,13 @@ class DenoiseActor(nn.Module):
         if run_inference:
             return self.compute_trajectory(
                 trajectory_mask,
-                rgb3d, rgb2d, pcd, instruction, proprio
+                rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=instr_mask
             )
 
         # Training, use gt_trajectory to compute loss
         return self.compute_loss(
             gt_trajectory, trajectory_mask,
-            rgb3d, rgb2d, pcd, instruction, proprio
+            rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=instr_mask
         )
 
 

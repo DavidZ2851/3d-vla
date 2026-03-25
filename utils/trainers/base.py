@@ -1,6 +1,7 @@
 from copy import deepcopy
 import os
 import random
+from functools import partial
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -78,6 +79,12 @@ class BaseTrainTester:
 
         # Datasets
         train_dataset, val_dataset = self.get_datasets()
+        collate_fn = base_collate_fn
+        if self.args.pre_tokenize and self.args.backbone == "qwen3vl":
+            collate_fn = partial(
+                qwen_tokenize_collate_fn,
+                model_name_or_path=os.environ.get("QWEN3VL_MODEL_PATH"),
+            )
         # Samplers and loaders
         g = torch.Generator()
         g.manual_seed(0)
@@ -88,7 +95,7 @@ class BaseTrainTester:
             shuffle=False,
             num_workers=self.args.num_workers,
             worker_init_fn=seed_worker,
-            collate_fn=base_collate_fn,
+            collate_fn=collate_fn,
             pin_memory=True,
             sampler=train_sampler,
             drop_last=True,
@@ -103,7 +110,7 @@ class BaseTrainTester:
                 batch_size=self.args.batch_size_val // self.args.chunk_size,
                 shuffle=False,
                 num_workers=self.args.num_workers,
-                collate_fn=base_collate_fn,
+                collate_fn=collate_fn,
                 pin_memory=True,
                 sampler=None,
                 drop_last=False,
@@ -331,7 +338,7 @@ class BaseTrainTester:
                     val_iters=10,
                     split='train'
                 )
-                if (step_id + 1) % 20000 == 0:  # frequently evaluate on val and save ckpt
+                if (step_id + 1) % 5000 == 0:  # frequently evaluate on val and save ckpt
                     print("Test evaluation.......")
                     new_loss = self.evaluate_nsteps(
                         ema_model.module if self.args.use_ema else model.module,
@@ -356,12 +363,23 @@ class BaseTrainTester:
         action, action_mask, rgbs, rgb2d, pcds, instr, prop = self.prepare_batch(
             sample, augment=training
         )
+        instr_mask = None
         if self.args.pre_tokenize:
-            instr = self.tokenizer(instr).cuda(non_blocking=True)
+            if "instr_input_ids" in sample and "instr_attention_mask" in sample:
+                instr = sample["instr_input_ids"].cuda(non_blocking=True)
+                instr_mask = sample["instr_attention_mask"].cuda(non_blocking=True)
+            else:
+                tok_out = self.tokenizer(instr)
+                if isinstance(tok_out, torch.Tensor):
+                    instr = tok_out.cuda(non_blocking=True)
+                else:
+                    instr = tok_out.input_ids.cuda(non_blocking=True)
+                    instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = model(
                 action, action_mask, rgbs, rgb2d, pcds, instr, prop,
-                run_inference=not training
+                run_inference=not training,
+                instr_mask=instr_mask,
             )
         return out  # loss if training, else action
 
@@ -686,6 +704,26 @@ def base_collate_fn(batch):
 
     return _dict
 
+
+_QWEN_COLLATE_TOKENIZER = {}
+
+def _get_qwen_collate_tokenizer(model_name_or_path=None):
+    key = model_name_or_path or os.environ.get("QWEN3VL_MODEL_PATH")
+    if key not in _QWEN_COLLATE_TOKENIZER:
+        from modeling.encoder.text.qwen3vl import Qwen3VLTokenizer
+        _QWEN_COLLATE_TOKENIZER[key] = Qwen3VLTokenizer(model_name_or_path=key)
+    return _QWEN_COLLATE_TOKENIZER[key]
+
+def qwen_tokenize_collate_fn(batch, model_name_or_path=None):
+    """Collate + CPU tokenization in dataloader workers for Qwen."""
+    sample = base_collate_fn(batch)
+    if "instr" not in sample:
+        return sample
+    tokenizer = _get_qwen_collate_tokenizer(model_name_or_path)
+    tok_out = tokenizer(sample["instr"])
+    sample["instr_input_ids"] = tok_out.input_ids
+    sample["instr_attention_mask"] = tok_out.attention_mask
+    return sample
 
 def actions_collate_fn(batch):
     return {"action": torch.cat([item["action"] for item in batch])}

@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import random
 
@@ -19,6 +20,19 @@ from pyrep.const import RenderMode
 
 from modeling.encoder.text import fetch_tokenizers
 from online_evaluation_rlbench.get_stored_demos import get_stored_demos
+
+
+def _instruction_to_filename_suffix(descriptions, max_len=80):
+    """Sanitize task instruction for use in a filename and return a suffix string."""
+    if not descriptions:
+        return ""
+    raw = descriptions[0] if isinstance(descriptions[0], str) else str(descriptions[0])
+    # Replace characters invalid in filenames and collapse spaces
+    sanitized = re.sub(r'[/\\:*?"<>|\n\r]+', "_", raw)
+    sanitized = re.sub(r"\s+", "_", sanitized).strip("_")
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len].rstrip("_")
+    return f"_{sanitized}" if sanitized else ""
 
 
 def task_file_to_task_class(task_file):
@@ -101,11 +115,18 @@ class Actioner:
         self._relative = bool(getattr(self._policy, "_relative", True))
         self._rotation_format = getattr(self._policy, "_rotation_format", "quat_xyzw")
         self._instr = None
+        self._instr_mask = None
         self.tokenizer = fetch_tokenizers(backbone)
 
     def load_episode(self, descriptions):
         instr = [random.choice(descriptions)]
-        self._instr = self.tokenizer(instr).cuda(non_blocking=True)
+        tok_out = self.tokenizer(instr)
+        if isinstance(tok_out, torch.Tensor):
+            self._instr = tok_out.cuda(non_blocking=True)
+            self._instr_mask = None
+        else:
+            self._instr = tok_out.input_ids.cuda(non_blocking=True)
+            self._instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
 
     def predict(self, rgbs, pcds, gripper, prediction_len=1):
         """
@@ -133,7 +154,8 @@ class Actioner:
             pcds,
             self._instr,
             gripper.unflatten(-1, (2, -1)),  # (1, nhist, nhand=2, 8)
-            run_inference=True
+            run_inference=True,
+            instr_mask=self._instr_mask,
         )
 
     @property
@@ -395,8 +417,12 @@ class RLBenchEnv:
             )
             if record_video:
                 from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
+                instr_suffix = _instruction_to_filename_suffix(descriptions)
                 clip = ImageSequenceClip(frames, fps=1)
-                clip.write_videofile(f"eval_logs/bimanual_reproduce/{task_str}_{demo_id}.mp4", codec="libx264")
+                clip.write_videofile(
+                    f"eval_logs/bimanual_reproduce/{task_str}_var{variation}_{demo_id}{instr_suffix}.mp4",
+                    codec="libx264",
+                )
         # Compensate for failed demos
         valid = len(var_demos) > 0
         return success_rate, valid, len(var_demos)
@@ -499,7 +525,7 @@ class ReplayRLBenchEnv(RLBenchEnv):
             if record_video:
                 frames = []
 
-            _, obs = task.reset_to_demo(demo)
+            descriptions, obs = task.reset_to_demo(demo)
 
             move = Mover(task, max_tries=max_tries)
             reward = 0.0
@@ -573,8 +599,12 @@ class ReplayRLBenchEnv(RLBenchEnv):
             if record_video and reward < 1:
                 try:
                     from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
+                    instr_suffix = _instruction_to_filename_suffix(descriptions)
                     clip = ImageSequenceClip(frames, fps=1)
-                    clip.write_videofile(f"videos4/replay_{task_str}_{demo_id}.mp4", codec="libx264")
+                    clip.write_videofile(
+                        f"videos4/replay_{task_str}_var{variation}_{demo_id}{instr_suffix}.mp4",
+                        codec="libx264",
+                    )
                 except:
                     print("Error writing video file")
 

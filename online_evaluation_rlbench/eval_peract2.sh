@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=eval_peract2_finetune_laptop
+#SBATCH --job-name=eval_peract2_finetune_bimanual_push_box
 #SBATCH --mem=500G
 #SBATCH --gres=gpu:1
 #SBATCH --time=48:00:00
@@ -33,27 +33,27 @@ export RLBENCH_RENDER_MODE=OPENGL
 #     bimanual_take_tray_out_of_oven
 # )
 tasks=(
-    bimanual_pick_laptop
+    bimanual_push_box
 )
 
 # Testing arguments
 # scratch
-# checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/peract2/flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-scratch/last.pth
-# checkpoint_alias=flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-scratch
+# checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/peract2/flower_actor_3d-Peract2_3dfront-C1024-B64-lr1e-4-constant-H3-rectified_flow-florence2-finetuned_false-job6485989/last.pth
+# checkpoint_alias=flower_actor_3d-Peract2_3dfront-C1024-B64-lr1e-4-constant-H3-rectified_flow-florence2-finetuned_false-job6485989
 # finetune
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/peract2/flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-job6464932/last.pth
-checkpoint_alias=flower_actor_3d-Peract2_3dfront_3dwrist-C1024-B4-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-job6464932
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/peract2/flower_actor_3d-Peract2_3dfront-C256-B32-lr1e-4-constant-H3-rectified_flow-florence2-finetuned_true-job6581506/last.pth
+checkpoint_alias=flower_actor_3d-Peract2_3dfront-C256-B32-lr1e-4-constant-H3-rectified_flow-florence2-finetuned_true-job6581506
 num_episodes=100
 max_tries=2
 max_steps=25
 headless=true
 collision_checking=false
 seed=0
-replay=false  # was true
+replay=false
 
 # Dataset arguments
 data_dir=/data/group_data/katefgroup/datasets/peract2/peract2_test/  # load eval env layouts
-dataset=Peract2_3dfront_3dwrist
+dataset=Peract2_3dfront
 image_size=256,256
 
 # Model arguments
@@ -62,12 +62,12 @@ bimanual=true
 prediction_len=1  # for keypose
 backbone=florence2
 fps_subsampling_factor=1  # was 4
-embedding_dim=1024  # was 120
+embedding_dim=256  # was 120
 num_attn_heads=16  # was 8
 num_vis_instr_attn_layers=3
-num_shared_attn_layers=16
-num_history=1
-relative_action=true  # NOTE: was false both original eval and train, change to true to align with training script
+num_shared_attn_layers=4
+num_history=3
+relative_action=false
 rotation_format=quat_xyzw
 denoise_timesteps=5
 denoise_model=rectified_flow

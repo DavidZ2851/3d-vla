@@ -1,4 +1,4 @@
-from torch.optim.lr_scheduler import CosineAnnealingLR, ConstantLR
+from torch.optim.lr_scheduler import SequentialLR, CosineAnnealingLR, ConstantLR
 
 from .tristage_scheduler import TriStageLRScheduler
 
@@ -8,6 +8,16 @@ def fetch_scheduler(type_, optimizer, train_iters):
         scheduler = ConstantLR(optimizer, factor=1.0, total_iters=train_iters)
     elif type_ == "cosine":
         scheduler = CosineAnnealingLR(optimizer, T_max=train_iters)
+    elif type_ == "hold_decay":
+        hold_steps = train_iters*0.5
+        decay_steps = train_iters*0.5
+        scheduler_hold = ConstantLR(optimizer, factor=1.0, total_iters=hold_steps)
+        scheduler_decay = CosineAnnealingLR(optimizer, T_max=decay_steps)
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[scheduler_hold, scheduler_decay],
+            milestones=[hold_steps]
+        )
     elif type_ == "tristage_flower":
         scheduler = TriStageLRScheduler(optimizer)
     else:
