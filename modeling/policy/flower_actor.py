@@ -67,7 +67,7 @@ class FlowerActor3D(BaseDenoiseActor):
             nhist=nhist * 2,  # NOTE: build model with always 2 hands (was nhist=nhist * nhand)
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
-            rot_dim=3 if rotation_format == 'euler' else 6  # NOTE: could change to always 6d
+            rot_dim=3 if rotation_format in ['euler', 'axisangle'] else 6  # NOTE: could change to always 6d
         )
 
 
@@ -380,7 +380,7 @@ class FlowerActor2D(BaseDenoiseActor):
             fps_subsampling_factor=fps_subsampling_factor,
             finetune_backbone=finetune_backbone,
             finetune_text_encoder=finetune_text_encoder,
-            rot_dim=3 if rotation_format == 'euler' else 6
+            rot_dim=3 if rotation_format in ['euler', 'axisangle'] else 6
         )
 
         # Action decoder, runs at every denoising timestep
@@ -389,7 +389,7 @@ class FlowerActor2D(BaseDenoiseActor):
             nhist=nhist * 2,  # NOTE: build model with always 2 hands (was nhist=nhist * nhand)
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
-            rot_dim=3 if rotation_format == 'euler' else 6
+            rot_dim=3 if rotation_format in ['euler', 'axisangle'] else 6
         )
 
 

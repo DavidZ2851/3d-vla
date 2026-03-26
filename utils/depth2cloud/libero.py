@@ -18,10 +18,15 @@ class LiberoDepth2Cloud:
 
     @staticmethod
     def _get_cam_proj_mat_inv_b(extrinsics, intrinsics):
-        # extrinsics follow zarr convention: T_cam<-world (world-to-camera). ext (B, 4, 4), int (B, 3, 3)
+        # extrinsics follow zarr convention used by visualize_scene: T_cam->world (cam-to-world).
         # Depth is already in meters, and rgb/depth/extrinsics are already aligned.
-        # Build P = K [R|t], then invert once to unproject to world coordinates.
-        cam_proj = torch.bmm(intrinsics, extrinsics[:, :3, :])  # (B, 3, 4)
+        # Build P = K [R_wc|t_wc] from the inverse extrinsic (world-to-camera), then invert once.
+        C = extrinsics[:, :3, 3:]  # (B, 3, 1)
+        R = extrinsics[:, :3, :3]  # (B, 3, 3)
+        R_inv = R.transpose(1, 2)  # (B, 3, 3)
+        t_inv = -torch.bmm(R_inv, C)  # (B, 3, 1)
+        ext_inv = torch.cat([R_inv, t_inv], dim=-1)  # (B, 3, 4), world-to-camera
+        cam_proj = torch.bmm(intrinsics, ext_inv)  # (B, 3, 4)
         cam_proj_homo = torch.cat([
             cam_proj,
             torch.tensor(

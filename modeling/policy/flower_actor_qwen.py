@@ -60,5 +60,5 @@ class QwenFlowerActor3D(BaseDenoiseActor):
             nhist=nhist * nhand,  # NOTE: use nhist=nhist*2 when aligning action space
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
-            rot_dim=3 if rotation_format == 'euler' else 6  # NOTE: could change to always 6d
+            rot_dim=3 if rotation_format in ['euler', 'axisangle'] else 6  # NOTE: could change to always 6d
         )

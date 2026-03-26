@@ -95,7 +95,7 @@ class RobotSceneVisualizer:
                 color_to_use = 'red' if hand_key == 'left' else 'blue'
                 self._draw_gripper_wireframe(ax, data['pos'], data['rot'], color_to_use, alpha=1.0)
         center_point = np.array([0.8, 0, 0.4])
-        eye_point = np.array([1.0, 0, 0.8])
+        eye_point = np.array([-1.0, 0, 0.8])
         view_dir = center_point - eye_point
         view_dir = view_dir / np.linalg.norm(view_dir)
         elev = np.arcsin(-view_dir[2]) * 180 / np.pi

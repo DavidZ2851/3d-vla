@@ -15,7 +15,7 @@ from utils.trainers.base import (
     relative_to_absolute as base_relative_to_absolute
 )
 from utils.data_preprocessors.rlbench import RLBenchDataPreprocessor
-from visualize_scene import RobotSceneVisualizer
+from visualize_geniesim_scene import RobotSceneVisualizer
 from utils.depth2cloud.rlbench import RLBenchDepth2Cloud
 from utils.pytorch3d_transforms import quaternion_to_matrix, matrix_to_quaternion
 
