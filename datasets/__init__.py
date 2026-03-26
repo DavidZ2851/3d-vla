@@ -11,6 +11,7 @@ from .rlbench import (
     DatPeractTwoCamDataset
 )
 from .geniesim3 import GenieSim3Dataset
+from .libero import LIBERODataset
 
 def fetch_dataset_class(dataset_name):
     """Fetch the dataset class based on the dataset name."""
@@ -28,6 +29,7 @@ def fetch_dataset_class(dataset_name):
         "Peract2All": Peract2AllDataset,
         "GenieSim3": GenieSim3Dataset,
         "GenieSim3.0": GenieSim3Dataset,
+        "Libero": LIBERODataset,
     }
     
     if dataset_name not in dataset_classes:

@@ -18,7 +18,7 @@ class CALVINDataset(BaseDataset):
         relative_action=False,
         mem_limit=8,
         actions_only=False,
-        chunk_size=4
+        chunk_size=8
     ):
         super().__init__(
             root=root,

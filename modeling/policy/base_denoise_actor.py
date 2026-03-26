@@ -45,8 +45,10 @@ class DenoiseActor(nn.Module):
         self.encoder = None  # Implement this!
 
         # Action decoder, runs at every denoising timestep
+        # euler/axisangle: xyz(3)+rot(3) = 6 passed through as-is
+        # quat_*/rotmatrix: xyz(3)+rot6d(6) = 9 after convert_rot
         self.traj_encoder = nn.Linear(
-            6 if rotation_format == 'euler' else 9,  # NOTE: could change to XYZ + 6d (quat and euler are converted into 6d)
+            6 if rotation_format in ('euler', 'axisangle') else 9,
             embedding_dim
         )
         self.prediction_head = TransformerHead(
@@ -54,7 +56,7 @@ class DenoiseActor(nn.Module):
             nhist=nhist * 2,  # NOTE: build model with always 2 hands (was nhist=nhist * nhand)
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
-            rot_dim=3 if rotation_format == 'euler' else 6  # NOTE: could change to 6d
+            rot_dim=3 if rotation_format in ('euler', 'axisangle') else 6
         )
 
         # Noise/denoise schedulers and hyperparameters
@@ -63,10 +65,12 @@ class DenoiseActor(nn.Module):
         )
         self.n_steps = denoise_timesteps
 
-        # Normalization for the 3D space, will be loaded in the main process
-        if rotation_format == 'euler':  # normalize pos+rot
+        # Normalization for the 3D space, will be loaded in the main process.
+        # euler/axisangle: normalize pos+rot (6D), set by trainer.
+        # quat_*/rotmatrix: normalize pos only (3D), rotations are not normalized.
+        if rotation_format in ('euler', 'axisangle'):
             self.workspace_normalizer = nn.Parameter(
-                torch.Tensor([[0., 0, 0, 0, 0, 0], [1., 1, 1, 1, 1, 1]]),  # NOTE: could change to [[0,0,0],[1,1,1]] for 6d rot
+                torch.Tensor([[0., 0, 0, 0, 0, 0], [1., 1, 1, 1, 1, 1]]),
                 requires_grad=False
             )
         else:
@@ -78,21 +82,29 @@ class DenoiseActor(nn.Module):
 
     def encode_inputs(self, rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=None):
         encoder_input_proprio = proprio
-        # NOTE: fix for flower_actor_2d
+        # NOTE: fix for flower_actor_2d — convert external rotation rep to rot6d for encoder
         if hasattr(self.encoder, "proprio_feat"):
             layer = self.encoder.proprio_feat
             if isinstance(layer, nn.Linear) and layer.in_features > 8:
-                is_input_quat_8dim = (proprio.shape[-1] == 8)
-                if is_input_quat_8dim:
+                if proprio.shape[-1] == 8:  # quat proprio: xyz(3)+quat(4)+gripper(1)
                     pos = proprio[..., :3]
                     quat = proprio[..., 3:7]
                     gripper = proprio[..., 7:]
                     if self._rotation_format == 'quat_xyzw':
-                        quat = quat[..., [3, 0, 1, 2]] 
+                        quat = quat[..., [3, 0, 1, 2]]
                     mat = quaternion_to_matrix(quat)
                     batch_dims = mat.shape[:-2]
                     mat_flat = mat.flatten(0, -3)
-                    rot6d_flat = get_ortho6d_from_rotation_matrix(mat_flat) # -> (N, 6)
+                    rot6d_flat = get_ortho6d_from_rotation_matrix(mat_flat)  # (N, 6)
+                    rot6d = rot6d_flat.view(*batch_dims, 6)
+                    encoder_input_proprio = torch.cat([pos, rot6d, gripper], dim=-1)
+                elif proprio.shape[-1] == 13:  # rotmatrix proprio: xyz(3)+rotmat(9)+gripper(1)
+                    pos = proprio[..., :3]
+                    mat = proprio[..., 3:12]
+                    gripper = proprio[..., 12:]
+                    batch_dims = mat.shape[:-1]
+                    mat_flat = mat.flatten(0, -2).reshape(-1, 3, 3)
+                    rot6d_flat = get_ortho6d_from_rotation_matrix(mat_flat)  # (N, 6)
                     rot6d = rot6d_flat.view(*batch_dims, 6)
                     encoder_input_proprio = torch.cat([pos, rot6d, gripper], dim=-1)
         # NOTE: fix end
@@ -176,7 +188,8 @@ class DenoiseActor(nn.Module):
         )
 
         # Sample from learned model starting from noise
-        out_dim = 6 if self._rotation_format == 'euler' else 9  # NOTE: could change to out_dim=9 when euler and quat all use 6d
+        # euler/axisangle: xyz(3)+rot(3)=6;  quat_*/rotmatrix: xyz(3)+rot6d(6)=9
+        out_dim = 6 if self._rotation_format in ('euler', 'axisangle') else 9
         trajectory = torch.randn(
             size=tuple(trajectory_mask.shape) + (out_dim,),
             device=trajectory_mask.device
@@ -308,8 +321,12 @@ class DenoiseActor(nn.Module):
         return out
 
     def convert_rot(self, signal):
-        # If Euler then no conversion
-        if self._rotation_format == 'euler':
+        """Convert external rotation representation to rot6d for diffusion.
+        euler/axisangle : already 3, no conversion needed.
+        quat_*          : quat(4) → rotmat(3x3) → rot6d(6).
+        rotmatrix       : rotmat flat(9) → rot6d(6).
+        """
+        if self._rotation_format in ('euler', 'axisangle'):
             return signal
             # NOTE: if use euler->6d
             # rot = signal[..., 3:6]
@@ -320,14 +337,23 @@ class DenoiseActor(nn.Module):
             #     signal = torch.cat((signal, res), -1)
             # return signal
         # Else assume quaternion
+        if self._rotation_format == 'rotmatrix':
+            # signal: (..., 3 + 9 + 1)  — flattened row-major 3×3 matrix
+            res = signal[..., 12:] if signal.size(-1) > 12 else None
+            rot_flat = signal[..., 3:12]
+            *bdims, _ = rot_flat.shape
+            mat = rot_flat.reshape(-1, 3, 3)
+            rot6d = get_ortho6d_from_rotation_matrix(mat).reshape(*bdims, 6)
+            signal = torch.cat([signal[..., :3], rot6d], dim=-1)
+            if res is not None:
+                signal = torch.cat((signal, res), -1)
+            return signal
+        # quat_xyzw / quat_wxyz
         rot = normalise_quat(signal[..., 3:7])
         res = signal[..., 7:] if signal.size(-1) > 7 else None
-        # The following code expects wxyz quaternion format!
         if self._rotation_format == 'quat_xyzw':
             rot = rot[..., (3, 0, 1, 2)]
-        # Convert to rotation matrix
         rot = quaternion_to_matrix(rot)
-        # Convert to 6D
         if len(rot.shape) == 4:
             B, L, D1, D2 = rot.shape
             rot = rot.reshape(B * L, D1, D2)
@@ -335,15 +361,18 @@ class DenoiseActor(nn.Module):
             rot = rot.reshape(B, L, 6)
         else:
             rot = get_ortho6d_from_rotation_matrix(rot)
-        # Concatenate pos, rot, other state info
         signal = torch.cat([signal[..., :3], rot], dim=-1)
         if res is not None:
             signal = torch.cat((signal, res), -1)
         return signal
 
     def unconvert_rot(self, signal):
-        # If Euler then no conversion
-        if self._rotation_format == 'euler':
+        """Convert rot6d back to the external rotation representation.
+        euler/axisangle : no conversion needed.
+        quat_*          : rot6d(6) → rotmat(3x3) → quat(4).
+        rotmatrix       : rot6d(6) → rotmat(3x3) → flat(9).
+        """
+        if self._rotation_format in ('euler', 'axisangle'):
             return signal
             # NOTE: if use euler->6d->euler
             # res = signal[..., 9:] if signal.size(-1) > 9 else None
@@ -354,6 +383,18 @@ class DenoiseActor(nn.Module):
             #     signal = torch.cat((signal, res), -1)
             # return signal
         # Else assume quaternion
+        if self._rotation_format == 'rotmatrix':
+            # signal: (..., 3 + 6 + 1)  — rot6d
+            res = signal[..., 9:] if signal.size(-1) > 9 else None
+            rot6d = signal[..., 3:9]
+            *bdims, _ = rot6d.shape
+            mat = compute_rotation_matrix_from_ortho6d(rot6d.reshape(-1, 6))
+            mat_flat = mat.reshape(*bdims, 9)
+            signal = torch.cat([signal[..., :3], mat_flat], dim=-1)
+            if res is not None:
+                signal = torch.cat((signal, res), -1)
+            return signal
+        # quat_xyzw / quat_wxyz
         res = signal[..., 9:] if signal.size(-1) > 9 else None
         if len(signal.shape) == 3:
             B, L, _ = signal.shape
@@ -365,7 +406,6 @@ class DenoiseActor(nn.Module):
             rot = signal[..., 3:9]
             mat = compute_rotation_matrix_from_ortho6d(rot)
             quat = matrix_to_quaternion(mat)
-        # The above code handled wxyz quaternion format!
         if self._rotation_format == 'quat_xyzw':
             quat = quat[..., (1, 2, 3, 0)]
         signal = torch.cat([signal[..., :3], quat], dim=-1)
@@ -397,9 +437,11 @@ class DenoiseActor(nn.Module):
             instr_mask: optional (B, L) text padding mask for Qwen3-VL (1 = token, 0 = pad)
 
         Note:
-            The input rotation is expressed either as:
-                a) quaternion (4D), then the model converts it to 6D internally.
-                b) Euler angles (3D).
+            The input rotation is expressed as one of:
+                a) quaternion (4D)  — converted to 6D internally.
+                b) Euler angles (3D) — passed through as-is.
+                c) axis-angle (3D)  — passed through as-is (relative LIBERO).
+                d) rotation matrix flat (9D) — converted to 6D internally (absolute LIBERO).
 
         Returns:
             - loss: scalar, if run_inference is False

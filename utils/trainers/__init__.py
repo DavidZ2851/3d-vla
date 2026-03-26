@@ -1,7 +1,7 @@
 from .calvin import CALVINTrainTester
 from .peract import PeractTrainTester
 from .rlbench import RLBenchTrainTester
-
+from .libero import LiberoTrainTester
 
 def fetch_train_tester(dataset_name):
     dataset_name = dataset_name.lower()
@@ -15,4 +15,6 @@ def fetch_train_tester(dataset_name):
         return CALVINTrainTester
     if 'geniesim' in dataset_name:
         return RLBenchTrainTester
+    if 'libero' in dataset_name:
+        return LiberoTrainTester
     return None
