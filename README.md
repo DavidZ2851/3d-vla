@@ -43,16 +43,3 @@ calvin_env/calvin_env/envs/play_table_env.py: comment import cv2
 > pip install --upgrade networkx
 /home/ngkanats/miniforge3/envs/robot_26/lib/python3.10/site-packages/urdfpy/urdf.py: line 898, replace np.float with float
 moviepy
-
-OLD: 
-Remember to use the latest `calvin_env` module, which fixes bugs of `turn_off_led`.  See this [post](https://github.com/mees/calvin/issues/32#issuecomment-1363352121) for detail.
-```
-> git clone --recurse-submodules https://github.com/mees/calvin.git
-> export CALVIN_ROOT=$(pwd)/calvin
-> cd calvin
-> cd calvin_env; git checkout main
-> cd ..
-> ./install.sh; cd ..
-```
-Maybe need to upgrade networkx and change np.float to float in urdfpy.
-May need to install pyhash2
