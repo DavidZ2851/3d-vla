@@ -56,16 +56,3 @@ Remember to use the latest `calvin_env` module, which fixes bugs of `turn_off_le
 ```
 Maybe need to upgrade networkx and change np.float to float in urdfpy.
 May need to install pyhash2
-
-### Install LeRobot (not in this repo)
-```
-> git clone https://github.com/huggingface/lerobot.git
-> conda create -y -n lerobot python=3.10
-> conda activate lerobot
-> module load cuda-12.4
-> conda install -c conda-forge av ffmpeg
-> pip install --no-binary=av -e .
-> pip install -e ".[pi0]"
-> pip install pytest
-> create a huggingface token and login
-```
