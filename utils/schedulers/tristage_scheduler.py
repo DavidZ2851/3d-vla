@@ -67,6 +67,11 @@ class TriStageLRScheduler(_LRScheduler):
         self.decay_factor = -math.log(final_lr_scale) / self.decay_steps
         self.update_step = 0
         self.lr = self.init_lr
+        base_lrs = [group["lr"] for group in optimizer.param_groups]
+        max_lr = max(base_lrs) if base_lrs else 1.0
+        if max_lr <= 0:
+            max_lr = 1.0
+        self.lr_ratios = [base_lr / max_lr for base_lr in base_lrs]
 
     def _decide_stage(self):
         if self.update_step < self.warmup_steps:
@@ -107,10 +112,9 @@ class TriStageLRScheduler(_LRScheduler):
 
         return self.lr
 
-    @staticmethod
-    def set_lr(optimizer, lr):
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+    def set_lr(self, optimizer, lr):
+        for g, ratio in zip(optimizer.param_groups, self.lr_ratios):
+            g["lr"] = lr * ratio
 
     def get_lr(self):
         for g in self.optimizer.param_groups:

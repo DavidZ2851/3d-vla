@@ -40,7 +40,7 @@ lr=1e-4
 lr_scheduler=tristage_flower
 backbone_lr=1e-6
 wd=1e-10
-train_iters=600000
+train_iters=200000
 use_compile=false
 use_ema=false
 

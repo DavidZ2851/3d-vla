@@ -34,6 +34,7 @@ class Qwen3VLEncoder3D(nn.Module):
         num_attn_heads=9,
         fps_subsampling_factor=5,
         finetune_backbone=False,
+        num_finetune_vision_layers=0,
         finetune_text_encoder=False,
         backbone_module=None,
         normalize_module=None,
@@ -46,9 +47,20 @@ class Qwen3VLEncoder3D(nn.Module):
         self.backbone = backbone_module or Qwen3VLBackbone()
         self.normalize = normalize_module or Qwen3VLNormalize()
         self.finetune_backbone = finetune_backbone
+        self.num_finetune_vision_layers = num_finetune_vision_layers
 
         for p in self.backbone.parameters():
             p.requires_grad = finetune_backbone
+        if num_finetune_vision_layers > 0 and not finetune_backbone:
+            visual = self.backbone.vlm.visual
+            for block in visual.blocks[-num_finetune_vision_layers:]:
+                for p in block.parameters():
+                    p.requires_grad = True
+            for p in visual.merger.parameters():
+                p.requires_grad = True
+            for merger in visual.deepstack_merger_list:
+                for p in merger.parameters():
+                    p.requires_grad = True
 
         # ---------- Bridge layers (trained from scratch) ----------
         self.vis_norm = RmsNorm(self.backbone.vision_hidden_size)
@@ -93,7 +105,8 @@ class Qwen3VLEncoder3D(nn.Module):
         rgb3d_normed = self.normalize(rgb3d)
 
         # ---- Qwen3-VL forward ----
-        grad_ctx = nullcontext() if self.finetune_backbone else torch.no_grad()
+        needs_grad = self.finetune_backbone or self.num_finetune_vision_layers > 0
+        grad_ctx = nullcontext() if needs_grad else torch.no_grad()
         with grad_ctx:
             pre_merge, text_hidden = self.backbone(
                 rgb3d_normed, instruction, text_attention_mask=instr_mask

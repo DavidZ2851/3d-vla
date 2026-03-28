@@ -1,3 +1,15 @@
+#!/bin/bash
+#SBATCH --job-name=eval_calvin
+#SBATCH --mem=500G
+#SBATCH --gres=gpu:1
+#SBATCH --time=48:00:00
+#SBATCH --partition=general
+#SBATCH --output=/data/user_data/ziyinx/logs/%x_%j.out
+#SBATCH --error=/data/user_data/ziyinx/logs/%x_%j.err
+
+# pretrained VLM backbone path
+export QWEN3VL_MODEL_PATH=/home/ziyinx/Xiaomi-Robotics-0-Pretrain
+
 # You probably don't need to change these
 merged_config_file=online_evaluation_calvin/configs/merged_config_val_abc_d.yaml
 task_config_file=online_evaluation_calvin/configs/new_playtable_tasks.yaml
@@ -5,18 +17,16 @@ ann_config_file=online_evaluation_calvin/configs/new_playtable_validation.yaml
 
 # Things you may want to change if you train/eval a new model
 seed=0
-checkpoint=train_logs/CALVIN/flower_actor_3d-Calvin10th-C1024-B8-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true/interm20000.pth
-base_log_dir=eval_logs/CALVIN/flower_actor_3d-Calvin10th-C1024-B8-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true/
-checkpoint=train_logs/CALVIN/flower_actor_3d-Calvin10th-C1024-B8-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true/best.pth
-base_log_dir=eval_logs/CALVIN/flower_actor_3d-Calvin10th-C1024-B8-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true/
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/qwen_flower_actor_3d-Calvin10th-C1024-B64-lr1e-4-tristage_flower-H1-rectified_flow-qwen3vl-finetuned_false-job6767753/iter100k.pth
+base_log_dir=eval_logs/CALVIN/qwen_flower_actor_3d-Calvin10th-C1024-B64-lr1e-4-tristage_flower-H1-rectified_flow-qwen3vl-finetuned_false-job6767753-100k/
 save_video=false
 
 # Things you can change if you customize the model architecture
-model_type=flower_actor_3d
+model_type=qwen_flower_actor_3d
 pred_len=10
 pre_tokenize=true
 custom_img_size=224
-backbone=florence2
+backbone=qwen3vl
 fps_subsampling_factor=1
 embedding_dim=1024
 num_attn_heads=16
@@ -28,7 +38,6 @@ denoise_timesteps=5
 denoise_model=rectified_flow
 
 ngpus=1
-
 
 torchrun --nproc_per_node $ngpus --master_port $RANDOM \
     online_evaluation_calvin/evaluate_policy.py \

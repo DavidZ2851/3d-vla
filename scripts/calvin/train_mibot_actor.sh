@@ -9,7 +9,7 @@
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40S|A100_40GB"
+#SBATCH --constraint="L40S|A100_40GB|A100_80GB"
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
@@ -28,10 +28,10 @@ val_instructions=instructions/calvin/val_instructions.json
 dataset=Calvin10th
 num_workers=8
 memory_limit=8
-B=64
-B_val=64
+B=16
+B_val=16
 chunk_size=8
-lv2_batch_size=1
+lv2_batch_size=2
 
 # ---- Training ----
 val_freq=2000
@@ -39,8 +39,11 @@ eval_only=false
 lr=1e-4
 lr_scheduler=tristage_flower
 backbone_lr=1e-6
+num_finetune_vision_layers=2
+vision_lr_scale=0.05
+projector_lr_scale=0.1
 wd=1e-10
-train_iters=600000
+train_iters=200000
 use_compile=false
 use_ema=false
 
@@ -124,4 +127,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --rotation_format $rotation_format \
     --denoise_timesteps $denoise_timesteps \
     --denoise_model $denoise_model \
-    --finetune $finetune
+    --finetune $finetune \
+    --num_finetune_vision_layers $num_finetune_vision_layers \
+    --vision_lr_scale $vision_lr_scale \
+    --projector_lr_scale $projector_lr_scale

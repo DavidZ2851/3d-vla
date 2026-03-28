@@ -51,11 +51,26 @@ class Model:
         self.policy = self.policy.to(device)
 
     def load_pretrained_weights(self):
-        state_dict = torch.load(self.args.checkpoint, map_location="cpu")["ema_weight"]
+        ckpt = torch.load(self.args.checkpoint, map_location="cpu")
+        state_dict = None
+
+        if isinstance(ckpt, dict):
+            # Prefer EMA weights when available, otherwise use raw weights.
+            state_dict = ckpt.get("ema_weight") or ckpt.get("weight")
+            if state_dict is None:
+                # Fallback for other common checkpoint formats.
+                state_dict = ckpt.get("state_dict") or ckpt.get("model_state_dict")
+
+        if not isinstance(state_dict, dict):
+            raise ValueError(
+                f"Unable to find a valid state_dict in checkpoint {self.args.checkpoint}. "
+                f"Expected one of: ema_weight, weight, state_dict, model_state_dict."
+            )
+
         model_weights = {}
-        for key in state_dict:
-            _key = key[7:]
-            model_weights[_key] = state_dict[key]
+        for key, value in state_dict.items():
+            _key = key[7:] if key.startswith("module.") else key
+            model_weights[_key] = value
         print(f'Loading weights from {self.args.checkpoint}')
         self.policy.load_state_dict(model_weights, strict=True)
 

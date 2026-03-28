@@ -127,6 +127,7 @@ class BaseTrainTester:
         _model = self.model_cls(
             backbone=self.args.backbone,
             finetune_backbone=self.args.finetune_backbone,
+            num_finetune_vision_layers=self.args.num_finetune_vision_layers,
             finetune_text_encoder=self.args.finetune_text_encoder,
             num_vis_instr_attn_layers=self.args.num_vis_instr_attn_layers,
             fps_subsampling_factor=self.args.fps_subsampling_factor,
@@ -195,10 +196,38 @@ class BaseTrainTester:
             {"params": [], "weight_decay": 0.0, "lr": self.args.lr},
             {"params": [], "weight_decay": self.args.wd, "lr": self.args.lr}
         ]
+        backbone_idx = None
         if self.args.finetune_backbone:
+            backbone_idx = len(optimizer_grouped_parameters)
             optimizer_grouped_parameters.append({
                 "params": [], "weight_decay": self.args.wd,
                 "lr": self.args.backbone_lr
+            })
+        use_vision_groups = self.args.num_finetune_vision_layers > 0
+        vision_no_decay_idx = None
+        vision_decay_idx = None
+        projector_no_decay_idx = None
+        projector_decay_idx = None
+        if use_vision_groups:
+            vision_no_decay_idx = len(optimizer_grouped_parameters)
+            optimizer_grouped_parameters.append({
+                "params": [], "weight_decay": 0.0,
+                "lr": self.args.lr * self.args.vision_lr_scale
+            })
+            vision_decay_idx = len(optimizer_grouped_parameters)
+            optimizer_grouped_parameters.append({
+                "params": [], "weight_decay": self.args.wd,
+                "lr": self.args.lr * self.args.vision_lr_scale
+            })
+            projector_no_decay_idx = len(optimizer_grouped_parameters)
+            optimizer_grouped_parameters.append({
+                "params": [], "weight_decay": 0.0,
+                "lr": self.args.lr * self.args.projector_lr_scale
+            })
+            projector_decay_idx = len(optimizer_grouped_parameters)
+            optimizer_grouped_parameters.append({
+                "params": [], "weight_decay": self.args.wd,
+                "lr": self.args.lr * self.args.projector_lr_scale
             })
 
         # Collect names of all norm parameters
@@ -224,10 +253,20 @@ class BaseTrainTester:
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if name in norm_param_names or name.endswith(".bias"):
+            is_no_decay = name in norm_param_names or name.endswith(".bias")
+            if use_vision_groups and "encoder.backbone.vlm.visual.blocks." in name:
+                group_idx = vision_no_decay_idx if is_no_decay else vision_decay_idx
+                optimizer_grouped_parameters[group_idx]["params"].append(param)
+            elif use_vision_groups and (
+                "encoder.backbone.vlm.visual.merger" in name
+                or "encoder.backbone.vlm.visual.deepstack_merger_list" in name
+            ):
+                group_idx = projector_no_decay_idx if is_no_decay else projector_decay_idx
+                optimizer_grouped_parameters[group_idx]["params"].append(param)
+            elif is_no_decay:
                 optimizer_grouped_parameters[0]["params"].append(param)
-            elif self.args.finetune_backbone and 'backbone' in name:
-                optimizer_grouped_parameters[2]["params"].append(param)
+            elif self.args.finetune_backbone and "backbone" in name:
+                optimizer_grouped_parameters[backbone_idx]["params"].append(param)
             else:
                 optimizer_grouped_parameters[1]["params"].append(param)
         optimizer = optim.AdamW(
@@ -254,7 +293,8 @@ class BaseTrainTester:
         lr_scheduler = fetch_scheduler(
             self.args.lr_scheduler, optimizer, self.args.train_iters
         )
-        scaler = torch.GradScaler()
+        # GradScaler is only needed for float16 autocast. This trainer uses bfloat16.
+        scaler = torch.GradScaler(enabled=False)
 
         # Move model to devices
         if torch.cuda.is_available():

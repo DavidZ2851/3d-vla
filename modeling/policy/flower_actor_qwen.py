@@ -16,6 +16,7 @@ class QwenFlowerActor3D(BaseDenoiseActor):
         output_level="res3",
         upsample=False,
         finetune_backbone=False,
+        num_finetune_vision_layers=0,
         finetune_text_encoder=False,
         num_vis_instr_attn_layers=2,
         fps_subsampling_factor=5,
@@ -51,6 +52,7 @@ class QwenFlowerActor3D(BaseDenoiseActor):
             num_attn_heads=num_attn_heads,
             fps_subsampling_factor=fps_subsampling_factor,
             finetune_backbone=finetune_backbone,
+            num_finetune_vision_layers=num_finetune_vision_layers,
             finetune_text_encoder=finetune_text_encoder,
         )
 
