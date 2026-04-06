@@ -2,6 +2,93 @@ import gc, os, torch
 from torch import nn
 from transformers import AutoProcessor
 
+
+def _parse_dotted_lora_suffixes(dotted_csv: str) -> list[str]:
+    """
+    Split CLI dotted paths into suffixes **after** the layer index, e.g.
+    ``self_attn.q_proj,mlp.gate_proj`` -> ``["self_attn.q_proj", "mlp.gate_proj"]``.
+    These are joined with ``layers.{i}.`` / ``blocks.{i}.`` for PEFT (see below).
+    """
+    out = []
+    for part in dotted_csv.split(","):
+        p = part.strip()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def _resolve_peft_target_modules(
+    module: nn.Module,
+    stack_name: str,
+    n_total: int,
+    start_layer: int,
+    dotted_targets: list[str],
+) -> list[str]:
+    """
+    Resolve user-facing dotted targets to exact ``named_modules()`` keys.
+
+    This is more robust than inferring a path prefix and constructing strings,
+    because MiBot / Qwen variants may place the layer stack at slightly different
+    nesting depths while still exposing the same leaf module suffixes.
+    """
+    if not dotted_targets:
+        return []
+
+    named_module_keys = [name for name, _ in module.named_modules() if name]
+    resolved = []
+    missing = []
+
+    for target in dotted_targets:
+        target = target.strip()
+        if not target:
+            continue
+
+        layer_matches = []
+        for layer_idx in range(start_layer, n_total):
+            want = f"{stack_name}.{layer_idx}.{target}"
+            exact = [name for name in named_module_keys if name == want or name.endswith(f".{want}")]
+            layer_matches.extend(exact)
+
+        if not layer_matches:
+            missing.append(target)
+            continue
+
+        for name in layer_matches:
+            if name not in resolved:
+                resolved.append(name)
+
+    if missing:
+        preview = [name for name in named_module_keys if stack_name in name][:20]
+        raise ValueError(
+            f"Could not resolve LoRA target modules {missing} under '{stack_name}' "
+            f"for layers [{start_layer}, {n_total}). Example module keys: {preview}"
+        )
+
+    return resolved
+
+
+def _unwrap_peft_module(module: nn.Module) -> nn.Module:
+    """Return inner base model if ``module`` is a PEFT-wrapped model."""
+    try:
+        from peft import PeftModel
+    except ImportError:
+        return module
+    m = module
+    while isinstance(m, PeftModel):
+        m = m.get_base_model()
+    return m
+
+
+def _register_merger_pre_hook(visual: nn.Module, hook_fn) -> None:
+    inner = _unwrap_peft_module(visual)
+    inner.merger.register_forward_pre_hook(hook_fn)
+
+
+def _register_block_forward_hook(visual: nn.Module, layer_idx: int, hook_fn):
+    inner = _unwrap_peft_module(visual)
+    return inner.blocks[layer_idx].register_forward_hook(hook_fn)
+
+
 class Qwen3VLNormalize(nn.Module):
     """
     MiBot/Qwen3-VL preprocessing:
@@ -35,18 +122,8 @@ class Qwen3VLNormalize(nn.Module):
 
     def forward(self, img):
         x = img
-        if self.do_rescale:
-            # 3DFA-VLA pipeline applies pixel/255 during data preprocessing.
-            # If values look like raw uint8-range, apply MiBot's rescale factor.
-            apply_rescale = True
-            if torch.is_floating_point(x):
-                max_val = x.detach().amax()
-                if torch.isfinite(max_val) and max_val <= 1.0 + 1e-6:
-                    apply_rescale = False
-            if apply_rescale:
-                x = x * self.rescale_factor
         if self.do_normalize:
-            x = (x - self.mean) / self.std
+            x = (x - self.mean.to(x.dtype)) / self.std.to(x.dtype)
         return x
 
 
@@ -68,20 +145,43 @@ class Qwen3VLBackbone(nn.Module):
     1. **Pre-merge** vision features – stride-16, dim ``vision_hidden_size``
        (captured by a forward-pre-hook on the main ``PatchMerger``).
     2. **Fused LLM** text hidden states – dim ``llm_hidden_size``, extracted
-       from ``last_hidden_state`` at text-token positions (after full decoder + RMSNorm). 
-       The forward pass runs MiBot/HF ``Qwen3VLModel`` with ``pixel_values`` set, which (per ``Qwen3VLModel.forward``) calls ``get_image_features`` → ViT returns ``deepstack_image_embeds``, then ``language_model(..., deepstack_visual_embeds=...)`` applies ``_deepstack_process`` at early decoder layers on visual positions.
-       Text positions then attend (causally) to those enriched visuals, so the text slice matches the fused representation used when conditioning on the same VLM in MiBot.
+       from ``last_hidden_state`` at text-token positions (after full decoder + RMSNorm).
 
-    Prompts follow MiBot/Qwen chat template formatting. We derive template scaffolding from the tokenizer (when available) and then expand image placeholders to match merged visual token counts.
-
-    Supports loading from:
-      - A **MiBot** checkpoint  (``model_type="mibot"``): loads
-        ``MiBoTForActionGeneration``, extracts ``model.vlm.model`` (``Qwen3VLModel``) — weights match because HuggingFace resolves the full ``vlm.model.visual.*`` / ``vlm.model.language_model.*`` key hierarchy during ``from_pretrained``.
-      - A **Qwen3-VL** checkpoint (``model_type="qwen3_vl"``): loads
-        ``Qwen3VLForConditionalGeneration`` and extracts ``.model``, or loads ``Qwen3VLModel`` directly.
+    LLM adaptation uses **PEFT LoRA** on ``language_model`` when requested.
+    Vision adaptation uses **PEFT LoRA** on ``visual`` when requested; otherwise the
+    encoder may still full-finetune ``visual`` via ``requires_grad`` (see ``Qwen3VLEncoder3D``).
     """
-    def __init__(self, model_name_or_path=None):
+    def __init__(
+        self,
+        model_name_or_path=None,
+        vision_lora_rank=0,
+        vision_lora_alpha=16,
+        vision_lora_dropout=0.0,
+        vision_lora_num_layers=0,
+        vision_lora_target_modules="attn.qkv,attn.proj",
+        llm_lora_rank=0,
+        llm_lora_alpha=16,
+        llm_lora_dropout=0.0,
+        llm_lora_num_layers=0,
+        llm_lora_target_modules="self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj",
+        gradient_checkpointing=False,
+        use_multiscale=False,
+        multiscale_layers=(5, 11, 17, 23),
+    ):
         super().__init__()
+        use_vision_lora = vision_lora_num_layers > 0 and vision_lora_rank > 0
+        use_llm_lora = llm_lora_num_layers > 0 and llm_lora_rank > 0
+        use_any_lora = use_vision_lora or use_llm_lora
+        LoraConfig = None
+        get_peft_model = None
+        if use_any_lora:
+            try:
+                from peft import LoraConfig, get_peft_model
+            except ImportError as e:
+                raise ImportError(
+                    "PEFT is required for Qwen3-VL LoRA. Install with: pip install peft"
+                ) from e
+
         path = _resolve_model_path(model_name_or_path)
         vlm, vlm_config = self._load_vlm(path)
         self.vlm = vlm
@@ -96,14 +196,120 @@ class Qwen3VLBackbone(nn.Module):
         self.llm_hidden_size = vlm_config.text_config.hidden_size
 
         vlm_config.text_config.use_cache = False
+        if hasattr(self.vlm, "config"):
+            self.vlm.config.use_cache = False
+            if hasattr(self.vlm.config, "text_config"):
+                self.vlm.config.text_config.use_cache = False
+        if hasattr(self.vlm.language_model, "config"):
+            self.vlm.language_model.config.use_cache = False
 
         self.token_dropout = nn.Dropout(0.1)
         self._debug_timing_printed = False
         self._rope_cache = {}
         self._rope_cache_max = 2048
+        self._template_tensor_cache = {}
 
         self._pre_merge_features = None
-        self.vlm.visual.merger.register_forward_pre_hook(self._pre_merge_hook)
+        self.use_multiscale = bool(use_multiscale)
+        self.multiscale_layers = tuple(
+            dict.fromkeys(int(layer_idx) for layer_idx in multiscale_layers)
+        )
+        self._multiscale_features = {}
+        self._multiscale_hook_handles = []
+
+        # Store dotted paths for optimizer grouping (substring match on param names)
+        self.vision_lora_target_modules = (
+            [x.strip() for x in vision_lora_target_modules.split(",") if x.strip()]
+            if isinstance(vision_lora_target_modules, str)
+            else list(vision_lora_target_modules)
+        )
+        self.llm_lora_target_modules = (
+            [x.strip() for x in llm_lora_target_modules.split(",") if x.strip()]
+            if isinstance(llm_lora_target_modules, str)
+            else list(llm_lora_target_modules)
+        )
+        self.resolved_vision_lora_target_modules = []
+        self.resolved_llm_lora_target_modules = []
+
+        # ---- PEFT: vision LoRA (optional) ----
+        if use_vision_lora:
+            vis_inner = _unwrap_peft_module(self.vlm.visual)
+            n_blocks = len(vis_inner.blocks)
+            start = max(0, n_blocks - vision_lora_num_layers)
+            v_suf = _parse_dotted_lora_suffixes(",".join(self.vision_lora_target_modules))
+            if not v_suf:
+                v_suf = ["attn.qkv", "attn.proj"]
+            v_tgt = _resolve_peft_target_modules(
+                vis_inner,
+                "blocks",
+                n_blocks,
+                start,
+                v_suf,
+            )
+            self.resolved_vision_lora_target_modules = list(v_tgt)
+            v_cfg = LoraConfig(
+                r=vision_lora_rank,
+                lora_alpha=vision_lora_alpha,
+                lora_dropout=vision_lora_dropout,
+                target_modules=v_tgt,
+                bias="none",
+            )
+            self.vlm.visual = get_peft_model(self.vlm.visual, v_cfg)
+
+        # ---- PEFT: LLM LoRA (optional) ----
+        if use_llm_lora:
+            lm = _unwrap_peft_module(self.vlm.language_model)
+            n_layers = len(lm.layers)
+            start = max(0, n_layers - llm_lora_num_layers)
+            l_suf = _parse_dotted_lora_suffixes(",".join(self.llm_lora_target_modules))
+            if not l_suf:
+                l_suf = [
+                    "self_attn.q_proj",
+                    "self_attn.k_proj",
+                    "self_attn.v_proj",
+                    "self_attn.o_proj",
+                ]
+            l_tgt = _resolve_peft_target_modules(
+                lm,
+                "layers",
+                n_layers,
+                start,
+                l_suf,
+            )
+            self.resolved_llm_lora_target_modules = list(l_tgt)
+            l_cfg = LoraConfig(
+                r=llm_lora_rank,
+                lora_alpha=llm_lora_alpha,
+                lora_dropout=llm_lora_dropout,
+                target_modules=l_tgt,
+                bias="none",
+            )
+            self.vlm.language_model = get_peft_model(self.vlm.language_model, l_cfg)
+
+        _register_merger_pre_hook(self.vlm.visual, self._pre_merge_hook)
+        if self.use_multiscale:
+            vis_inner = _unwrap_peft_module(self.vlm.visual)
+            n_blocks = len(vis_inner.blocks)
+            invalid_layers = [
+                layer_idx
+                for layer_idx in self.multiscale_layers
+                if layer_idx < 0 or layer_idx >= n_blocks
+            ]
+            if invalid_layers:
+                raise ValueError(
+                    f"Invalid multiscale vision layers {invalid_layers}; "
+                    f"Qwen vision tower has {n_blocks} blocks."
+                )
+            for layer_idx in self.multiscale_layers:
+                handle = _register_block_forward_hook(
+                    self.vlm.visual,
+                    layer_idx,
+                    self._make_multiscale_hook(layer_idx),
+                )
+                self._multiscale_hook_handles.append(handle)
+
+        if gradient_checkpointing:
+            self.vlm.gradient_checkpointing_enable()
 
         # Reuse MiBot tokenizer metadata and chat-template scaffolding when available.
         self._processor = None
@@ -162,6 +368,7 @@ class Qwen3VLBackbone(nn.Module):
             # ---- Standard Qwen3-VL checkpoint ----
             raw = AutoModelForCausalLM.from_pretrained(
                 path, trust_remote_code=True, torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
                 low_cpu_mem_usage=True,
             )
             if hasattr(raw, "model") and hasattr(raw.model, "visual"):
@@ -184,6 +391,32 @@ class Qwen3VLBackbone(nn.Module):
         # Input to the main PatchMerger: last ViT block output, shape (total_patches, vision_hidden_size)
         # total_patches = B * ncam * hp * wp (same concat order as pixel_values)
         self._pre_merge_features = args[0]
+
+    def _make_multiscale_hook(self, layer_idx):
+        def hook(module, args, output):
+            feats = output[0] if isinstance(output, tuple) else output
+            self._multiscale_features[layer_idx] = feats
+
+        return hook
+
+    def _reshape_pre_merge_tokens(self, feats, batch_size, num_cameras, hp, wp):
+        ms = self.spatial_merge_size
+        feats = feats.reshape(
+            batch_size * num_cameras,
+            hp // ms,
+            wp // ms,
+            ms,
+            ms,
+            self.vision_hidden_size,
+        )
+        feats = feats.permute(0, 1, 3, 2, 4, 5).reshape(
+            batch_size,
+            num_cameras,
+            hp,
+            wp,
+            self.vision_hidden_size,
+        )
+        return feats
 
     @staticmethod
     def _find_subseq_index(sequence, subsequence):
@@ -259,9 +492,17 @@ class Qwen3VLBackbone(nn.Module):
         self._chat_mid_ids = prefix_with_vision[vision_end_pos + 1 :]
         self._chat_suffix_ids = suffix
 
+    def _get_cached_template_ids(self, ids, cache_name: str, device) -> torch.Tensor:
+        key = (cache_name, str(device))
+        cached = self._template_tensor_cache.get(key)
+        if cached is None:
+            cached = torch.tensor(ids, dtype=torch.long, device=device)
+            self._template_tensor_cache[key] = cached
+        return cached
+
     def images_to_pixel_values(self, images):
         """(N,3,H,W) -> (N*hp*wp, C*tp*ps*ps) flat patches in merge-block order.
-        Qwen3-VL ViT expects patches grouped so that each spatial_merge_size x spatial_merge_size block is contiguous (matching fast_pos_embed_interpolate, rot_pos_emb, and PatchMerger in the pretrained weights).  
+        Qwen3-VL ViT expects patches grouped so that each spatial_merge_size x spatial_merge_size block is contiguous (matching fast_pos_embed_interpolate, rot_pos_emb, and PatchMerger in the pretrained weights).
         The HF Qwen2VLImageProcessor produces exactly this layout; we replicate it here for raw tensor inputs.
         """
         N, C, H, W = images.shape
@@ -296,65 +537,109 @@ class Qwen3VLBackbone(nn.Module):
 
         cursor = 0
         if prefix_len > 0:
-            prefix = torch.tensor(self._chat_prefix_ids, dtype=torch.long, device=device)
+            prefix = self._get_cached_template_ids(
+                self._chat_prefix_ids, "prefix", device
+            )
             ids[:, cursor : cursor + prefix_len] = prefix[None, :]
             cursor += prefix_len
         for _ in range(ncam):
             ids[:, cursor] = self.vision_start_token_id
-            ids[:, cursor + 1 : cursor + 1 + merged_tok] = self.image_token_id
+            ids[:, cursor + 1 : cursor + 1 + merged_tok].fill_(self.image_token_id)
             ids[:, cursor + 1 + merged_tok] = self.vision_end_token_id
             cursor += per_img
         if mid_len > 0:
-            mid = torch.tensor(self._chat_mid_ids, dtype=torch.long, device=device)
+            mid = self._get_cached_template_ids(
+                self._chat_mid_ids, "mid", device
+            )
             ids[:, cursor : cursor + mid_len] = mid[None, :]
             cursor += mid_len
 
         instr_start = cursor
-        ids[:, instr_start : instr_start + tl] = text_ids
+        ids[:, instr_start : instr_start + tl] = text_ids.to(device=device)
         cursor += tl
 
         if suffix_len > 0:
-            suffix = torch.tensor(self._chat_suffix_ids, dtype=torch.long, device=device)
+            suffix = self._get_cached_template_ids(
+                self._chat_suffix_ids, "suffix", device
+            )
             ids[:, cursor : cursor + suffix_len] = suffix[None, :]
 
         return ids, instr_start, tl
 
-    def _get_native_position_ids_cached(self, input_ids, grid_thw, attention_mask, text_attention_mask, ncam, hp, wp):
+    def _get_native_position_ids_cached(
+        self,
+        input_ids,
+        grid_thw,
+        attention_mask,
+        text_attention_mask,
+        ncam,
+        hp,
+        wp,
+        text_valid_lens=None,
+    ):
         """
-        Use original Qwen3VLModel.get_rope_index(), but cache by layout+mask pattern.
-        This preserves native MiBot/Qwen logic while avoiding repeated Python loops.
+        Cache native RoPE indices per sample length instead of per whole batch.
+        For our prompt layout, RoPE depends on the visual layout and each sample's
+        valid text length, so this avoids frequent batch-cache misses.
         """
-        if text_attention_mask is None:
-            valid_text_lens = tuple([input_ids.shape[1]] * input_ids.shape[0])
+        if text_valid_lens is None:
+            if text_attention_mask is None:
+                text_valid_lens = tuple([int(input_ids.shape[1])] * input_ids.shape[0])
+            else:
+                text_valid_lens = tuple(
+                    int(x)
+                    for x in text_attention_mask.sum(dim=1).to(dtype=torch.long).tolist()
+                )
         else:
-            valid_text_lens = tuple(
-                text_attention_mask.sum(dim=1).to(dtype=torch.long).tolist()
-            )
-        key = (ncam, hp, wp, int(input_ids.shape[1]), valid_text_lens)
-        cached = self._rope_cache.get(key)
-        if cached is not None:
-            return cached
+            text_valid_lens = tuple(int(x) for x in text_valid_lens)
 
-        position_ids, rope_deltas = self.vlm.get_rope_index(
-            input_ids=input_ids,
-            image_grid_thw=grid_thw,
-            attention_mask=attention_mask,
-        )
-        # Keep cache bounded.
-        if len(self._rope_cache) >= self._rope_cache_max:
-            self._rope_cache.pop(next(iter(self._rope_cache)))
-        self._rope_cache[key] = (position_ids, rope_deltas)
+        cached_pos = []
+        cached_deltas = []
+        seq_len = int(input_ids.shape[1])
+        for batch_idx, valid_len in enumerate(text_valid_lens):
+            key = (ncam, hp, wp, seq_len, int(valid_len))
+            cached = self._rope_cache.get(key)
+            if cached is None:
+                single_input_ids = input_ids[batch_idx : batch_idx + 1]
+                single_attention_mask = (
+                    attention_mask[batch_idx : batch_idx + 1]
+                    if attention_mask is not None
+                    else None
+                )
+                single_grid_thw = grid_thw[
+                    batch_idx * ncam : (batch_idx + 1) * ncam
+                ]
+                cached = self.vlm.get_rope_index(
+                    input_ids=single_input_ids,
+                    image_grid_thw=single_grid_thw,
+                    attention_mask=single_attention_mask,
+                )
+                if len(self._rope_cache) >= self._rope_cache_max:
+                    self._rope_cache.pop(next(iter(self._rope_cache)))
+                self._rope_cache[key] = cached
+            cached_pos.append(cached[0])
+            cached_deltas.append(cached[1])
+
+        position_ids = torch.cat(cached_pos, dim=1)
+        rope_deltas = torch.cat(cached_deltas, dim=0)
         return position_ids, rope_deltas
 
-    def forward(self, images, text_token_ids, text_attention_mask=None):
+    def forward(
+        self,
+        images,
+        text_token_ids,
+        text_attention_mask=None,
+        text_valid_lens=None,
+    ):
         """
         Args:
             images:         (B, ncam, 3, H, W), MiBot-preprocessed
             text_token_ids: (B, L), pre-tokenised instruction
-            text_attention_mask: (B, L) optional; 1 = real token, 0 = pad (from tokenizer)
+            text_attention_mask: (B, L) optional; 1 = real token, 0 = pad (from Qwen tokenizer)
         Returns:
             pre_merge_feats: (B, ncam, h16, w16, vision_hidden_size)
             text_hidden:     (B, L, llm_hidden_size)
+            multiscale_feats: dict[layer_idx -> (B, ncam, h16, w16, vision_hidden_size)] or None
         """
         B, ncam, C, H, W = images.shape
         dev = images.device
@@ -380,13 +665,23 @@ class Qwen3VLBackbone(nn.Module):
             full_attention_mask = None
 
         position_ids, rope_deltas = self._get_native_position_ids_cached(
-            input_ids, grid_thw, full_attention_mask, text_attention_mask, ncam, hp, wp
+            input_ids,
+            grid_thw,
+            full_attention_mask,
+            text_attention_mask,
+            ncam,
+            hp,
+            wp,
+            text_valid_lens=text_valid_lens,
         )
         # Keep model-internal rope_deltas behavior consistent with native path.
         self.vlm.rope_deltas = rope_deltas
 
         self._pre_merge_features = None
-        # pixel_values non-None → Qwen3VLModel.forward runs get_image_features (ViT + deepstack mergers) and passes deepstack_visual_embeds into language_model.
+        if self.use_multiscale:
+            self._multiscale_features = {}
+        # pixel_values non-None → Qwen3VLModel.forward runs get_image_features
+        # (ViT + deepstack mergers) and passes deepstack_visual_embeds into language_model.
         outputs = self.vlm(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -398,14 +693,31 @@ class Qwen3VLBackbone(nn.Module):
         # Feature 1 – pre-merge vision (stride 16, ViT hidden dim)
         # The ViT outputs patches in merge-block order (bh, bw, ms, ms).
         # Undo the reorder to recover row-major (hp, wp) spatial layout so features align with the bilinearly-downsampled PCD grid.
-        pre_merge = self._pre_merge_features
-        ms = self.spatial_merge_size
-        pre_merge = pre_merge.reshape(
-            B * ncam, hp // ms, wp // ms, ms, ms, self.vision_hidden_size
-        )
-        pre_merge = pre_merge.permute(0, 1, 3, 2, 4, 5).reshape(
-            B, ncam, hp, wp, self.vision_hidden_size
-        )
+        pre_merge_flat = self._pre_merge_features
+        pre_merge = self._reshape_pre_merge_tokens(pre_merge_flat, B, ncam, hp, wp)
+
+        multiscale_feats = None
+        if self.use_multiscale:
+            flat_multiscale = dict(self._multiscale_features)
+            if self.multiscale_layers:
+                flat_multiscale.setdefault(
+                    self.multiscale_layers[-1], pre_merge_flat
+                )
+            missing_layers = [
+                layer_idx
+                for layer_idx in self.multiscale_layers
+                if layer_idx not in flat_multiscale
+            ]
+            if missing_layers:
+                raise RuntimeError(
+                    f"Missing multiscale Qwen features for layers {missing_layers}."
+                )
+            multiscale_feats = {
+                layer_idx: self._reshape_pre_merge_tokens(
+                    flat_multiscale[layer_idx], B, ncam, hp, wp
+                )
+                for layer_idx in self.multiscale_layers
+            }
 
         # Feature 2 – text positions only from final LLM hidden states (deepstack-fused context via causal attention to visual positions)
         text_hidden = outputs.last_hidden_state[:, instr_start : instr_start + text_len, :]
@@ -413,7 +725,7 @@ class Qwen3VLBackbone(nn.Module):
             tm = text_attention_mask.to(device=text_hidden.device, dtype=text_hidden.dtype)
             text_hidden = text_hidden * tm.unsqueeze(-1)
         text_hidden = self.token_dropout(text_hidden)
-        return pre_merge, text_hidden
+        return pre_merge, text_hidden, multiscale_feats
 
 
 def load_qwen3vl():

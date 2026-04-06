@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=calvin_mibot
+#SBATCH --job-name=calvin_mibot_multiscale
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=500G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=300G
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=general
@@ -13,8 +13,6 @@
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
-
-# ---- VLM Model path ----
 export QWEN3VL_MODEL_PATH=/home/ziyinx/Xiaomi-Robotics-0-Pretrain
 
 # ---- Data paths (edit as needed) ----
@@ -31,19 +29,15 @@ memory_limit=8
 B=16
 B_val=16
 chunk_size=8
-lv2_batch_size=2
+lv2_batch_size=1
 
 # ---- Training ----
-val_freq=2000
+val_freq=5000
 eval_only=false
-lr=1e-4
+lr=3e-5
 lr_scheduler=tristage_flower
-backbone_lr=1e-6
-num_finetune_vision_layers=2
-vision_lr_scale=0.05
-projector_lr_scale=0.1
-wd=1e-10
-train_iters=200000
+wd=0.05
+train_iters=100000
 use_compile=false
 use_ema=false
 
@@ -58,6 +52,20 @@ backbone=qwen3vl
 finetune_backbone=false
 finetune_text_encoder=false
 fps_subsampling_factor=1
+use_multiscale=true
+
+# ---- LoRA Configuration ----
+num_finetune_vision_layers=24
+vision_lora_rank=0
+vision_lora_alpha=32
+vision_lora_dropout=0.05
+vision_lora_num_layers=0
+vision_lora_target_modules=attn.qkv,attn.proj,mlp.linear_fc1,mlp.linear_fc2
+llm_lora_rank=64
+llm_lora_alpha=128
+llm_lora_dropout=0.05
+llm_lora_num_layers=36
+llm_lora_target_modules=self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj,mlp.gate_proj,mlp.up_proj,mlp.down_proj
 
 C=1024
 num_attn_heads=16
@@ -103,7 +111,6 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --eval_only $eval_only \
     --lr $lr \
     --lr_scheduler $lr_scheduler \
-    --backbone_lr $backbone_lr \
     --wd $wd \
     --train_iters $train_iters \
     --use_compile $use_compile \
@@ -117,6 +124,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --finetune_backbone $finetune_backbone \
     --finetune_text_encoder $finetune_text_encoder \
     --fps_subsampling_factor $fps_subsampling_factor \
+    --use_multiscale $use_multiscale \
     --embedding_dim $C \
     --num_attn_heads $num_attn_heads \
     --num_vis_instr_attn_layers $num_vis_instr_attn_layers \
@@ -129,5 +137,13 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --denoise_model $denoise_model \
     --finetune $finetune \
     --num_finetune_vision_layers $num_finetune_vision_layers \
-    --vision_lr_scale $vision_lr_scale \
-    --projector_lr_scale $projector_lr_scale
+    --vision_lora_rank $vision_lora_rank \
+    --vision_lora_alpha $vision_lora_alpha \
+    --vision_lora_dropout $vision_lora_dropout \
+    --vision_lora_num_layers $vision_lora_num_layers \
+    --vision_lora_target_modules $vision_lora_target_modules \
+    --llm_lora_rank $llm_lora_rank \
+    --llm_lora_alpha $llm_lora_alpha \
+    --llm_lora_dropout $llm_lora_dropout \
+    --llm_lora_num_layers $llm_lora_num_layers \
+    --llm_lora_target_modules $llm_lora_target_modules

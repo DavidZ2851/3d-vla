@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import os
 import gc
 import random
@@ -52,7 +53,19 @@ def parse_arguments():
         ('custom_img_size', int, None),
         # Model arguments: encoder
         ('backbone', str, "clip"),
+        ('num_finetune_vision_layers', int, 0),
+        ('vision_lora_rank', int, 0),
+        ('vision_lora_alpha', int, 32),
+        ('vision_lora_dropout', float, 0.05),
+        ('vision_lora_num_layers', int, 0),
+        ('vision_lora_target_modules', str, "attn.qkv,attn.proj"),
+        ('llm_lora_rank', int, 0),
+        ('llm_lora_alpha', int, 32),
+        ('llm_lora_dropout', float, 0.05),
+        ('llm_lora_num_layers', int, 0),
+        ('llm_lora_target_modules', str, "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj"),
         ('fps_subsampling_factor', int, 5),
+        ('use_multiscale', str2bool, False),
         # Model arguments: encoder and head
         ('embedding_dim', int, 144),
         ('num_attn_heads', int, 9),
@@ -71,8 +84,14 @@ def parse_arguments():
 
 
 def evaluate_policy(model, env, task_config_file, ann_config_file,
-                    eval_log_dir=None, save_video=False, sequence_indices=[]):
-    """Run this function to evaluate a model on the CALVIN challenge."""
+                    eval_log_dir=None, save_video=False, sequence_indices=[],
+                    eval_sequences=None):
+    """Run this function to evaluate a model on the CALVIN challenge.
+
+    If ``eval_sequences`` is provided (list of ``(initial_state, subtask_list)``),
+    it is used instead of ``get_sequences(NUM_SEQUENCES)``. Callers must pass
+    ``sequence_indices`` consistent with ``len(eval_sequences)``.
+    """
     # Load configs for tasks and instructions
     task_cfg = OmegaConf.load(task_config_file)
     task_oracle = hydra.utils.instantiate(task_cfg)
@@ -81,8 +100,9 @@ def evaluate_policy(model, env, task_config_file, ann_config_file,
     # Create a directory to store results
     eval_log_dir = get_log_dir(eval_log_dir)
 
-    # Sample sequences of 5 instructions
-    eval_sequences = get_sequences(NUM_SEQUENCES)
+    # Sample sequences of 5 instructions (or use a caller-provided benchmark list)
+    if eval_sequences is None:
+        eval_sequences = get_sequences(NUM_SEQUENCES)
 
     # Load cached results (in case evaluation gets killed)
     results, tested_sequence_indices = collect_results(eval_log_dir)
@@ -110,11 +130,11 @@ def evaluate_policy(model, env, task_config_file, ann_config_file,
 
         # Optionally store videos
         if save_video:
-            from moviepy.video.io import ImageSequenceClip
+            image_sequence_clip = importlib.import_module("moviepy.video.io.ImageSequenceClip")
             clip = []
             for video in videos:
                 clip.extend(video)
-            clip = ImageSequenceClip.ImageSequenceClip(clip, fps=30)
+            clip = image_sequence_clip.ImageSequenceClip(clip, fps=30)
             clip.write_videofile(f"calvin_seq{seq_ind}.mp4")
 
     return results
@@ -189,17 +209,33 @@ def rollout(env, model, task_oracle, subtask, lang, verbose=True):
             trajectory = model.step(obs, lang)
         # Execute
         for act_ind in range(trajectory.shape[1]):
-            curr_action = {
-                "action": [
-                    trajectory[0, act_ind, :3],  # [x, y, z]
-                    trajectory[0, act_ind, 3:6],  # [euler_x, euler_y, euler_z]
-                    trajectory[0, act_ind, [6]]  # [open in {-1, 1}]
-                ],
-                "type": "cartesian_abs"
-            }
-            if verbose:
-                pbar.set_description(f"step: {step}")
-            obs, _, _, current_info = env.step(curr_action)
+            # How the env interprets the 7D command (see calvin_env robot.apply_action):
+            # - cartesian_abs / cartesian_rel: dict with pos, euler, gripper chunks
+            # - relative_array: bare length-7 ndarray -> relative_to_absolute (NOT absolute pose)
+            exec_mode = getattr(model, "calvin_action_exec", "cartesian_abs")
+            if exec_mode == "relative_array":
+                step_action = np.asarray(trajectory[0, act_ind], dtype=np.float64).reshape(7)
+                step_action[6] = 1 if step_action[6] > 0 else -1
+                if verbose:
+                    pbar.set_description(f"step: {step}")
+                obs, _, _, current_info = env.step(step_action)
+            else:
+                if exec_mode not in ("cartesian_abs", "cartesian_rel"):
+                    raise ValueError(
+                        f"Unknown calvin_action_exec={exec_mode!r}; "
+                        "use 'cartesian_abs', 'cartesian_rel', or 'relative_array'"
+                    )
+                curr_action = {
+                    "action": [
+                        trajectory[0, act_ind, :3],  # [x, y, z]
+                        trajectory[0, act_ind, 3:6],  # [euler_x, euler_y, euler_z]
+                        trajectory[0, act_ind, [6]],  # [open in {-1, 1}]
+                    ],
+                    "type": exec_mode,
+                }
+                if verbose:
+                    pbar.set_description(f"step: {step}")
+                obs, _, _, current_info = env.step(curr_action)
 
             # check if current step solves a task
             current_task_info = task_oracle.get_task_info_for_set(

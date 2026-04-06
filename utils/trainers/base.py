@@ -1,4 +1,5 @@
 from copy import deepcopy
+import inspect
 import os
 import random
 from functools import partial
@@ -124,7 +125,7 @@ class BaseTrainTester:
     def get_model(self):
         """Initialize the model."""
         # Initialize model with arguments
-        _model = self.model_cls(
+        model_kwargs = dict(
             backbone=self.args.backbone,
             finetune_backbone=self.args.finetune_backbone,
             num_finetune_vision_layers=self.args.num_finetune_vision_layers,
@@ -140,8 +141,28 @@ class BaseTrainTester:
             rotation_format=self.args.rotation_format,
             denoise_timesteps=self.args.denoise_timesteps,
             denoise_model=self.args.denoise_model,
-            lv2_batch_size=self.args.lv2_batch_size
+            lv2_batch_size=self.args.lv2_batch_size,
         )
+        # Inject Qwen-specific kwargs based on model ctor support rather than brittle model_type string checks.
+        model_init_params = inspect.signature(self.model_cls.__init__).parameters
+        qwen_kwargs = {
+            "vision_lora_rank": self.args.vision_lora_rank,
+            "vision_lora_alpha": self.args.vision_lora_alpha,
+            "vision_lora_dropout": self.args.vision_lora_dropout,
+            "vision_lora_num_layers": self.args.vision_lora_num_layers,
+            "vision_lora_target_modules": self.args.vision_lora_target_modules,
+            "llm_lora_rank": self.args.llm_lora_rank,
+            "llm_lora_alpha": self.args.llm_lora_alpha,
+            "llm_lora_dropout": self.args.llm_lora_dropout,
+            "llm_lora_num_layers": self.args.llm_lora_num_layers,
+            "llm_lora_target_modules": self.args.llm_lora_target_modules,
+            "gradient_checkpointing": getattr(self.args, "gradient_checkpointing", False),
+            "use_multiscale": getattr(self.args, "use_multiscale", False),
+        }
+        for key, value in qwen_kwargs.items():
+            if key in model_init_params:
+                model_kwargs[key] = value
+        _model = self.model_cls(**model_kwargs)
 
         # Print basic modules' parameters
         if dist.get_rank() == 0:
@@ -196,39 +217,6 @@ class BaseTrainTester:
             {"params": [], "weight_decay": 0.0, "lr": self.args.lr},
             {"params": [], "weight_decay": self.args.wd, "lr": self.args.lr}
         ]
-        backbone_idx = None
-        if self.args.finetune_backbone:
-            backbone_idx = len(optimizer_grouped_parameters)
-            optimizer_grouped_parameters.append({
-                "params": [], "weight_decay": self.args.wd,
-                "lr": self.args.backbone_lr
-            })
-        use_vision_groups = self.args.num_finetune_vision_layers > 0
-        vision_no_decay_idx = None
-        vision_decay_idx = None
-        projector_no_decay_idx = None
-        projector_decay_idx = None
-        if use_vision_groups:
-            vision_no_decay_idx = len(optimizer_grouped_parameters)
-            optimizer_grouped_parameters.append({
-                "params": [], "weight_decay": 0.0,
-                "lr": self.args.lr * self.args.vision_lr_scale
-            })
-            vision_decay_idx = len(optimizer_grouped_parameters)
-            optimizer_grouped_parameters.append({
-                "params": [], "weight_decay": self.args.wd,
-                "lr": self.args.lr * self.args.vision_lr_scale
-            })
-            projector_no_decay_idx = len(optimizer_grouped_parameters)
-            optimizer_grouped_parameters.append({
-                "params": [], "weight_decay": 0.0,
-                "lr": self.args.lr * self.args.projector_lr_scale
-            })
-            projector_decay_idx = len(optimizer_grouped_parameters)
-            optimizer_grouped_parameters.append({
-                "params": [], "weight_decay": self.args.wd,
-                "lr": self.args.lr * self.args.projector_lr_scale
-            })
 
         # Collect names of all norm parameters
         norm_types = (
@@ -241,7 +229,7 @@ class BaseTrainTester:
             torch.nn.InstanceNorm2d,
             torch.nn.InstanceNorm3d,
             torch.nn.LocalResponseNorm,
-            torch.nn.RMSNorm
+            #torch.nn.RMSNorm
         )
         norm_param_names = set()
         for module_name, module in model.named_modules():
@@ -253,20 +241,13 @@ class BaseTrainTester:
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            is_no_decay = name in norm_param_names or name.endswith(".bias")
-            if use_vision_groups and "encoder.backbone.vlm.visual.blocks." in name:
-                group_idx = vision_no_decay_idx if is_no_decay else vision_decay_idx
-                optimizer_grouped_parameters[group_idx]["params"].append(param)
-            elif use_vision_groups and (
-                "encoder.backbone.vlm.visual.merger" in name
-                or "encoder.backbone.vlm.visual.deepstack_merger_list" in name
-            ):
-                group_idx = projector_no_decay_idx if is_no_decay else projector_decay_idx
-                optimizer_grouped_parameters[group_idx]["params"].append(param)
-            elif is_no_decay:
+            is_no_decay = (
+                name in norm_param_names
+                or name.endswith(".bias")
+                or ".lora_" in name
+            )
+            if is_no_decay:
                 optimizer_grouped_parameters[0]["params"].append(param)
-            elif self.args.finetune_backbone and "backbone" in name:
-                optimizer_grouped_parameters[backbone_idx]["params"].append(param)
             else:
                 optimizer_grouped_parameters[1]["params"].append(param)
         optimizer = optim.AdamW(
@@ -294,7 +275,9 @@ class BaseTrainTester:
             self.args.lr_scheduler, optimizer, self.args.train_iters
         )
         # GradScaler is only needed for float16 autocast. This trainer uses bfloat16.
-        scaler = torch.GradScaler(enabled=False)
+        scaler = torch.GradScaler(enabled=False)  # NOTE: for 3dfavla
+        #from torch.cuda.amp import GradScaler  # NOTE: for flowervla
+        #scaler = GradScaler()  # NOTE: for flowervla
 
         # Move model to devices
         if torch.cuda.is_available():
@@ -303,12 +286,14 @@ class BaseTrainTester:
         if self.args.use_compile:
             model.compute_loss = torch.compile(model.compute_loss, fullgraph=True)
         model = DistributedDataParallel(
-            model, device_ids=[self.args.local_rank],
-            broadcast_buffers=False, find_unused_parameters=True
+            model,
+            device_ids=[self.args.local_rank],
+            broadcast_buffers=False,
+            find_unused_parameters=False
         )
 
-        # Initialize EMA copy
-        ema_model = deepcopy(model)
+        # Initialize EMA copy only when enabled to avoid duplicating model memory.
+        ema_model = deepcopy(model) if self.args.use_ema else None
         self.ema = EMA()
 
         # Check for a checkpoint
@@ -367,7 +352,8 @@ class BaseTrainTester:
                 sample = next(iter_loader)
 
             self.train_one_step(model, optimizer, scaler, lr_scheduler, sample)
-            self.ema.step(model, ema_model, self.args.use_ema, step_id)
+            if self.args.use_ema:
+                self.ema.step(model, ema_model, self.args.use_ema, step_id)
 
             if (step_id + 1) % self.args.val_freq == 0 and dist.get_rank() == 0:
                 print("Train evaluation.......")
@@ -378,12 +364,12 @@ class BaseTrainTester:
                     val_iters=10,
                     split='train'
                 )
-                if (step_id + 1) % 5000 == 0:  # frequently evaluate on val and save ckpt
+                if (step_id + 1) % 10000 == 0:  # frequently evaluate on val and save ckpt
                     print("Test evaluation.......")
                     new_loss = self.evaluate_nsteps(
                         ema_model.module if self.args.use_ema else model.module,
                         val_loader, step_id,
-                        val_iters=500  # was 1250, decrease to prevent timeout on other gpus
+                        val_iters=500
                     )
                     # save model
                     best_loss = self.save_checkpoint(
@@ -404,8 +390,18 @@ class BaseTrainTester:
             sample, augment=training
         )
         instr_mask = None
+        instr_lens = None
         if self.args.pre_tokenize:
             if "instr_input_ids" in sample and "instr_attention_mask" in sample:
+                if "instr_valid_lens" in sample:
+                    instr_lens = tuple(
+                        int(x) for x in sample["instr_valid_lens"].tolist()
+                    )
+                else:
+                    instr_lens = tuple(
+                        int(x)
+                        for x in sample["instr_attention_mask"].sum(dim=1).tolist()
+                    )
                 instr = sample["instr_input_ids"].cuda(non_blocking=True)
                 instr_mask = sample["instr_attention_mask"].cuda(non_blocking=True)
             else:
@@ -413,6 +409,9 @@ class BaseTrainTester:
                 if isinstance(tok_out, torch.Tensor):
                     instr = tok_out.cuda(non_blocking=True)
                 else:
+                    instr_lens = tuple(
+                        int(x) for x in tok_out.attention_mask.sum(dim=1).tolist()
+                    )
                     instr = tok_out.input_ids.cuda(non_blocking=True)
                     instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -420,12 +419,13 @@ class BaseTrainTester:
                 action, action_mask, rgbs, rgb2d, pcds, instr, prop,
                 run_inference=not training,
                 instr_mask=instr_mask,
+                instr_lens=instr_lens,
             )
         return out  # loss if training, else action
 
     def train_one_step(self, model, optimizer, scaler, lr_scheduler, sample):
         """Run a single training step."""
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         # Forward pass
         loss = self._model_forward(model, sample)
@@ -665,7 +665,8 @@ class BaseTrainTester:
             print("All keys matched successfully!")
         # EMA weights
         if model_dict.get("ema_weight") is not None:
-            ema_model.load_state_dict(model_dict["ema_weight"], strict=True)
+            if ema_model is not None:
+                ema_model.load_state_dict(model_dict["ema_weight"], strict=True)
         if self.args.finetune:  # NOTE: for finetune we only load weights but reset iter and best_loss
             print("=> [FINETUNE MODE] Resetting iter, optimizer, and best_loss.")
             start_iter = 0
@@ -688,34 +689,21 @@ class BaseTrainTester:
         """Save checkpoint if requested."""
         model_state = model.state_dict()
         ema_state = ema_model.state_dict() if self.args.use_ema else None
-
-        # Best checkpoint
+        current_iter = step_id + 1
         if best_loss is None or new_loss <= best_loss:
             best_loss = new_loss
-            torch.save({
-                "weight": model_state,
-                "ema_weight": ema_state,
-                "iter": step_id + 1,
-                "best_loss": best_loss
-            }, self.args.log_dir / "best.pth")
 
-        # Last checkpoint (always saved)
+        # Main checkpoint:
+        # - before 60k iters (inclusive): keep writing last.pth
+        # - from 60k iters: write <iter>.pth
+        ckpt_name = f"{current_iter}.pth" if current_iter > 50000 else "last.pth"
         torch.save({
             "weight": model_state,
             "ema_weight": ema_state,
             "optimizer": optimizer.state_dict(),
-            "iter": step_id + 1,
+            "iter": current_iter,
             "best_loss": best_loss
-        }, self.args.log_dir / "last.pth")
-
-        # Save intermediate checkpoints
-        if (step_id + 1) % self.args.interm_ckpt_freq == 0:
-            torch.save({
-                "weight": model_state,
-                "ema_weight": ema_state,
-                "iter": step_id + 1,
-                "best_loss": best_loss
-            }, self.args.log_dir / f"interm{step_id + 1}.pth")
+        }, self.args.log_dir / ckpt_name)
 
         return best_loss
 
@@ -763,6 +751,7 @@ def qwen_tokenize_collate_fn(batch, model_name_or_path=None):
     tok_out = tokenizer(sample["instr"])
     sample["instr_input_ids"] = tok_out.input_ids
     sample["instr_attention_mask"] = tok_out.attention_mask
+    sample["instr_valid_lens"] = tok_out.attention_mask.sum(dim=1).to(torch.int32)
     return sample
 
 def actions_collate_fn(batch):

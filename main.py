@@ -61,6 +61,7 @@ def parse_arguments():
         ('finetune_backbone', str2bool, False),
         ('finetune_text_encoder', str2bool, False),
         ('fps_subsampling_factor', int, 5),
+        ('use_multiscale', str2bool, False),
         # Model arguments: encoder and head
         ('embedding_dim', int, 120),  # divisible by num_attn_heads
         ('num_attn_heads', int, 8),
@@ -72,7 +73,21 @@ def parse_arguments():
         ('rotation_format', str, 'quat_xyzw'),
         ('denoise_timesteps', int, 10),
         ('denoise_model', str, "rectified_flow"),
-        ('finetune', str2bool, False)  # NOTE: for finetune
+        ('finetune', str2bool, False),  # NOTE: for finetune
+        # LoRA arguments
+        ('vision_lora_rank', int, 0),
+        ('vision_lora_alpha', int, 16),
+        ('vision_lora_dropout', float, 0.0),
+        ('vision_lora_num_layers', int, 0),
+        ('vision_lora_target_modules', str, 'attn.qkv,attn.proj'),
+        ('llm_lora_rank', int, 0),
+        ('llm_lora_alpha', int, 16),
+        ('llm_lora_dropout', float, 0.0),
+        ('llm_lora_num_layers', int, 0),
+        ('llm_lora_target_modules', str, 'self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj'),
+        ('vision_lora_lr_scale', float, 0.05),
+        ('merger_lr_scale', float, 0.1),
+        ('gradient_checkpointing', str2bool, False),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])

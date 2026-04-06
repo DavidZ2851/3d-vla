@@ -80,7 +80,16 @@ class DenoiseActor(nn.Module):
             )
         self.nrm_dim = int(self.workspace_normalizer.size(-1))
 
-    def encode_inputs(self, rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=None):
+    def encode_inputs(
+        self,
+        rgb3d,
+        rgb2d,
+        pcd,
+        instruction,
+        proprio,
+        instr_mask=None,
+        instr_lens=None,
+    ):
         encoder_input_proprio = proprio
         # NOTE: fix for flower_actor_2d — convert external rotation rep to rot6d for encoder
         if hasattr(self.encoder, "proprio_feat"):
@@ -112,6 +121,7 @@ class DenoiseActor(nn.Module):
             rgb3d, rgb2d, pcd, instruction,
             encoder_input_proprio.flatten(1, 2),
             instr_mask=instr_mask,
+            instr_lens=instr_lens,
         )
         # Query trajectory (for relative trajectory prediction)
         query_trajectory = proprio[:, -1:]
@@ -179,12 +189,27 @@ class DenoiseActor(nn.Module):
             trajectory = torch.cat((pos, rot), -1)
         return torch.cat((trajectory, out[..., -1:]), -1)
 
-    def compute_trajectory(self, trajectory_mask,
-                           rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=None):
+    def compute_trajectory(
+        self,
+        trajectory_mask,
+        rgb3d,
+        rgb2d,
+        pcd,
+        instruction,
+        proprio,
+        instr_mask=None,
+        instr_lens=None,
+    ):
         valid_mask = (~trajectory_mask)[..., None].float()  # (B,T,H,1)
         # Encode observations, states, instructions
         fixed_inputs = self.encode_inputs(
-            rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=instr_mask
+            rgb3d,
+            rgb2d,
+            pcd,
+            instruction,
+            proprio,
+            instr_mask=instr_mask,
+            instr_lens=instr_lens,
         )
 
         # Sample from learned model starting from noise
@@ -214,11 +239,27 @@ class DenoiseActor(nn.Module):
 
         return trajectory
 
-    def compute_loss(self, gt_trajectory, trajectory_mask,
-                     rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=None):
+    def compute_loss(
+        self,
+        gt_trajectory,
+        trajectory_mask,
+        rgb3d,
+        rgb2d,
+        pcd,
+        instruction,
+        proprio,
+        instr_mask=None,
+        instr_lens=None,
+    ):
         # Encode observations, states, instructions
         fixed_inputs = self.encode_inputs(
-            rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=instr_mask
+            rgb3d,
+            rgb2d,
+            pcd,
+            instruction,
+            proprio,
+            instr_mask=instr_mask,
+            instr_lens=instr_lens,
         )
 
         # Process gt_trajectory
@@ -424,6 +465,7 @@ class DenoiseActor(nn.Module):
         proprio,
         run_inference=False,
         instr_mask=None,
+        instr_lens=None,
     ):
         """
         Arguments:
@@ -451,13 +493,25 @@ class DenoiseActor(nn.Module):
         if run_inference:
             return self.compute_trajectory(
                 trajectory_mask,
-                rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=instr_mask
+                rgb3d,
+                rgb2d,
+                pcd,
+                instruction,
+                proprio,
+                instr_mask=instr_mask,
+                instr_lens=instr_lens,
             )
 
         # Training, use gt_trajectory to compute loss
         return self.compute_loss(
             gt_trajectory, trajectory_mask,
-            rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=instr_mask
+            rgb3d,
+            rgb2d,
+            pcd,
+            instruction,
+            proprio,
+            instr_mask=instr_mask,
+            instr_lens=instr_lens,
         )
 
 

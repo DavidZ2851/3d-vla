@@ -30,6 +30,18 @@ class QwenFlowerActor3D(BaseDenoiseActor):
         denoise_timesteps=100,
         denoise_model="ddpm",
         lv2_batch_size=1,
+        vision_lora_rank=0,
+        vision_lora_alpha=16,
+        vision_lora_dropout=0.0,
+        vision_lora_num_layers=0,
+        vision_lora_target_modules="attn.qkv,attn.proj",
+        llm_lora_rank=0,
+        llm_lora_alpha=16,
+        llm_lora_dropout=0.0,
+        llm_lora_num_layers=0,
+        llm_lora_target_modules="self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj",
+        gradient_checkpointing=False,
+        use_multiscale=False,
     ):
         super().__init__(
             embedding_dim=embedding_dim,
@@ -54,6 +66,18 @@ class QwenFlowerActor3D(BaseDenoiseActor):
             finetune_backbone=finetune_backbone,
             num_finetune_vision_layers=num_finetune_vision_layers,
             finetune_text_encoder=finetune_text_encoder,
+            vision_lora_rank=vision_lora_rank,
+            vision_lora_alpha=vision_lora_alpha,
+            vision_lora_dropout=vision_lora_dropout,
+            vision_lora_num_layers=vision_lora_num_layers,
+            vision_lora_target_modules=vision_lora_target_modules,
+            llm_lora_rank=llm_lora_rank,
+            llm_lora_alpha=llm_lora_alpha,
+            llm_lora_dropout=llm_lora_dropout,
+            llm_lora_num_layers=llm_lora_num_layers,
+            llm_lora_target_modules=llm_lora_target_modules,
+            gradient_checkpointing=gradient_checkpointing,
+            use_multiscale=use_multiscale,
         )
 
         # Override head with flower_actor's TransformerHead (3D RoPE + AdaLN)
@@ -64,3 +88,5 @@ class QwenFlowerActor3D(BaseDenoiseActor):
             num_shared_attn_layers=num_shared_attn_layers,
             rot_dim=3 if rotation_format in ['euler', 'axisangle'] else 6  # NOTE: could change to always 6d
         )
+        if nhand == 1:
+            self.prediction_head.hand_embed = None

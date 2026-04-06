@@ -39,6 +39,20 @@ eval_only=false
 lr=1e-4
 lr_scheduler=tristage_flower
 backbone_lr=1e-6
+num_finetune_vision_layers=0
+vision_lora_rank=16
+vision_lora_alpha=32
+vision_lora_dropout=0.05
+vision_lora_num_layers=6
+vision_lora_target_modules=attn.qkv,attn.proj
+llm_lora_rank=16
+llm_lora_alpha=32
+llm_lora_dropout=0.05
+llm_lora_num_layers=4
+llm_lora_target_modules=self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj
+vision_lora_lr_scale=0.15
+llm_lora_lr_scale=0.05
+merger_lr_scale=0.4
 wd=1e-10
 train_iters=200000
 use_compile=false
@@ -69,7 +83,7 @@ denoise_timesteps=5
 denoise_model=rectified_flow
 
 main_dir=libero
-run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
+run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-visLoraR${vision_lora_rank}-visL${vision_lora_num_layers}-llmLoraR${llm_lora_rank}-llmL${llm_lora_num_layers}-job${SLURM_JOBID}
 # train from scratch:
 checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
 finetune=false
@@ -124,4 +138,18 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --rotation_format $rotation_format \
     --denoise_timesteps $denoise_timesteps \
     --denoise_model $denoise_model \
-    --finetune $finetune
+    --finetune $finetune \
+    --num_finetune_vision_layers $num_finetune_vision_layers \
+    --vision_lora_rank $vision_lora_rank \
+    --vision_lora_alpha $vision_lora_alpha \
+    --vision_lora_dropout $vision_lora_dropout \
+    --vision_lora_num_layers $vision_lora_num_layers \
+    --vision_lora_target_modules $vision_lora_target_modules \
+    --llm_lora_rank $llm_lora_rank \
+    --llm_lora_alpha $llm_lora_alpha \
+    --llm_lora_dropout $llm_lora_dropout \
+    --llm_lora_num_layers $llm_lora_num_layers \
+    --llm_lora_target_modules $llm_lora_target_modules \
+    --vision_lora_lr_scale $vision_lora_lr_scale \
+    --llm_lora_lr_scale $llm_lora_lr_scale \
+    --merger_lr_scale $merger_lr_scale

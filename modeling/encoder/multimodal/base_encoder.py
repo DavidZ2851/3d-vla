@@ -53,7 +53,16 @@ class Encoder(nn.Module):
             self.cond_norm = RmsNorm(1024)
             self.vit_fpn = ViTFPN("res3", embedding_dim, [128, 256, 512, 1024], 1024)
 
-    def forward(self, rgb3d, rgb2d, pcd, instruction, proprio, instr_mask=None):
+    def forward(
+        self,
+        rgb3d,
+        rgb2d,
+        pcd,
+        instruction,
+        proprio,
+        instr_mask=None,
+        instr_lens=None,
+    ):
         """
         Encode different modalities, independent of denoising step.
 
@@ -64,6 +73,7 @@ class Encoder(nn.Module):
             - instruction: (B, nt), tokens
             - proprio: (B, nhist, 3+6+X)
             - instr_mask: unused in base encoder (Qwen3-VL only; see Qwen3VLEncoder3D)
+            - instr_lens: unused in base encoder; kept for Qwen3-VL API parity
 
         Returns:
             - rgb3d_feats: (B, N, F)

@@ -18,6 +18,7 @@ class FlowerActor3D(BaseDenoiseActor):
                  output_level="res3",
                  upsample=False,
                  finetune_backbone=False,
+                 num_finetune_vision_layers=0,  # Qwen-only; accepted but ignored for Florence2
                  finetune_text_encoder=False,
                  num_vis_instr_attn_layers=2,
                  fps_subsampling_factor=5,
@@ -198,7 +199,7 @@ class TransformerHead(nn.Module):
         B, traj_len, nhand, _ = trajectory.shape
 
         # Trajectory features
-        if nhand > 1:
+        if nhand > 1 and self.hand_embed is not None:
             traj_feats = traj_feats + self.hand_embed.weight[None, None]
         traj_feats = einops.rearrange(traj_feats, 'b l h c -> b (l h) c')
         trajectory = einops.rearrange(trajectory, 'b l h c -> b (l h) c')
@@ -438,7 +439,7 @@ class TransformerHead2D(TransformerHead):
         _, traj_len, nhand, _ = trajectory.shape
 
         # Trajectory features
-        if nhand > 1:
+        if nhand > 1 and self.hand_embed is not None:
             traj_feats = traj_feats + self.hand_embed.weight[None, None]
         traj_feats = einops.rearrange(traj_feats, 'b l h c -> b (l h) c')
         trajectory = einops.rearrange(trajectory, 'b l h c -> b (l h) c')

@@ -1,42 +1,45 @@
 #!/bin/bash
-#SBATCH --job-name=calvin_scratch
+#SBATCH --job-name=calvin_flower
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=500G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=300G
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40S"
+#SBATCH --constraint="L40S|A100_40GB|A100_80GB"
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
 
-DATA_PATH=/data/group_data/katefgroup/VLA
+DATA_PATH=/data/user_data/ziyinx/datasets
 train_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/train_rechunked8.zarr
-eval_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/val_rechunked8.zarr
+eval_data_dir=/data/group_data/katefgroup/VLA/zarr_datasets/calvin_zarr/val_rechunked8.zarr
 train_instructions=instructions/calvin/train_instructions.json
 val_instructions=instructions/calvin/val_instructions.json
 
 dataset=Calvin10th
-num_workers=8
-memory_limit=8
+num_workers=4
+memory_limit=6
 B=8
 B_val=8
 chunk_size=8
 
 # Training/testing arguments, change these for HPT
-val_freq=2000
+val_freq=5000
 eval_only=false
-lr=1e-4
+lr=2e-5
 lr_scheduler=tristage_flower
-backbone_lr=1e-5
-wd=1e-10  # 0.05
-train_iters=600000
+backbone_lr=2e-5
+num_finetune_vision_layers=0  # unused by Florence2, kept for CLI parity with mibot script
+vision_lr_scale=0.2
+projector_lr_scale=0.4
+wd=0.05
+train_iters=50000
 use_compile=false
-use_ema=false  # true
+use_ema=true
 
 # Model arguments, change (some of) these for new architectures
 model_type=flower_actor_3d
@@ -50,11 +53,11 @@ finetune_backbone=true
 finetune_text_encoder=false
 fps_subsampling_factor=1
 
-C=256  # 1024
+C=1024
 num_attn_heads=16
 num_vis_instr_attn_layers=3  # unused by Florence2, only applied to CLIP.
-num_history=3  # 1
-num_shared_attn_layers=4  # 16
+num_history=1
+num_shared_attn_layers=16
 
 workspace_normalizer_buffer=0.0
 rotation_format=euler
@@ -117,4 +120,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --rotation_format $rotation_format \
     --denoise_timesteps $denoise_timesteps \
     --denoise_model $denoise_model \
-    --finetune $finetune
+    --finetune $finetune \
+    --num_finetune_vision_layers $num_finetune_vision_layers \
+    --vision_lr_scale $vision_lr_scale \
+    --projector_lr_scale $projector_lr_scale
