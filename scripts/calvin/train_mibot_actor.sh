@@ -37,7 +37,7 @@ eval_only=false
 lr=3e-5
 lr_scheduler=tristage_flower
 wd=0.05
-train_iters=100000
+train_iters=70000
 use_compile=false
 use_ema=false
 

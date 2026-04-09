@@ -37,10 +37,16 @@ def _get_checkpoint_lora_summary(state_dict):
         key for key in state_dict
         if ".lora_A." in key or ".lora_B." in key
     ]
+    # Qwen checkpoints in this repo can store LLM LoRA keys as either:
+    # - "...language_model.layers.<id>..."
+    # - "...language_model.base_model.model.layers.<id>..."
+    # We treat any LoRA key under `language_model` as LLM LoRA.
+    has_vision_lora = any(".visual." in key for key in lora_keys)
+    has_llm_lora = any(".language_model." in key for key in lora_keys)
     return {
         "any": bool(lora_keys),
-        "vision": any("visual.blocks." in key for key in lora_keys),
-        "llm": any("language_model.layers." in key for key in lora_keys),
+        "vision": has_vision_lora,
+        "llm": has_llm_lora,
     }
 
 

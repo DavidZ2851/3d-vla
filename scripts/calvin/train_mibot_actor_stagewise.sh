@@ -9,7 +9,7 @@
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40S|A100_40GB|A100_80GB"
+#SBATCH --constraint="L40S|A100_80GB"
 
 export WANDB_MODE=online
 export WANDB_API_KEY=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
