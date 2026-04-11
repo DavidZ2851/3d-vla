@@ -71,7 +71,12 @@ def _checkpoint_uses_multiscale(state_dict):
 
 
 def _maybe_override_qwen_eval_args_from_checkpoint(args, state_dict):
-    if args.model_type != "qwen_flower_actor_3d":
+    if args.model_type not in {
+        "qwen_flower_actor_3d",
+        "qwen_flower_actor_3d_stagewise",
+        "qwen_flower_actor_3d_grounding_cond",
+        "qwen_flower_actor_3d_grounding_pred",
+    }:
         return
 
     embedding_weight = _get_checkpoint_embedding_weight(state_dict)
@@ -163,7 +168,12 @@ class Model:
             denoise_timesteps=self.args.denoise_timesteps,
             denoise_model=self.args.denoise_model,
         )
-        if self.args.model_type == "qwen_flower_actor_3d":
+        if self.args.model_type in {
+            "qwen_flower_actor_3d",
+            "qwen_flower_actor_3d_stagewise",
+            "qwen_flower_actor_3d_grounding_cond",
+            "qwen_flower_actor_3d_grounding_pred",
+        }:
             model_kwargs.update(
                 vision_lora_rank=self.args.vision_lora_rank,
                 vision_lora_alpha=self.args.vision_lora_alpha,

@@ -7,6 +7,10 @@ from .flower.model_peract2_3d import FLOWERVLA3D
 from .flower_actor import FlowerActor3D, FlowerActor2D
 from .flower_actor_qwen import QwenFlowerActor3D
 from .flower_actor_qwen_stagewise import QwenFlowerActor3DStagewise
+from .flower_actor_qwen_grounding import (
+    QwenFlowerActor3DGroundingCond,
+    QwenFlowerActor3DGroundingPred,
+)
 # from .old_diffuser_actor import DiffuserActor
 
 
@@ -31,6 +35,10 @@ def fetch_model_class(model_type):
         return QwenFlowerActor3D
     if model_type == 'qwen_flower_actor_3d_stagewise':
         return QwenFlowerActor3DStagewise
+    if model_type == 'qwen_flower_actor_3d_grounding_cond':
+        return QwenFlowerActor3DGroundingCond
+    if model_type == 'qwen_flower_actor_3d_grounding_pred':
+        return QwenFlowerActor3DGroundingPred
     # if model_type == '3dda':
     #     return DiffuserActor
     return None

@@ -1,5 +1,5 @@
 from .base import BaseDataset
-from .utils import to_relative_action
+from .utils import to_relative_action, to_tensor
 import torchvision.transforms as T, torch
 
 class CALVINDataset(BaseDataset):
@@ -8,7 +8,7 @@ class CALVINDataset(BaseDataset):
     train_copies = 1
     quat_format= 'euler'
     camera_inds = None
-    max_samples=None
+    max_samples=None  # max number of chunks
 
     def __init__(
         self,
@@ -18,7 +18,8 @@ class CALVINDataset(BaseDataset):
         relative_action=False,
         mem_limit=8,
         actions_only=False,
-        chunk_size=8
+        chunk_size=8,
+        max_samples=None
     ):
         super().__init__(
             root=root,
@@ -29,7 +30,8 @@ class CALVINDataset(BaseDataset):
             actions_only=actions_only,
             chunk_size=chunk_size
         )
-
+        self.max_samples = max_samples
+    
     def __len__(self):
         total_samples = len(self.annos['action']) // self.chunk_size
         if self.max_samples is not None:
@@ -100,5 +102,52 @@ class CALVINDataset(BaseDataset):
             "wrist_depth": self._get_attr_by_idx(idx, 'depth_wrist'),
             "extrinsics_wrist": self._get_attr_by_idx(idx, 'extrinsics_wrist'),
             "proprioception": self._get_attr_by_idx(idx, 'proprioception'),
-            "action": self._get_action(idx)
+            "action": self._get_action(idx),
         }
+
+
+class CALVINContactDataset(CALVINDataset):
+    """CALVIN dataset extended with 3D contact point supervision.
+
+    Adds a ``3d_contact_point`` key to every batch item when the zarr archive
+    contains a ``3d_contact_point`` array of shape ``(N, 3)`` (world-frame xyz,
+    one entry per frame, same value repeated within a chunk since the contact
+    point is the task goal for the whole chunk).
+
+    When the array is absent the key is still present but set to ``None``; the
+    trainer and model both handle ``None`` gracefully (auxiliary loss is
+    skipped, conditioning is a no-op).
+
+    Dataset names: ``CalvinContact`` / ``CalvinContact10th``.
+    """
+
+    _CONTACT_KEY = '3d_contact_point'
+
+    def _get_contact_point(self, idx):
+        """Return (chunk_size, 3) float32 tensor, or None if key not in zarr.
+
+        The zarr array is expected to have shape ``(N, 3)`` where N matches the
+        total number of frames.  Slicing ``[idx : idx + chunk_size]`` yields
+        ``(chunk_size, 3)`` so that ``torch.cat`` in the collate function
+        produces ``(batch_size, 3)`` -- matching the shape the model expects.
+        """
+        if self._CONTACT_KEY not in self.annos:
+            return None
+        return to_tensor(
+            self.annos[self._CONTACT_KEY][idx : idx + self.chunk_size]
+        ).float()  # (chunk_size, 3)
+
+    def __getitem__(self, idx):
+        sample = super().__getitem__(idx)
+        if not self._actions_only:
+            # idx was already converted to the raw zarr index inside super();
+            # replicate the same index arithmetic to read the contact point.
+            total_samples = len(self.annos['action']) // self.chunk_size
+            effective_size = (
+                min(self.max_samples, total_samples)
+                if self.max_samples is not None
+                else total_samples
+            )
+            raw_idx = (idx % effective_size) * self.chunk_size
+            sample['3d_contact_point'] = self._get_contact_point(raw_idx)
+        return sample

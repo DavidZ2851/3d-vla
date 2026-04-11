@@ -1,4 +1,4 @@
-from .calvin import CALVINDataset
+from .calvin import CALVINDataset, CALVINContactDataset
 from .rlbench import (
     Peract2Dataset,
     Peract2SingleCamDataset,
@@ -25,6 +25,8 @@ def fetch_dataset_class(dataset_name):
         "PeractDatTwoCam": DatPeractTwoCamDataset,
         'Calvin': CALVINDataset,
         'Calvin10th': CALVINDataset,
+        'CalvinContact': CALVINContactDataset,
+        'CalvinContact10th': CALVINContactDataset,
         "Peract2TCSingle": SinglePeract2Dataset,
         "Peract2All": Peract2AllDataset,
         "GenieSim3": GenieSim3Dataset,

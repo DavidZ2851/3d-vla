@@ -88,6 +88,7 @@ def parse_arguments():
         ('vision_lora_lr_scale', float, 0.05),
         ('merger_lr_scale', float, 0.1),
         ('gradient_checkpointing', str2bool, False),
+        ('grounding_loss_weight', float, 10.0),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])

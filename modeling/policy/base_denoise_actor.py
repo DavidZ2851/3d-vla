@@ -466,6 +466,7 @@ class DenoiseActor(nn.Module):
         run_inference=False,
         instr_mask=None,
         instr_lens=None,
+        **kwargs,
     ):
         """
         Arguments:

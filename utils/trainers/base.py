@@ -67,7 +67,8 @@ class BaseTrainTester:
             copies=1,
             relative_action=self.args.relative_action,
             mem_limit=0.1,
-            chunk_size=self.args.chunk_size
+            chunk_size=self.args.chunk_size,
+            max_samples=1000
         )
         return train_dataset, val_dataset
 
@@ -158,6 +159,7 @@ class BaseTrainTester:
             "llm_lora_target_modules": self.args.llm_lora_target_modules,
             "gradient_checkpointing": getattr(self.args, "gradient_checkpointing", False),
             "use_multiscale": getattr(self.args, "use_multiscale", False),
+            "grounding_loss_weight": getattr(self.args, "grounding_loss_weight", 10.0),
         }
         for key, value in qwen_kwargs.items():
             if key in model_init_params:
@@ -414,12 +416,16 @@ class BaseTrainTester:
                     )
                     instr = tok_out.input_ids.cuda(non_blocking=True)
                     instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
+        grounding_3d = None
+        if "3d_contact_point" in sample and sample["3d_contact_point"] is not None:
+            grounding_3d = sample["3d_contact_point"].cuda(non_blocking=True).float()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = model(
                 action, action_mask, rgbs, rgb2d, pcds, instr, prop,
                 run_inference=not training,
                 instr_mask=instr_mask,
                 instr_lens=instr_lens,
+                grounding_3d=grounding_3d,
             )
         return out  # loss if training, else action
 
