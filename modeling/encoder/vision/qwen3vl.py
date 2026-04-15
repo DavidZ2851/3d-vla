@@ -309,7 +309,17 @@ class Qwen3VLBackbone(nn.Module):
                 self._multiscale_hook_handles.append(handle)
 
         if gradient_checkpointing:
-            self.vlm.gradient_checkpointing_enable()
+            # This codebase captures intermediate activations through forward hooks
+            # and lightweight forward-time side channels (for example pre/post-merge
+            # vision features and selected LLM layer states). Reentrant activation
+            # checkpointing runs those wrapped layer forwards under checkpoint
+            # recomputation semantics that can make such side-captured tensors poor
+            # autograd citizens. Non-reentrant checkpointing preserves the memory
+            # savings we want here while keeping those captured tensors attached to
+            # the forward graph used by downstream policy code.
+            self.vlm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
         # Reuse MiBot tokenizer metadata and chat-template scaffolding when available.
         self._processor = None

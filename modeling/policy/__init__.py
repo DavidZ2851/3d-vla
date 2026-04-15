@@ -11,6 +11,8 @@ from .flower_actor_qwen_grounding import (
     QwenFlowerActor3DGroundingCond,
     QwenFlowerActor3DGroundingPred,
 )
+from .qwen_pi_llm_actor_3d import QwenPi0LLMActor3D, QwenPi05LLMActor3D
+from .qwen_dualexpert_3dfa_actor import QwenDualExpert3DFAActor
 # from .old_diffuser_actor import DiffuserActor
 
 
@@ -39,6 +41,12 @@ def fetch_model_class(model_type):
         return QwenFlowerActor3DGroundingCond
     if model_type == 'qwen_flower_actor_3d_grounding_pred':
         return QwenFlowerActor3DGroundingPred
+    if model_type == 'qwen_pi0_llm_actor_3d':
+        return QwenPi0LLMActor3D
+    if model_type == 'qwen_pi05_llm_actor_3d':
+        return QwenPi05LLMActor3D
+    if model_type == 'qwen_dualexpert_3dfa_actor':
+        return QwenDualExpert3DFAActor
     # if model_type == '3dda':
     #     return DiffuserActor
     return None

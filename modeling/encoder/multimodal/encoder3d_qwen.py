@@ -50,8 +50,15 @@ def _unwrap_peft_base(module: nn.Module) -> nn.Module:
 
 class Qwen3VLEncoder3D(nn.Module):
     """
-    Uses Qwen3-VL pre-merge vision features (stride 16, dim=vision_hidden_size) for scene tokens and fused LLM hidden states (dim=llm_hidden_size) for language tokens.
-    Both modalities use ``Linear(RmsNorm(x))`` into ``embedding_dim`` (bias-free linear): same pattern as Florence2 text in ``Encoder.encode_florence2``, extended to vision tokens.
+    Uses Qwen3-VL vision features for scene tokens and fused LLM hidden states for language tokens.
+    Both modalities use ``Linear(RmsNorm(x))`` into ``embedding_dim`` (bias-free linear).
+
+    When ``use_post_merge=False`` (default): uses **pre-merge** features (stride 16,
+    dim=``vision_hidden_size``), captured via a forward-pre-hook before PatchMerger.
+
+    When ``use_post_merge=True``: uses **post-merge** features (stride 32,
+    dim=``llm_hidden_size``), captured via a forward-hook on PatchMerger output.
+    PCD is bilinearly downsampled to the stride-32 grid in this mode.
 
     **Trainable layout** (typical Calvin / MiBot script):
     - ``visual`` full weights update for the last ``num_finetune_vision_layers``
@@ -84,11 +91,13 @@ class Qwen3VLEncoder3D(nn.Module):
         llm_lora_target_modules="self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj",
         gradient_checkpointing=False,
         use_multiscale=False,
+        use_post_merge=False,
         **kwargs,
     ):
         super().__init__()
         self.subsampling_factor = fps_subsampling_factor
         self.use_multiscale = bool(use_multiscale)
+        self.use_post_merge = bool(use_post_merge)
 
         self._use_llm_lora = bool(llm_lora_rank > 0 and llm_lora_num_layers > 0)
         self._use_vision_lora = bool(vision_lora_rank > 0 and vision_lora_num_layers > 0)
@@ -126,10 +135,21 @@ class Qwen3VLEncoder3D(nn.Module):
                 self.backbone.multiscale_layers,
             )
         else:
-            self.vis_norm = RmsNorm(self.backbone.vision_hidden_size)
-            self.vis_proj = nn.Linear(
-                self.backbone.vision_hidden_size, embedding_dim, bias=False
+            # post-merge: dim = llm_hidden_size (merger projects to LLM input space)
+            vis_in_dim = (
+                self.backbone.llm_hidden_size
+                if use_post_merge
+                else self.backbone.vision_hidden_size
             )
+            self.vis_norm = RmsNorm(vis_in_dim)
+            self.vis_proj = nn.Linear(vis_in_dim, embedding_dim, bias=False)
+
+        # Register post-merge hook when use_post_merge=True
+        if use_post_merge and not self.use_multiscale:
+            self._post_merge_features = None
+            visual_inner = _unwrap_peft_base(self.backbone.vlm.visual)
+            visual_inner.merger.register_forward_hook(self._post_merge_hook)
+
         # Text: cond_linear(cond_norm(lang_feats)); LLM dim is Qwen hidden size.
         self.cond_norm = RmsNorm(self.backbone.llm_hidden_size)
         self.cond_linear = nn.Linear(
@@ -148,6 +168,10 @@ class Qwen3VLEncoder3D(nn.Module):
             use_adaln=False,
             pre_norm=False,
         )
+
+    def _post_merge_hook(self, module, args, output):
+        """Capture PatchMerger output (post-merge, stride-32 features)."""
+        self._post_merge_features = output
 
     def _backbone_visual_dtype(self) -> torch.dtype:
         visual_inner = _unwrap_peft_base(self.backbone.vlm.visual)
@@ -257,10 +281,17 @@ class Qwen3VLEncoder3D(nn.Module):
         # text_hidden: (B, L, C_llm)
 
         B, ncam, h16, w16, _ = pre_merge.shape
+        ms = self.backbone.spatial_merge_size  # typically 2
+        h32, w32 = h16 // ms, w16 // ms
 
-        # ---- Vision: RmsNorm on C_vis then Linear → embedding_dim (same pattern as text) ----
+        # ---- Vision: RmsNorm on C_vis then Linear → embedding_dim ----
         if self.use_multiscale:
             rgb3d_feats = self.multiscale_fuser(multiscale_pre_merge)
+        elif self.use_post_merge:
+            # post_merge_features: (B * ncam * h32 * w32, llm_hidden_size)
+            post_merge = self._post_merge_features
+            post_merge = post_merge.reshape(B, ncam * h32 * w32, -1)
+            rgb3d_feats = self.vis_proj(self.vis_norm(post_merge.to(self.vis_proj.weight.dtype)))
         else:
             rgb3d_feats = pre_merge.reshape(B, ncam * h16 * w16, -1)
             rgb3d_feats = self.vis_proj(self.vis_norm(rgb3d_feats))
@@ -268,11 +299,13 @@ class Qwen3VLEncoder3D(nn.Module):
         # ---- Language: same pattern as Florence2 (RmsNorm + bias-free Linear) ----
         instr_feats = self.cond_linear(self.cond_norm(text_hidden))
 
-        # ---- Align PCD to the stride-16 grid ----
+        # ---- Align PCD to vision feature grid (stride-16 or stride-32) ----
         num_cameras = pcd.shape[1]
+        grid_h = h32 if self.use_post_merge else h16
+        grid_w = w32 if self.use_post_merge else w16
         pcd_down = F.interpolate(
             einops.rearrange(pcd, "b nc c h w -> (b nc) c h w"),
-            (h16, w16),
+            (grid_h, grid_w),
             mode="bilinear",
         )
         pcd_flat = einops.rearrange(

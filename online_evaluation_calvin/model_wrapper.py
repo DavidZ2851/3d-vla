@@ -1,4 +1,5 @@
 import logging
+import inspect
 
 import numpy as np
 import torch
@@ -76,6 +77,8 @@ def _maybe_override_qwen_eval_args_from_checkpoint(args, state_dict):
         "qwen_flower_actor_3d_stagewise",
         "qwen_flower_actor_3d_grounding_cond",
         "qwen_flower_actor_3d_grounding_pred",
+        "qwen_pi0_llm_actor_3d",
+        "qwen_pi05_llm_actor_3d",
     }:
         return
 
@@ -168,25 +171,26 @@ class Model:
             denoise_timesteps=self.args.denoise_timesteps,
             denoise_model=self.args.denoise_model,
         )
-        if self.args.model_type in {
-            "qwen_flower_actor_3d",
-            "qwen_flower_actor_3d_stagewise",
-            "qwen_flower_actor_3d_grounding_cond",
-            "qwen_flower_actor_3d_grounding_pred",
-        }:
-            model_kwargs.update(
-                vision_lora_rank=self.args.vision_lora_rank,
-                vision_lora_alpha=self.args.vision_lora_alpha,
-                vision_lora_dropout=self.args.vision_lora_dropout,
-                vision_lora_num_layers=self.args.vision_lora_num_layers,
-                vision_lora_target_modules=self.args.vision_lora_target_modules,
-                llm_lora_rank=self.args.llm_lora_rank,
-                llm_lora_alpha=self.args.llm_lora_alpha,
-                llm_lora_dropout=self.args.llm_lora_dropout,
-                llm_lora_num_layers=self.args.llm_lora_num_layers,
-                llm_lora_target_modules=self.args.llm_lora_target_modules,
-                use_multiscale=getattr(self.args, "use_multiscale", False),
-            )
+        model_init_params = inspect.signature(model_class.__init__).parameters
+        qwen_kwargs = {
+            "vision_lora_rank": self.args.vision_lora_rank,
+            "vision_lora_alpha": self.args.vision_lora_alpha,
+            "vision_lora_dropout": self.args.vision_lora_dropout,
+            "vision_lora_num_layers": self.args.vision_lora_num_layers,
+            "vision_lora_target_modules": self.args.vision_lora_target_modules,
+            "llm_lora_rank": self.args.llm_lora_rank,
+            "llm_lora_alpha": self.args.llm_lora_alpha,
+            "llm_lora_dropout": self.args.llm_lora_dropout,
+            "llm_lora_num_layers": self.args.llm_lora_num_layers,
+            "llm_lora_target_modules": self.args.llm_lora_target_modules,
+            "use_multiscale": getattr(self.args, "use_multiscale", False),
+            "gradient_checkpointing": getattr(
+                self.args, "gradient_checkpointing", False
+            ),
+        }
+        for key, value in qwen_kwargs.items():
+            if key in model_init_params:
+                model_kwargs[key] = value
         return model_class(**model_kwargs)
 
     def reset(self):

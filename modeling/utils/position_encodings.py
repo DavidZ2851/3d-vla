@@ -106,6 +106,69 @@ class RotaryPositionEncoding3D(RotaryPositionEncoding):
         return position_code.detach()
 
 
+class RotaryPositionEncoding4D(RotaryPositionEncoding):
+    """4D RoPE encoding (time, x, y, z).
+
+    The head_dim is split into four roughly equal even-sized buckets (dt, dx,
+    dy, dz) each encoding one axis.  Any remainder is absorbed into dz.
+
+    Input:  TXYZ  [B, N, 4]  where TXYZ[...,0] is a temporal index (float,
+            e.g. trajectory step 0,1,…,T-1) and TXYZ[...,1:4] are metric XYZ
+            coordinates.
+    Output: [B, N, feature_dim, 2]  stacked (cos, sin) ready for embed_rotary.
+    """
+
+    def __init__(self, feature_dim, pe_type="Rotary4D"):
+        super().__init__(feature_dim, pe_type)
+
+    @torch.no_grad()
+    def forward(self, TXYZ):
+        bsize, npoint, _ = TXYZ.shape
+        t_pos = TXYZ[..., 0:1]
+        x_pos = TXYZ[..., 1:2]
+        y_pos = TXYZ[..., 2:3]
+        z_pos = TXYZ[..., 3:4]
+
+        dt = self.feature_dim // 4
+        if dt % 2 == 1:
+            dt -= 1
+        remaining = self.feature_dim - dt
+        dx = dy = remaining // 3
+        if dx % 2 == 1:
+            dx -= 1
+            dy -= 1
+        dz = self.feature_dim - dt - dx - dy
+
+        def _freq(d):
+            return torch.exp(
+                torch.arange(0, d, 2, dtype=torch.float, device=TXYZ.device)
+                * (-math.log(10000.0) / max(d, 2))
+            ).view(1, 1, -1)
+
+        sint = torch.sin(t_pos * _freq(dt))
+        cost = torch.cos(t_pos * _freq(dt))
+        sinx = torch.sin(x_pos * _freq(dx))
+        cosx = torch.cos(x_pos * _freq(dx))
+        siny = torch.sin(y_pos * _freq(dy))
+        cosy = torch.cos(y_pos * _freq(dy))
+        sinz = torch.sin(z_pos * _freq(dz))
+        cosz = torch.cos(z_pos * _freq(dz))
+
+        sint, cost, sinx, cosx, siny, cosy, sinz, cosz = map(
+            lambda feat: torch.stack([feat, feat], -1).view(bsize, npoint, -1),
+            [sint, cost, sinx, cosx, siny, cosy, sinz, cosz],
+        )
+
+        position_code = torch.stack(
+            [
+                torch.cat([cost, cosx, cosy, cosz], dim=-1),
+                torch.cat([sint, sinx, siny, sinz], dim=-1),
+            ],
+            dim=-1,
+        )
+        return position_code.detach()
+
+
 class PositionEmbeddingLearnedMLP(nn.Module):
     """Absolute pos embedding, learned."""
 

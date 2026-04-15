@@ -6,9 +6,9 @@ class CALVINDataset(BaseDataset):
     """CALVIN dataset."""
     cameras = ("front", "wrist")
     train_copies = 1
-    quat_format= 'euler'
+    quat_format = 'euler'
     camera_inds = None
-    max_samples=None  # max number of chunks
+    max_samples = None  # max number of chunks
 
     def __init__(
         self,

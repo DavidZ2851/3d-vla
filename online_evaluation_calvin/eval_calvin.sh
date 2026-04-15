@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=eval_calvin_multiscale
+#SBATCH --job-name=eval_calvin_cond
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1
-#SBATCH --time=2:30:00
+#SBATCH --time=3:30:00
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/ziyinx/logs/%x_%j.out
 #SBATCH --error=/data/user_data/ziyinx/logs/%x_%j.err
@@ -17,12 +17,12 @@ ann_config_file=online_evaluation_calvin/configs/new_playtable_validation.yaml
 
 # Things you may want to change if you train/eval a new model
 seed=0
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/qwen_flower_actor_3d_stagewise-Calvin10th-C1024-B16-lr3e-5-tristage_flower-H1-rectified_flow-qwen3vl-finetuned_false-job7028952/70000.pth
-base_log_dir=eval_logs/CALVIN/lora_multistage/
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/qwen_grounding_as_condition/60k.pth
+base_log_dir=eval_logs/CALVIN/grounding_cond/
 save_video=false
 
 # Things you can change if you customize the model architecture
-model_type=qwen_flower_actor_3d_stagewise
+model_type=qwen_flower_actor_3d_grounding_cond
 pred_len=10
 pre_tokenize=true
 custom_img_size=224

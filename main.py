@@ -89,6 +89,8 @@ def parse_arguments():
         ('merger_lr_scale', float, 0.1),
         ('gradient_checkpointing', str2bool, False),
         ('grounding_loss_weight', float, 10.0),
+        ('grounding_loss_weight_hold_iters', int, 0),  # 0 = fixed weight; else hold --grounding_loss_weight for this many steps
+        ('grounding_loss_weight_final', float, 0.1),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])

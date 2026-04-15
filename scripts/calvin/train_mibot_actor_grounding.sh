@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=calvin_contact_prediction
+#SBATCH --job-name=calvin_contact_condition
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -9,7 +9,7 @@
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40S|A100_40GB|A100_80GB"
+#SBATCH --constraint="L40S|A100_80GB|H100|H200|RTX_PRO_6000"
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
@@ -24,7 +24,7 @@ val_instructions=instructions/calvin/val_instructions.json
 
 # ---- Dataset / loader ----
 # CalvinContact10th reads '3d_contact_point' from the zarr if present.
-# Falls back to None gracefully when the field is absent (no-op for both variants).
+# Falls back to None when the field is absent (no-op for both variants).
 dataset=CalvinContact10th
 num_workers=8
 memory_limit=8
@@ -47,7 +47,7 @@ use_ema=false
 # Choose ONE of the two grounding variants:
 #   qwen_flower_actor_3d_grounding_cond  -- conditions on contact point as extra context token
 #   qwen_flower_actor_3d_grounding_pred  -- predicts contact point as auxiliary training goal
-model_type=qwen_flower_actor_3d_grounding_pred
+model_type=qwen_flower_actor_3d_grounding_cond
 bimanual=false
 keypose_only=false
 pre_tokenize=true
@@ -59,8 +59,12 @@ finetune_text_encoder=false
 fps_subsampling_factor=1
 use_multiscale=false
 
-# ---- Grounding loss weight (variant 2 only; ignored by variant 1) ----
-grounding_loss_weight=10.0
+# ---- Grounding loss weight (qwen_flower_actor_3d_grounding_pred only; ignored by cond) ----
+grounding_loss_weight=5.0
+# Hold full weight for the first N steps, then linearly decay to grounding_loss_weight_final
+# by the last training iteration.
+grounding_loss_weight_hold_iters=5000
+grounding_loss_weight_final=0.1
 
 # ---- LoRA Configuration ----
 num_finetune_vision_layers=24
@@ -131,6 +135,8 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --fps_subsampling_factor $fps_subsampling_factor \
     --use_multiscale $use_multiscale \
     --grounding_loss_weight $grounding_loss_weight \
+    --grounding_loss_weight_hold_iters $grounding_loss_weight_hold_iters \
+    --grounding_loss_weight_final $grounding_loss_weight_final \
     --embedding_dim $C \
     --num_attn_heads $num_attn_heads \
     --num_vis_instr_attn_layers $num_vis_instr_attn_layers \

@@ -1,0 +1,153 @@
+#!/bin/bash
+#SBATCH --job-name=calvin_mibot_progressive_B16
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=300G
+#SBATCH --gres=gpu:4
+#SBATCH --time=48:00:00
+#SBATCH --partition=general
+#SBATCH --output=/data/user_data/%u/logs/%x_%j.out
+#SBATCH --error=/data/user_data/%u/logs/%x_%j.err
+#SBATCH --constraint="L40S|A100_80GB|H100|H200"
+
+export WANDB_MODE=online
+export WANDB_API_KEY=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
+export QWEN3VL_MODEL_PATH=/home/ziyinx/Xiaomi-Robotics-0-Pretrain
+
+DATA_PATH=/data/user_data/ziyinx/datasets
+train_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/train_rechunked8.zarr
+eval_data_dir=/data/group_data/katefgroup/VLA/zarr_datasets/calvin_zarr/val_rechunked8.zarr
+train_instructions=instructions/calvin/train_instructions.json
+val_instructions=instructions/calvin/val_instructions.json
+
+dataset=Calvin10th
+num_workers=8
+memory_limit=8
+B=16
+B_val=16
+chunk_size=8
+lv2_batch_size=1
+
+val_freq=5000
+eval_only=false
+lr=3e-5
+lr_scheduler=tristage_flower
+wd=0.05
+train_iters=100000
+use_compile=false
+use_ema=false
+
+# Hybrid 3DFA + Pi0 Dual-Expert model:
+#   - post-merge Qwen ViT (stride 32, keeps PatchMerger intact)
+#   - Qwen LLM runs unmodified; action expert cross-attends to per-layer states
+#   - 3D RoPE + AdaLN (3DFA-VLA style action decoding)
+#   - 3DFA-VLA output heads (pos/rot DoubleCrossSelf + static scene context)
+model_type=qwen_dualexpert_3dfa_actor
+bimanual=false
+keypose_only=false
+pre_tokenize=true
+custom_img_size=224
+
+backbone=qwen3vl
+finetune_backbone=false
+finetune_text_encoder=false
+fps_subsampling_factor=1
+use_multiscale=false
+
+# Finetune last N ViT blocks + PatchMerger (merger is KEPT unlike pi0 policy)
+num_finetune_vision_layers=24
+vision_lora_rank=64
+vision_lora_alpha=128
+vision_lora_dropout=0.05
+vision_lora_num_layers=0
+vision_lora_target_modules=attn.qkv,attn.proj,mlp.linear_fc1,mlp.linear_fc2
+
+# LLM LoRA (prefix runs frozen except for LoRA adapters)
+llm_lora_rank=64
+llm_lora_alpha=128
+llm_lora_dropout=0.05
+llm_lora_num_layers=36
+llm_lora_target_modules=self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj,mlp.gate_proj,mlp.up_proj,mlp.down_proj
+
+# Action expert / decoder dimensions
+# embedding_dim: action token and output head feature size (3DFA-VLA style)
+# num_attn_heads: must divide embedding_dim evenly (e.g. 120/8=15 or 120/10=12)
+C=1024
+num_attn_heads=16
+num_vis_instr_attn_layers=3   # legacy CLI arg, unused by this model
+num_history=1
+num_shared_attn_layers=16      # samples 16 of 36 Qwen LLM layers, denser near the end
+
+workspace_normalizer_buffer=0.0
+rotation_format=euler
+relative_action=true
+denoise_timesteps=5
+denoise_model=rectified_flow
+
+main_dir=calvin
+run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-job${SLURM_JOBID}
+checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
+finetune=false
+gradient_checkpointing=true
+
+ngpus=4
+master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))
+
+torchrun --nproc_per_node $ngpus --master_port $master_port \
+    /data/user_data/ziyinx/analogical_manipulation_clean/main.py \
+    --train_data_dir $train_data_dir \
+    --eval_data_dir $eval_data_dir \
+    --train_instructions $train_instructions \
+    --val_instructions $val_instructions \
+    --dataset $dataset \
+    --num_workers $num_workers \
+    --memory_limit $memory_limit \
+    --batch_size $B \
+    --batch_size_val $B_val \
+    --lv2_batch_size $lv2_batch_size \
+    --chunk_size $chunk_size \
+    --exp_log_dir $main_dir \
+    --run_log_dir ${run_log_dir} \
+    --checkpoint $checkpoint \
+    --val_freq $val_freq \
+    --eval_only $eval_only \
+    --lr $lr \
+    --lr_scheduler $lr_scheduler \
+    --wd $wd \
+    --train_iters $train_iters \
+    --use_compile $use_compile \
+    --use_ema $use_ema \
+    --model_type $model_type \
+    --bimanual $bimanual \
+    --keypose_only $keypose_only \
+    --pre_tokenize $pre_tokenize \
+    --custom_img_size $custom_img_size \
+    --backbone $backbone \
+    --finetune_backbone $finetune_backbone \
+    --finetune_text_encoder $finetune_text_encoder \
+    --fps_subsampling_factor $fps_subsampling_factor \
+    --use_multiscale $use_multiscale \
+    --embedding_dim $C \
+    --num_attn_heads $num_attn_heads \
+    --num_vis_instr_attn_layers $num_vis_instr_attn_layers \
+    --num_history $num_history \
+    --num_shared_attn_layers $num_shared_attn_layers \
+    --workspace_normalizer_buffer $workspace_normalizer_buffer \
+    --relative_action $relative_action \
+    --rotation_format $rotation_format \
+    --denoise_timesteps $denoise_timesteps \
+    --denoise_model $denoise_model \
+    --finetune $finetune \
+    --num_finetune_vision_layers $num_finetune_vision_layers \
+    --vision_lora_rank $vision_lora_rank \
+    --vision_lora_alpha $vision_lora_alpha \
+    --vision_lora_dropout $vision_lora_dropout \
+    --vision_lora_num_layers $vision_lora_num_layers \
+    --vision_lora_target_modules $vision_lora_target_modules \
+    --llm_lora_rank $llm_lora_rank \
+    --llm_lora_alpha $llm_lora_alpha \
+    --llm_lora_dropout $llm_lora_dropout \
+    --llm_lora_num_layers $llm_lora_num_layers \
+    --llm_lora_target_modules $llm_lora_target_modules \
+    --gradient_checkpointing $gradient_checkpointing
