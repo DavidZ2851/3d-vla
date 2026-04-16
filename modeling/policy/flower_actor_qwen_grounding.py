@@ -16,6 +16,13 @@ Grounding variants of QwenFlowerActor3D. Two parallel classes:
     skipped.  Inference is unchanged.
 
 Both variants leave existing code untouched (new file + new model_type entries).
+
+Additional variant:
+  - QwenFlowerActor3DGroundingCondLLMVisual
+    (model_type: qwen_flower_actor_3d_grounding_cond_llm_visual)
+    Same as QwenFlowerActor3DGroundingCond, but scene features come from
+    final Qwen LLM visual token states (stride 32) rather than pre-merge
+    ViT features (stride 16).
 """
 
 import einops
@@ -327,6 +334,111 @@ class QwenFlowerActor3DGroundingCond(BaseDenoiseActor):
             valid_mask=valid_mask,
             grounding_feats=grounding_feats,
             grounding_pos=grounding_pos,
+        )
+
+
+class QwenFlowerActor3DGroundingCondLLMVisual(QwenFlowerActor3DGroundingCond):
+    """
+    Grounding-conditioned 3DFA policy using post-LLM visual tokens.
+
+    This variant keeps the same decoder and grounding-token conditioning as
+    ``QwenFlowerActor3DGroundingCond``. The only change is in the encoder:
+    scene RGB features are taken from the final Qwen LLM hidden states at
+    image-token positions (patch-size 32), following the native Qwen3VL
+    multimodal forward path before splitting visual/text features.
+    """
+
+    def __init__(
+        self,
+        backbone="qwen3vl",
+        output_level="res3",
+        upsample=False,
+        finetune_backbone=False,
+        num_finetune_vision_layers=0,
+        finetune_text_encoder=False,
+        num_vis_instr_attn_layers=2,
+        fps_subsampling_factor=5,
+        embedding_dim=60,
+        num_attn_heads=9,
+        nhist=3,
+        nhand=1,
+        num_shared_attn_layers=4,
+        relative=False,
+        rotation_format="quat_xyzw",
+        denoise_timesteps=100,
+        denoise_model="ddpm",
+        lv2_batch_size=1,
+        vision_lora_rank=0,
+        vision_lora_alpha=16,
+        vision_lora_dropout=0.0,
+        vision_lora_num_layers=0,
+        vision_lora_target_modules="attn.qkv,attn.proj",
+        llm_lora_rank=0,
+        llm_lora_alpha=16,
+        llm_lora_dropout=0.0,
+        llm_lora_num_layers=0,
+        llm_lora_target_modules=(
+            "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj"
+        ),
+        gradient_checkpointing=False,
+        use_multiscale=False,
+    ):
+        super().__init__(
+            backbone=backbone,
+            output_level=output_level,
+            upsample=upsample,
+            finetune_backbone=finetune_backbone,
+            num_finetune_vision_layers=num_finetune_vision_layers,
+            finetune_text_encoder=finetune_text_encoder,
+            num_vis_instr_attn_layers=num_vis_instr_attn_layers,
+            fps_subsampling_factor=fps_subsampling_factor,
+            embedding_dim=embedding_dim,
+            num_attn_heads=num_attn_heads,
+            nhist=nhist,
+            nhand=nhand,
+            num_shared_attn_layers=num_shared_attn_layers,
+            relative=relative,
+            rotation_format=rotation_format,
+            denoise_timesteps=denoise_timesteps,
+            denoise_model=denoise_model,
+            lv2_batch_size=lv2_batch_size,
+            vision_lora_rank=vision_lora_rank,
+            vision_lora_alpha=vision_lora_alpha,
+            vision_lora_dropout=vision_lora_dropout,
+            vision_lora_num_layers=vision_lora_num_layers,
+            vision_lora_target_modules=vision_lora_target_modules,
+            llm_lora_rank=llm_lora_rank,
+            llm_lora_alpha=llm_lora_alpha,
+            llm_lora_dropout=llm_lora_dropout,
+            llm_lora_num_layers=llm_lora_num_layers,
+            llm_lora_target_modules=llm_lora_target_modules,
+            gradient_checkpointing=gradient_checkpointing,
+            use_multiscale=use_multiscale,
+        )
+
+        # Override encoder only: use final LLM visual tokens as scene features.
+        self.encoder = Qwen3VLEncoder3D(
+            backbone=backbone,
+            embedding_dim=embedding_dim,
+            nhist=nhist * nhand,
+            num_attn_heads=num_attn_heads,
+            fps_subsampling_factor=fps_subsampling_factor,
+            finetune_backbone=finetune_backbone,
+            num_finetune_vision_layers=num_finetune_vision_layers,
+            finetune_text_encoder=finetune_text_encoder,
+            vision_lora_rank=vision_lora_rank,
+            vision_lora_alpha=vision_lora_alpha,
+            vision_lora_dropout=vision_lora_dropout,
+            vision_lora_num_layers=vision_lora_num_layers,
+            vision_lora_target_modules=vision_lora_target_modules,
+            llm_lora_rank=llm_lora_rank,
+            llm_lora_alpha=llm_lora_alpha,
+            llm_lora_dropout=llm_lora_dropout,
+            llm_lora_num_layers=llm_lora_num_layers,
+            llm_lora_target_modules=llm_lora_target_modules,
+            gradient_checkpointing=gradient_checkpointing,
+            use_multiscale=use_multiscale,
+            use_post_llm_visual=True,
         )
 
 

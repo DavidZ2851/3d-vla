@@ -60,6 +60,10 @@ class Qwen3VLEncoder3D(nn.Module):
     dim=``llm_hidden_size``), captured via a forward-hook on PatchMerger output.
     PCD is bilinearly downsampled to the stride-32 grid in this mode.
 
+    When ``use_post_llm_visual=True``: uses **post-LLM visual** features (stride 32,
+    dim=``llm_hidden_size``), extracted from final ``last_hidden_state`` at image-token
+    positions. This follows the native Qwen3VL-Instruct path through the full LLM.
+
     **Trainable layout** (typical Calvin / MiBot script):
     - ``visual`` full weights update for the last ``num_finetune_vision_layers``
       blocks plus merger modules, or the whole VLM when ``finetune_backbone``.
@@ -92,12 +96,23 @@ class Qwen3VLEncoder3D(nn.Module):
         gradient_checkpointing=False,
         use_multiscale=False,
         use_post_merge=False,
+        use_post_llm_visual=False,
         **kwargs,
     ):
         super().__init__()
         self.subsampling_factor = fps_subsampling_factor
         self.use_multiscale = bool(use_multiscale)
         self.use_post_merge = bool(use_post_merge)
+        self.use_post_llm_visual = bool(use_post_llm_visual)
+
+        if self.use_post_merge and self.use_post_llm_visual:
+            raise ValueError(
+                "use_post_merge and use_post_llm_visual are mutually exclusive."
+            )
+        if self.use_post_llm_visual and self.use_multiscale:
+            raise ValueError(
+                "use_post_llm_visual is incompatible with use_multiscale."
+            )
 
         self._use_llm_lora = bool(llm_lora_rank > 0 and llm_lora_num_layers > 0)
         self._use_vision_lora = bool(vision_lora_rank > 0 and vision_lora_num_layers > 0)
@@ -138,7 +153,7 @@ class Qwen3VLEncoder3D(nn.Module):
             # post-merge: dim = llm_hidden_size (merger projects to LLM input space)
             vis_in_dim = (
                 self.backbone.llm_hidden_size
-                if use_post_merge
+                if (use_post_merge or use_post_llm_visual)
                 else self.backbone.vision_hidden_size
             )
             self.vis_norm = RmsNorm(vis_in_dim)
@@ -271,12 +286,17 @@ class Qwen3VLEncoder3D(nn.Module):
         )
         grad_ctx = nullcontext() if needs_grad else torch.no_grad()
         with grad_ctx:
-            pre_merge, text_hidden, multiscale_pre_merge = self.backbone(
+            backbone_outputs = self.backbone(
                 rgb3d_normed,
                 instruction,
                 text_attention_mask=instr_mask,
                 text_valid_lens=instr_lens,
+                return_post_llm_visual=self.use_post_llm_visual,
             )
+        if self.use_post_llm_visual:
+            pre_merge, text_hidden, multiscale_pre_merge, post_llm_visual = backbone_outputs
+        else:
+            pre_merge, text_hidden, multiscale_pre_merge = backbone_outputs
         # pre_merge:   (B, ncam, h16, w16, C_vis)
         # text_hidden: (B, L, C_llm)
 
@@ -287,6 +307,10 @@ class Qwen3VLEncoder3D(nn.Module):
         # ---- Vision: RmsNorm on C_vis then Linear → embedding_dim ----
         if self.use_multiscale:
             rgb3d_feats = self.multiscale_fuser(multiscale_pre_merge)
+        elif self.use_post_llm_visual:
+            rgb3d_feats = self.vis_proj(
+                self.vis_norm(post_llm_visual.to(self.vis_proj.weight.dtype))
+            )
         elif self.use_post_merge:
             # post_merge_features: (B * ncam * h32 * w32, llm_hidden_size)
             post_merge = self._post_merge_features
@@ -301,8 +325,9 @@ class Qwen3VLEncoder3D(nn.Module):
 
         # ---- Align PCD to vision feature grid (stride-16 or stride-32) ----
         num_cameras = pcd.shape[1]
-        grid_h = h32 if self.use_post_merge else h16
-        grid_w = w32 if self.use_post_merge else w16
+        use_stride32_grid = self.use_post_merge or self.use_post_llm_visual
+        grid_h = h32 if use_stride32_grid else h16
+        grid_w = w32 if use_stride32_grid else w16
         pcd_down = F.interpolate(
             einops.rearrange(pcd, "b nc c h w -> (b nc) c h w"),
             (grid_h, grid_w),

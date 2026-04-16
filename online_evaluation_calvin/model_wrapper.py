@@ -76,9 +76,11 @@ def _maybe_override_qwen_eval_args_from_checkpoint(args, state_dict):
         "qwen_flower_actor_3d",
         "qwen_flower_actor_3d_stagewise",
         "qwen_flower_actor_3d_grounding_cond",
+        "qwen_flower_actor_3d_grounding_cond_llm_visual",
         "qwen_flower_actor_3d_grounding_pred",
         "qwen_pi0_llm_actor_3d",
         "qwen_pi05_llm_actor_3d",
+        "qwen_dualexpert_3dfa_actor",
     }:
         return
 

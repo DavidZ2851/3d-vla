@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=calvin_contact_condition
+#SBATCH --job-name=calvin_contact_condition_post_llm
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -47,7 +47,7 @@ use_ema=false
 # Choose ONE of the two grounding variants:
 #   qwen_flower_actor_3d_grounding_cond  -- conditions on contact point as extra context token
 #   qwen_flower_actor_3d_grounding_pred  -- predicts contact point as auxiliary training goal
-model_type=qwen_flower_actor_3d_grounding_cond
+model_type=qwen_flower_actor_3d_grounding_cond_llm_visual
 bimanual=false
 keypose_only=false
 pre_tokenize=true

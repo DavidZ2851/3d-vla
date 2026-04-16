@@ -9,6 +9,7 @@ from .flower_actor_qwen import QwenFlowerActor3D
 from .flower_actor_qwen_stagewise import QwenFlowerActor3DStagewise
 from .flower_actor_qwen_grounding import (
     QwenFlowerActor3DGroundingCond,
+    QwenFlowerActor3DGroundingCondLLMVisual,
     QwenFlowerActor3DGroundingPred,
 )
 from .qwen_pi_llm_actor_3d import QwenPi0LLMActor3D, QwenPi05LLMActor3D
@@ -39,6 +40,8 @@ def fetch_model_class(model_type):
         return QwenFlowerActor3DStagewise
     if model_type == 'qwen_flower_actor_3d_grounding_cond':
         return QwenFlowerActor3DGroundingCond
+    if model_type == 'qwen_flower_actor_3d_grounding_cond_llm_visual':
+        return QwenFlowerActor3DGroundingCondLLMVisual
     if model_type == 'qwen_flower_actor_3d_grounding_pred':
         return QwenFlowerActor3DGroundingPred
     if model_type == 'qwen_pi0_llm_actor_3d':

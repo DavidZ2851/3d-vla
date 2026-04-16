@@ -640,6 +640,7 @@ class Qwen3VLBackbone(nn.Module):
         text_token_ids,
         text_attention_mask=None,
         text_valid_lens=None,
+        return_post_llm_visual=False,
     ):
         """
         Args:
@@ -650,6 +651,8 @@ class Qwen3VLBackbone(nn.Module):
             pre_merge_feats: (B, ncam, h16, w16, vision_hidden_size)
             text_hidden:     (B, L, llm_hidden_size)
             multiscale_feats: dict[layer_idx -> (B, ncam, h16, w16, vision_hidden_size)] or None
+            post_llm_visual: (B, ncam*h32*w32, llm_hidden_size), only when
+                ``return_post_llm_visual=True``.
         """
         B, ncam, C, H, W = images.shape
         dev = images.device
@@ -735,6 +738,14 @@ class Qwen3VLBackbone(nn.Module):
             tm = text_attention_mask.to(device=text_hidden.device, dtype=text_hidden.dtype)
             text_hidden = text_hidden * tm.unsqueeze(-1)
         text_hidden = self.token_dropout(text_hidden)
+        if return_post_llm_visual:
+            image_token_mask = (input_ids == self.image_token_id)
+            # Prompt template is shared across the batch, so image token
+            # positions are identical for all samples.
+            image_positions = image_token_mask[0].nonzero(as_tuple=False).squeeze(-1)
+            post_llm_visual = outputs.last_hidden_state[:, image_positions, :]
+            return pre_merge, text_hidden, multiscale_feats, post_llm_visual
+
         return pre_merge, text_hidden, multiscale_feats
 
 
