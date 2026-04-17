@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=eval_calvin_cond
+#SBATCH --job-name=eval_calvin_cond_llm_visual
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1
 #SBATCH --time=3:30:00
@@ -17,12 +17,12 @@ ann_config_file=online_evaluation_calvin/configs/new_playtable_validation.yaml
 
 # Things you may want to change if you train/eval a new model
 seed=0
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/qwen_grounding_as_condition/60k.pth
-base_log_dir=eval_logs/CALVIN/grounding_cond/
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/qwen_flower_actor_3d_grounding_cond_qwen3d-CalvinContact10th-C1024-B16-lr3e-5-tristage_flower-H1-rectified_flow-qwen3vl-finetuned_false-job7172546/60000.pth
+base_log_dir=eval_logs/CALVIN/grounding_cond_qwen3d/
 save_video=false
 
 # Things you can change if you customize the model architecture
-model_type=qwen_flower_actor_3d_grounding_cond
+model_type=qwen_flower_actor_3d_grounding_cond_qwen3d
 pred_len=10
 pre_tokenize=true
 custom_img_size=224
@@ -39,7 +39,7 @@ llm_lora_dropout=0.05
 llm_lora_num_layers=36
 llm_lora_target_modules=self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj,mlp.gate_proj,mlp.up_proj,mlp.down_proj
 fps_subsampling_factor=1
-use_multiscale=true
+use_multiscale=false
 embedding_dim=1024
 num_attn_heads=16
 num_vis_instr_attn_layers=3

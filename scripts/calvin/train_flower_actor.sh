@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=calvin_flower
+#SBATCH --job-name=calvin_flower_cond
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -9,7 +9,7 @@
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40S|A100_40GB|A100_80GB"
+#SBATCH --constraint="L40S|A100_80GB"
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
@@ -20,7 +20,7 @@ eval_data_dir=/data/group_data/katefgroup/VLA/zarr_datasets/calvin_zarr/val_rech
 train_instructions=instructions/calvin/train_instructions.json
 val_instructions=instructions/calvin/val_instructions.json
 
-dataset=Calvin10th
+dataset=CalvinContact10th
 num_workers=4
 memory_limit=6
 B=8
@@ -37,12 +37,14 @@ num_finetune_vision_layers=0  # unused by Florence2, kept for CLI parity with mi
 vision_lr_scale=0.2
 projector_lr_scale=0.4
 wd=0.05
-train_iters=50000
+train_iters=60000
 use_compile=false
 use_ema=true
 
 # Model arguments, change (some of) these for new architectures
-model_type=flower_actor_3d
+# flower_actor_3d: no contact-point conditioning
+# flower_actor_3d_grounding_cond: condition decoder on 3D contact point when provided
+model_type=flower_actor_3d_grounding_cond
 bimanual=false
 keypose_only=false
 pre_tokenize=true

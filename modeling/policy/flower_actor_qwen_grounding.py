@@ -23,6 +23,13 @@ Additional variant:
     Same as QwenFlowerActor3DGroundingCond, but scene features come from
     final Qwen LLM visual token states (stride 32) rather than pre-merge
     ViT features (stride 16).
+
+  - QwenFlowerActor3DGroundingCondQwen3D
+    (model_type: qwen_flower_actor_3d_grounding_cond_qwen3d)
+    Keeps the same grounding-conditioned Flower decoder, but replaces the
+    encoder with a Qwen3D-style contextualizer:
+      post-merger stride-32 scene tokens -> 3D lift with PCD -> manual Qwen
+      prefix attention with bidirectional masking + 4D TXYZ RoPE.
 """
 
 import einops
@@ -33,6 +40,12 @@ from torch.nn import functional as F
 from .base_denoise_actor import DenoiseActor as BaseDenoiseActor
 from .flower_actor import TransformerHead
 from ..encoder.multimodal.encoder3d_qwen import Qwen3VLEncoder3D
+try:
+    from ..encoder.multimodal.encoder3d_qwen3d import Qwen3VLEncoderQwen3D
+    _QWEN3D_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    Qwen3VLEncoderQwen3D = None
+    _QWEN3D_IMPORT_ERROR = exc
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +452,119 @@ class QwenFlowerActor3DGroundingCondLLMVisual(QwenFlowerActor3DGroundingCond):
             gradient_checkpointing=gradient_checkpointing,
             use_multiscale=use_multiscale,
             use_post_llm_visual=True,
+        )
+
+
+class QwenFlowerActor3DGroundingCondQwen3D(QwenFlowerActor3DGroundingCond):
+    """
+    Grounding-conditioned 3DFA policy using Qwen3D-style scene contextualization.
+
+    This variant preserves the existing Flower grounding head and contact-point
+    conditioning token. Only the encoder changes: scene tokens are taken from
+    native Qwen stride-32 post-merger features, lifted to 3D with the PCD, and
+    then jointly contextualized with the chat/instruction prefix using full
+    bidirectional Qwen attention plus custom 4D TXYZ RoPE.
+    """
+
+    def __init__(
+        self,
+        backbone="qwen3vl",
+        output_level="res3",
+        upsample=False,
+        finetune_backbone=False,
+        num_finetune_vision_layers=0,
+        finetune_text_encoder=False,
+        num_vis_instr_attn_layers=2,
+        fps_subsampling_factor=5,
+        embedding_dim=60,
+        num_attn_heads=9,
+        nhist=3,
+        nhand=1,
+        num_shared_attn_layers=4,
+        relative=False,
+        rotation_format="quat_xyzw",
+        denoise_timesteps=100,
+        denoise_model="ddpm",
+        lv2_batch_size=1,
+        vision_lora_rank=0,
+        vision_lora_alpha=16,
+        vision_lora_dropout=0.0,
+        vision_lora_num_layers=0,
+        vision_lora_target_modules="attn.qkv,attn.proj",
+        llm_lora_rank=0,
+        llm_lora_alpha=16,
+        llm_lora_dropout=0.0,
+        llm_lora_num_layers=0,
+        llm_lora_target_modules=(
+            "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj"
+        ),
+        gradient_checkpointing=False,
+        use_multiscale=False,
+    ):
+        if Qwen3VLEncoderQwen3D is None:
+            raise ImportError(
+                "qwen_flower_actor_3d_grounding_cond_qwen3d requires "
+                "`transformers.models.qwen3_vl`. Please update/install a "
+                "compatible transformers build to use this model type."
+            ) from _QWEN3D_IMPORT_ERROR
+        if use_multiscale:
+            raise ValueError(
+                "QwenFlowerActor3DGroundingCondQwen3D only supports use_multiscale=False."
+            )
+        super().__init__(
+            backbone=backbone,
+            output_level=output_level,
+            upsample=upsample,
+            finetune_backbone=finetune_backbone,
+            num_finetune_vision_layers=num_finetune_vision_layers,
+            finetune_text_encoder=finetune_text_encoder,
+            num_vis_instr_attn_layers=num_vis_instr_attn_layers,
+            fps_subsampling_factor=fps_subsampling_factor,
+            embedding_dim=embedding_dim,
+            num_attn_heads=num_attn_heads,
+            nhist=nhist,
+            nhand=nhand,
+            num_shared_attn_layers=num_shared_attn_layers,
+            relative=relative,
+            rotation_format=rotation_format,
+            denoise_timesteps=denoise_timesteps,
+            denoise_model=denoise_model,
+            lv2_batch_size=lv2_batch_size,
+            vision_lora_rank=vision_lora_rank,
+            vision_lora_alpha=vision_lora_alpha,
+            vision_lora_dropout=vision_lora_dropout,
+            vision_lora_num_layers=vision_lora_num_layers,
+            vision_lora_target_modules=vision_lora_target_modules,
+            llm_lora_rank=llm_lora_rank,
+            llm_lora_alpha=llm_lora_alpha,
+            llm_lora_dropout=llm_lora_dropout,
+            llm_lora_num_layers=llm_lora_num_layers,
+            llm_lora_target_modules=llm_lora_target_modules,
+            gradient_checkpointing=gradient_checkpointing,
+            use_multiscale=use_multiscale,
+        )
+
+        self.encoder = Qwen3VLEncoderQwen3D(
+            backbone=backbone,
+            embedding_dim=embedding_dim,
+            nhist=nhist * nhand,
+            num_attn_heads=num_attn_heads,
+            fps_subsampling_factor=fps_subsampling_factor,
+            finetune_backbone=finetune_backbone,
+            num_finetune_vision_layers=num_finetune_vision_layers,
+            finetune_text_encoder=finetune_text_encoder,
+            vision_lora_rank=vision_lora_rank,
+            vision_lora_alpha=vision_lora_alpha,
+            vision_lora_dropout=vision_lora_dropout,
+            vision_lora_num_layers=vision_lora_num_layers,
+            vision_lora_target_modules=vision_lora_target_modules,
+            llm_lora_rank=llm_lora_rank,
+            llm_lora_alpha=llm_lora_alpha,
+            llm_lora_dropout=llm_lora_dropout,
+            llm_lora_num_layers=llm_lora_num_layers,
+            llm_lora_target_modules=llm_lora_target_modules,
+            gradient_checkpointing=gradient_checkpointing,
+            use_multiscale=use_multiscale,
         )
 
 

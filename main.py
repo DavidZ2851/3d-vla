@@ -47,6 +47,7 @@ def parse_arguments():
         ('wd', float, 5e-3),
         ('train_iters', int, 600000),
         ('use_compile', str2bool, False),
+        ('find_unused_parameters', str2bool, True),
         ('use_ema', str2bool, False),
         ('lv2_batch_size', int, 1),
         # Model arguments: general policy type

@@ -1,3 +1,4 @@
+import inspect
 import numpy as np, torch
 from modeling.encoder.text import fetch_tokenizers
 from modeling.policy import fetch_model_class
@@ -26,8 +27,9 @@ class Model:
 
     def get_policy(self):
         model_class = fetch_model_class(self.args.model_type)
-        return model_class(
+        model_kwargs = dict(
             backbone=self.args.backbone,
+            num_finetune_vision_layers=self.args.num_finetune_vision_layers,
             num_vis_instr_attn_layers=self.args.num_vis_instr_attn_layers,
             fps_subsampling_factor=self.args.fps_subsampling_factor,
             embedding_dim=self.args.embedding_dim,
@@ -40,6 +42,27 @@ class Model:
             denoise_timesteps=self.args.denoise_timesteps,
             denoise_model=self.args.denoise_model,
         )
+        model_init_params = inspect.signature(model_class.__init__).parameters
+        qwen_kwargs = {
+            "vision_lora_rank": self.args.vision_lora_rank,
+            "vision_lora_alpha": self.args.vision_lora_alpha,
+            "vision_lora_dropout": self.args.vision_lora_dropout,
+            "vision_lora_num_layers": self.args.vision_lora_num_layers,
+            "vision_lora_target_modules": self.args.vision_lora_target_modules,
+            "llm_lora_rank": self.args.llm_lora_rank,
+            "llm_lora_alpha": self.args.llm_lora_alpha,
+            "llm_lora_dropout": self.args.llm_lora_dropout,
+            "llm_lora_num_layers": self.args.llm_lora_num_layers,
+            "llm_lora_target_modules": self.args.llm_lora_target_modules,
+            "use_multiscale": getattr(self.args, "use_multiscale", False),
+            "gradient_checkpointing": getattr(
+                self.args, "gradient_checkpointing", False
+            ),
+        }
+        for key, value in qwen_kwargs.items():
+            if key in model_init_params:
+                model_kwargs[key] = value
+        return model_class(**model_kwargs)
 
     def reset(self):
         self.policy.eval()
@@ -49,10 +72,11 @@ class Model:
         self._proprio_history = []
         self._last_vec_env_id = None
 
-    def load_pretrained_weights(self):
-        state = torch.load(self.args.checkpoint, map_location="cpu", weights_only=True)
-        key = "ema_weight" if state.get("ema_weight") is not None else "weight"
-        weight_dict = state[key]
+    def load_pretrained_weights(self, weight_dict=None):
+        if weight_dict is None:
+            state = torch.load(self.args.checkpoint, map_location="cpu", weights_only=True)
+            key = "ema_weight" if state.get("ema_weight") is not None else "weight"
+            weight_dict = state[key]
         stripped = {}
         for k, v in weight_dict.items():
             if k.startswith("module."):
@@ -162,6 +186,112 @@ class Model:
 
 
 def create_model(args):
+    state = torch.load(args.checkpoint, map_location="cpu")
+    state_dict = _extract_state_dict(state)
+    _maybe_override_qwen_eval_args_from_checkpoint(args, state_dict)
     model = Model(args)
-    model.load_pretrained_weights()
+    model.load_pretrained_weights(weight_dict=state_dict)
     return model
+
+
+def _extract_state_dict(ckpt):
+    if isinstance(ckpt, dict):
+        state_dict = ckpt.get("ema_weight") or ckpt.get("weight")
+        if state_dict is None:
+            state_dict = ckpt.get("state_dict") or ckpt.get("model_state_dict")
+        if isinstance(state_dict, dict):
+            return state_dict
+    raise ValueError(
+        "Unable to find a valid state_dict in checkpoint. "
+        "Expected one of: ema_weight, weight, state_dict, model_state_dict."
+    )
+
+
+def _get_checkpoint_lora_summary(state_dict):
+    lora_keys = [key for key in state_dict if ".lora_A." in key or ".lora_B." in key]
+    has_vision_lora = any(".visual." in key for key in lora_keys)
+    has_llm_lora = any(".language_model." in key for key in lora_keys)
+    return {"any": bool(lora_keys), "vision": has_vision_lora, "llm": has_llm_lora}
+
+
+def _get_checkpoint_embedding_weight(state_dict):
+    embedding_weight = state_dict.get("encoder.vis_proj.weight")
+    if embedding_weight is not None:
+        return embedding_weight
+    for key, value in state_dict.items():
+        if key.startswith("encoder.multiscale_fuser.projections.") and key.endswith(".weight"):
+            return value
+    return None
+
+
+def _checkpoint_uses_multiscale(state_dict):
+    return any(key.startswith("encoder.multiscale_fuser.") for key in state_dict)
+
+
+def _maybe_override_qwen_eval_args_from_checkpoint(args, state_dict):
+    if args.model_type not in {
+        "qwen_flower_actor_3d",
+        "qwen_flower_actor_3d_stagewise",
+        "qwen_flower_actor_3d_grounding_cond",
+        "qwen_flower_actor_3d_grounding_cond_llm_visual",
+        "qwen_flower_actor_3d_grounding_cond_qwen3d",
+        "qwen_flower_actor_3d_grounding_pred",
+        "qwen_pi0_llm_actor_3d",
+        "qwen_pi05_llm_actor_3d",
+        "qwen_dualexpert_3dfa_actor",
+    }:
+        return
+
+    embedding_weight = _get_checkpoint_embedding_weight(state_dict)
+    if embedding_weight is not None:
+        ckpt_embedding_dim = int(embedding_weight.shape[0])
+        if args.embedding_dim != ckpt_embedding_dim:
+            print(
+                f"Overriding embedding_dim from checkpoint: "
+                f"{args.embedding_dim} -> {ckpt_embedding_dim}"
+            )
+            args.embedding_dim = ckpt_embedding_dim
+
+    ckpt_uses_multiscale = _checkpoint_uses_multiscale(state_dict)
+    requested_multiscale = bool(getattr(args, "use_multiscale", False))
+    if ckpt_uses_multiscale and not requested_multiscale:
+        print("Checkpoint uses multiscale vision fusion; enabling use_multiscale for evaluation.")
+        args.use_multiscale = True
+    elif requested_multiscale and not ckpt_uses_multiscale:
+        print("Checkpoint does not use multiscale vision fusion; disabling use_multiscale for evaluation.")
+        args.use_multiscale = False
+
+    lora_summary = _get_checkpoint_lora_summary(state_dict)
+    requested_vision_lora = (
+        getattr(args, "vision_lora_rank", 0) > 0
+        and getattr(args, "vision_lora_num_layers", 0) > 0
+    )
+    requested_llm_lora = (
+        getattr(args, "llm_lora_rank", 0) > 0
+        and getattr(args, "llm_lora_num_layers", 0) > 0
+    )
+    if (requested_vision_lora or requested_llm_lora) and not lora_summary["any"]:
+        print("Checkpoint has no LoRA weights; disabling requested LoRA settings for evaluation.")
+        args.vision_lora_rank = 0
+        args.vision_lora_num_layers = 0
+        args.llm_lora_rank = 0
+        args.llm_lora_num_layers = 0
+        return
+
+    if lora_summary["vision"] and not requested_vision_lora:
+        raise ValueError(
+            "Checkpoint contains vision LoRA weights, but evaluation did not enable matching vision LoRA args. "
+            "Please pass the matching vision_lora_* arguments used during training."
+        )
+    if lora_summary["llm"] and not requested_llm_lora:
+        raise ValueError(
+            "Checkpoint contains LLM LoRA weights, but evaluation did not enable matching llm_lora_* args."
+        )
+    if requested_vision_lora and not lora_summary["vision"] and lora_summary["any"]:
+        raise ValueError(
+            "Evaluation requested vision LoRA, but the checkpoint does not contain vision LoRA weights."
+        )
+    if requested_llm_lora and not lora_summary["llm"] and lora_summary["any"]:
+        raise ValueError(
+            "Evaluation requested LLM LoRA, but the checkpoint does not contain LLM LoRA weights."
+        )

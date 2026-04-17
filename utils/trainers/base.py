@@ -277,9 +277,9 @@ class BaseTrainTester:
             self.args.lr_scheduler, optimizer, self.args.train_iters
         )
         # GradScaler is only needed for float16 autocast. This trainer uses bfloat16.
-        scaler = torch.GradScaler(enabled=False)  # NOTE: for 3dfavla
-        #from torch.cuda.amp import GradScaler  # NOTE: for flowervla
-        #scaler = GradScaler()  # NOTE: for flowervla
+        #scaler = torch.GradScaler(enabled=False)  # NOTE: for 3dfavla
+        from torch.cuda.amp import GradScaler  # NOTE: for flowervla
+        scaler = GradScaler()  # NOTE: for flowervla
 
         # Move model to devices
         if torch.cuda.is_available():
@@ -291,7 +291,10 @@ class BaseTrainTester:
             model,
             device_ids=[self.args.local_rank],
             broadcast_buffers=False,
-            find_unused_parameters=False
+            # Some policy variants have conditionally active branches (e.g.,
+            # optional grounding inputs), so parameters may be unused on a
+            # given step. Keep this configurable and default to True.
+            find_unused_parameters=getattr(self.args, "find_unused_parameters", True),
         )
 
         # Initialize EMA copy only when enabled to avoid duplicating model memory.
@@ -419,6 +422,14 @@ class BaseTrainTester:
         grounding_3d = None
         if "3d_contact_point" in sample and sample["3d_contact_point"] is not None:
             grounding_3d = sample["3d_contact_point"].cuda(non_blocking=True).float()
+        model_type = getattr(self.args, "model_type", "")
+        if "grounding_cond" in model_type and grounding_3d is None:
+            raise ValueError(
+                f"Model type `{model_type}` requires `3d_contact_point` in each batch, "
+                f"but the current dataset `{self.args.dataset}` did not provide it. "
+                "Use a contact-point dataset such as `CalvinContact` / "
+                "`CalvinContact10th`, or switch to a non-grounding model type."
+            )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = model(
                 action, action_mask, rgbs, rgb2d, pcds, instr, prop,
