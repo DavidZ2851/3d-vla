@@ -209,6 +209,19 @@ class Model:
         print(f'Loading weights from {self.args.checkpoint}')
         self.policy.load_state_dict(model_weights, strict=True)
 
+    def _build_eval_grounding_kwargs(self, batch_size, device):
+        """Mirror training-time dropped-grounding behavior at online eval."""
+        if self.args.model_type != "flower_actor_3d_grounding_cond":
+            return {}
+        return {
+            "grounding_3d": torch.zeros(
+                batch_size, 3, device=device, dtype=torch.float32
+            ),
+            "grounding_keep_mask": torch.zeros(
+                batch_size, device=device, dtype=torch.bool
+            ),
+        }
+
     @torch.no_grad()
     def preprocess(self, obs, env):
         real_proprio = self.preprocessor.process_actions(
@@ -268,6 +281,10 @@ class Model:
                 instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
 
         # Forward pass
+        grounding_kwargs = self._build_eval_grounding_kwargs(
+            batch_size=1,
+            device=device,
+        )
         trajectory = self.policy(
             None,
             trajectory_mask,  # (1, T, 1 or pad to 2)
@@ -278,6 +295,7 @@ class Model:
             obs['proprio'],  # (1, nhist, 1 or pad to 2, 7)
             run_inference=True,
             instr_mask=instr_mask,
+            **grounding_kwargs,
         ).view(1, self.args.pred_len, 1, 7)  # (1, T, nhand=1 or pad to 2, 7)  # NOTE: if pad to bimanual: ).view(1, self.args.pred_len, 2, 7)
         trajectory = trajectory.data.cpu().numpy()[:,:,0,:]  # (1, T, 7)
         trajectory[..., -1] = 2 * (trajectory[..., -1] >= 0.5).astype(int) - 1  # openness

@@ -66,7 +66,8 @@ class GroundingCondTransformerHead(TransformerHead):
                 rgb3d_feats, rgb3d_pos, rgb2d_feats, rgb2d_pos,
                 instr_feats, instr_pos, proprio_feats,
                 fps_scene_feats, fps_scene_pos, valid_mask=None,
-                grounding_feats=None, grounding_pos=None):
+                grounding_feats=None, grounding_pos=None,
+                grounding_key_padding_mask=None):
         """
         Extra args vs TransformerHead.forward:
             grounding_feats: (B, 1, F) or None
@@ -116,9 +117,21 @@ class GroundingCondTransformerHead(TransformerHead):
         # --- build context, optionally injecting grounding token ---
         context_feats = torch.cat((rgb3d_feats, instr_feats), dim=1)
         context_pos = torch.cat((rgb3d_pos, instr_pos), dim=1)
+        context_key_padding_mask = None
         if grounding_feats is not None and grounding_pos is not None:
             context_feats = torch.cat((context_feats, grounding_feats), dim=1)
             context_pos = torch.cat((context_pos, grounding_pos), dim=1)
+            if grounding_key_padding_mask is not None:
+                prefix_mask = torch.zeros(
+                    context_feats.shape[0],
+                    context_feats.shape[1] - grounding_key_padding_mask.shape[1],
+                    dtype=torch.bool,
+                    device=context_feats.device,
+                )
+                context_key_padding_mask = torch.cat(
+                    (prefix_mask, grounding_key_padding_mask.to(dtype=torch.bool)),
+                    dim=1,
+                )
 
         # --- 3D RoPE ---
         rel_traj_pos = self.relative_pe_layer(traj_xyz)
@@ -130,6 +143,7 @@ class GroundingCondTransformerHead(TransformerHead):
             seq0=context_feats,
             seq_token_mask=token_mask_float,
             seq_token_mask_bool=token_mask_bool,
+            seq0_key_padding_mask=context_key_padding_mask,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,
@@ -141,11 +155,13 @@ class GroundingCondTransformerHead(TransformerHead):
             traj_feats, context_feats, rel_traj_pos, rel_scene_pos,
             time_embs, traj_feats.shape[1],
             token_mask_float=token_mask_float, token_mask_bool=token_mask_bool,
+            seq0_key_padding_mask=context_key_padding_mask,
         )
         position, position_features = self.predict_pos(
             traj_feats, context_feats, rel_traj_pos, rel_scene_pos,
             time_embs, traj_feats.shape[1],
             token_mask_float=token_mask_float, token_mask_bool=token_mask_bool,
+            seq0_key_padding_mask=context_key_padding_mask,
         )
         openess = self.openess_predictor(position_features)
 
@@ -257,6 +273,7 @@ class QwenFlowerActor3DGroundingCond(BaseDenoiseActor):
         # Transient storage used to thread grounding_3d into encode_inputs
         # without changing the compute_loss / compute_trajectory signatures.
         self._pending_grounding_3d = None
+        self._pending_grounding_keep_mask = None
 
     def forward(
         self,
@@ -271,10 +288,12 @@ class QwenFlowerActor3DGroundingCond(BaseDenoiseActor):
         instr_mask=None,
         instr_lens=None,
         grounding_3d=None,
+        grounding_keep_mask=None,
         **kwargs,
     ):
         """Identical to BaseDenoiseActor.forward but accepts grounding_3d."""
         self._pending_grounding_3d = grounding_3d
+        self._pending_grounding_keep_mask = grounding_keep_mask
         try:
             return super().forward(
                 gt_trajectory, trajectory_mask, rgb3d, rgb2d, pcd,
@@ -285,6 +304,7 @@ class QwenFlowerActor3DGroundingCond(BaseDenoiseActor):
             )
         finally:
             self._pending_grounding_3d = None
+            self._pending_grounding_keep_mask = None
 
     def encode_inputs(
         self,
@@ -303,14 +323,19 @@ class QwenFlowerActor3DGroundingCond(BaseDenoiseActor):
             instr_lens=instr_lens,
         )
         grounding_3d = self._pending_grounding_3d
+        grounding_keep_mask = self._pending_grounding_keep_mask
         if grounding_3d is not None:
             # grounding_feats: (B, 1, F)  grounding_pos: (B, 1, 3)
             grounding_feats = self.grounding_proj(grounding_3d).unsqueeze(1)
             grounding_pos = grounding_3d.unsqueeze(1)
+            grounding_key_padding_mask = None
+            if grounding_keep_mask is not None:
+                grounding_key_padding_mask = (~grounding_keep_mask.bool()).view(-1, 1)
         else:
             grounding_feats = None
             grounding_pos = None
-        return base_result + (grounding_feats, grounding_pos)
+            grounding_key_padding_mask = None
+        return base_result + (grounding_feats, grounding_pos, grounding_key_padding_mask)
 
     def policy_forward_pass(self, trajectory, timestep, fixed_inputs, valid_mask=None):
         (
@@ -320,7 +345,7 @@ class QwenFlowerActor3DGroundingCond(BaseDenoiseActor):
             instr_feats, instr_pos,
             proprio_feats,
             fps_scene_feats, fps_scene_pos,
-            grounding_feats, grounding_pos,
+            grounding_feats, grounding_pos, grounding_key_padding_mask,
         ) = fixed_inputs
 
         trajectory_feats = self.traj_encoder(trajectory)
@@ -347,6 +372,7 @@ class QwenFlowerActor3DGroundingCond(BaseDenoiseActor):
             valid_mask=valid_mask,
             grounding_feats=grounding_feats,
             grounding_pos=grounding_pos,
+            grounding_key_padding_mask=grounding_key_padding_mask,
         )
 
 

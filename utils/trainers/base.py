@@ -390,6 +390,32 @@ class BaseTrainTester:
     def prepare_batch(self, sample, augment=False):
         pass  # implement in children
 
+    def _run_model_forward(
+        self,
+        model,
+        action,
+        action_mask,
+        rgbs,
+        rgb2d,
+        pcds,
+        instr,
+        prop,
+        training,
+        instr_mask=None,
+        instr_lens=None,
+        grounding_3d=None,
+        grounding_keep_mask=None,
+    ):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            return model(
+                action, action_mask, rgbs, rgb2d, pcds, instr, prop,
+                run_inference=not training,
+                instr_mask=instr_mask,
+                instr_lens=instr_lens,
+                grounding_3d=grounding_3d,
+                grounding_keep_mask=grounding_keep_mask,
+            )
+
     def _model_forward(self, model, sample, training=True):
         action, action_mask, rgbs, rgb2d, pcds, instr, prop = self.prepare_batch(
             sample, augment=training
@@ -430,15 +456,35 @@ class BaseTrainTester:
                 "Use a contact-point dataset such as `CalvinContact` / "
                 "`CalvinContact10th`, or switch to a non-grounding model type."
             )
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model(
-                action, action_mask, rgbs, rgb2d, pcds, instr, prop,
-                run_inference=not training,
-                instr_mask=instr_mask,
-                instr_lens=instr_lens,
-                grounding_3d=grounding_3d,
+
+        dropout_prob = float(getattr(self.args, "grounding_dropout_prob", 0.0))
+        should_dropout_grounding = (
+            training
+            and "grounding_cond" in model_type
+            and grounding_3d is not None
+            and dropout_prob > 0.0
+        )
+        grounding_keep_mask = None
+        if should_dropout_grounding:
+            grounding_keep_mask = (
+                torch.rand(action.shape[0], device=grounding_3d.device) >= dropout_prob
             )
-        return out  # loss if training, else action
+
+        return self._run_model_forward(
+            model,
+            action,
+            action_mask,
+            rgbs,
+            rgb2d,
+            pcds,
+            instr,
+            prop,
+            training,
+            instr_mask=instr_mask,
+            instr_lens=instr_lens,
+            grounding_3d=grounding_3d,
+            grounding_keep_mask=grounding_keep_mask,
+        )  # loss if training, else action
 
     def train_one_step(self, model, optimizer, scaler, lr_scheduler, sample):
         """Run a single training step."""

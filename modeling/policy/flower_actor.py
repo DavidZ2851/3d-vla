@@ -131,6 +131,7 @@ class FlowerActor3DGroundingCond(FlowerActor3D):
             nn.Linear(embedding_dim, embedding_dim)
         )
         self._pending_grounding_3d = None
+        self._pending_grounding_keep_mask = None
 
     def forward(
         self,
@@ -145,9 +146,11 @@ class FlowerActor3DGroundingCond(FlowerActor3D):
         instr_mask=None,
         instr_lens=None,
         grounding_3d=None,
+        grounding_keep_mask=None,
         **kwargs,
     ):
         self._pending_grounding_3d = grounding_3d
+        self._pending_grounding_keep_mask = grounding_keep_mask
         try:
             return super().forward(
                 gt_trajectory,
@@ -164,6 +167,7 @@ class FlowerActor3DGroundingCond(FlowerActor3D):
             )
         finally:
             self._pending_grounding_3d = None
+            self._pending_grounding_keep_mask = None
 
     def encode_inputs(
         self,
@@ -186,16 +190,21 @@ class FlowerActor3DGroundingCond(FlowerActor3D):
         )
 
         grounding_3d = self._pending_grounding_3d
+        grounding_keep_mask = self._pending_grounding_keep_mask
         if grounding_3d is not None:
             if grounding_3d.ndim == 3 and grounding_3d.shape[1] == 1:
                 grounding_3d = grounding_3d.squeeze(1)
             grounding_feats = self.grounding_proj(grounding_3d).unsqueeze(1)
             grounding_pos = grounding_3d.unsqueeze(1)
+            grounding_key_padding_mask = None
+            if grounding_keep_mask is not None:
+                grounding_key_padding_mask = (~grounding_keep_mask.bool()).view(-1, 1)
         else:
             grounding_feats = None
             grounding_pos = None
+            grounding_key_padding_mask = None
 
-        return base_result + (grounding_feats, grounding_pos)
+        return base_result + (grounding_feats, grounding_pos, grounding_key_padding_mask)
 
     def policy_forward_pass(self, trajectory, timestep, fixed_inputs, valid_mask=None):
         (
@@ -205,7 +214,7 @@ class FlowerActor3DGroundingCond(FlowerActor3D):
             instr_feats, instr_pos,
             proprio_feats,
             fps_scene_feats, fps_scene_pos,
-            grounding_feats, grounding_pos
+            grounding_feats, grounding_pos, grounding_key_padding_mask
         ) = fixed_inputs
         trajectory_feats = self.traj_encoder(trajectory)
 
@@ -232,6 +241,7 @@ class FlowerActor3DGroundingCond(FlowerActor3D):
             valid_mask=valid_mask,
             grounding_feats=grounding_feats,
             grounding_pos=grounding_pos,
+            grounding_key_padding_mask=grounding_key_padding_mask,
         )
 
 
@@ -461,12 +471,14 @@ class TransformerHead(nn.Module):
         return time_feats + curr_gripper_feats
 
     def predict_pos(self, traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
-                    time_embs, traj_len, token_mask_float=None, token_mask_bool=None):
+                    time_embs, traj_len, token_mask_float=None, token_mask_bool=None,
+                    seq0_key_padding_mask=None):
         position_features = self.position_self_attn(
             seq=traj_feats,
             seq0=rgb3d_feats,
             seq_token_mask=token_mask_float,
             seq_token_mask_bool=token_mask_bool,
+            seq0_key_padding_mask=seq0_key_padding_mask,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,
@@ -478,12 +490,14 @@ class TransformerHead(nn.Module):
         return position, position_features
 
     def predict_rot(self, traj_feats, rgb3d_feats, rel_traj_pos, rel_scene_pos,
-                    time_embs, traj_len, token_mask_float=None, token_mask_bool=None):
+                    time_embs, traj_len, token_mask_float=None, token_mask_bool=None,
+                    seq0_key_padding_mask=None):
         rotation_features = self.rotation_self_attn(
             seq=traj_feats,
             seq0=rgb3d_feats,
             seq_token_mask=token_mask_float,
             seq_token_mask_bool=token_mask_bool,
+            seq0_key_padding_mask=seq0_key_padding_mask,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,
@@ -502,7 +516,8 @@ class GroundingCondTransformerHead(TransformerHead):
                 rgb3d_feats, rgb3d_pos, rgb2d_feats, rgb2d_pos,
                 instr_feats, instr_pos, proprio_feats,
                 fps_scene_feats, fps_scene_pos, valid_mask=None,
-                grounding_feats=None, grounding_pos=None):
+                grounding_feats=None, grounding_pos=None,
+                grounding_key_padding_mask=None):
         B, traj_len, nhand, _ = trajectory.shape
 
         if nhand > 1 and self.hand_embed is not None:
@@ -545,9 +560,21 @@ class GroundingCondTransformerHead(TransformerHead):
 
         context_feats = torch.cat((rgb3d_feats, instr_feats), dim=1)
         context_pos = torch.cat((rgb3d_pos, instr_pos), dim=1)
+        context_key_padding_mask = None
         if grounding_feats is not None and grounding_pos is not None:
             context_feats = torch.cat((context_feats, grounding_feats), dim=1)
             context_pos = torch.cat((context_pos, grounding_pos), dim=1)
+            if grounding_key_padding_mask is not None:
+                prefix_mask = torch.zeros(
+                    context_feats.shape[0],
+                    context_feats.shape[1] - grounding_key_padding_mask.shape[1],
+                    dtype=torch.bool,
+                    device=context_feats.device,
+                )
+                context_key_padding_mask = torch.cat(
+                    (prefix_mask, grounding_key_padding_mask.to(dtype=torch.bool)),
+                    dim=1,
+                )
 
         rel_traj_pos = self.relative_pe_layer(traj_xyz)
         rel_scene_pos = self.relative_pe_layer(context_pos)
@@ -557,6 +584,7 @@ class GroundingCondTransformerHead(TransformerHead):
             seq0=context_feats,
             seq_token_mask=token_mask_float,
             seq_token_mask_bool=token_mask_bool,
+            seq0_key_padding_mask=context_key_padding_mask,
             seq_pos_0=rel_traj_pos,
             seq0_pos=rel_scene_pos,
             seq_pos_1=rel_traj_pos,
@@ -566,12 +594,16 @@ class GroundingCondTransformerHead(TransformerHead):
         rotation = self.predict_rot(
             traj_feats, context_feats, rel_traj_pos, rel_scene_pos,
             time_embs, traj_feats.shape[1],
-            token_mask_float=token_mask_float, token_mask_bool=token_mask_bool
+            token_mask_float=token_mask_float,
+            token_mask_bool=token_mask_bool,
+            seq0_key_padding_mask=context_key_padding_mask,
         )
         position, position_features = self.predict_pos(
             traj_feats, context_feats, rel_traj_pos, rel_scene_pos,
             time_embs, traj_feats.shape[1],
-            token_mask_float=token_mask_float, token_mask_bool=token_mask_bool
+            token_mask_float=token_mask_float,
+            token_mask_bool=token_mask_bool,
+            seq0_key_padding_mask=context_key_padding_mask,
         )
         openess = self.openess_predictor(position_features)
 

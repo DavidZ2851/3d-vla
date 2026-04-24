@@ -92,6 +92,9 @@ def parse_arguments():
         ('grounding_loss_weight', float, 10.0),
         ('grounding_loss_weight_hold_iters', int, 0),  # 0 = fixed weight; else hold --grounding_loss_weight for this many steps
         ('grounding_loss_weight_final', float, 0.1),
+        # Training-only conditioning dropout for grounding-conditioned policies.
+        # Samples dropped here are trained exactly like inference: no grounding token.
+        ('grounding_dropout_prob', float, 0.0),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])

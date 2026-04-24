@@ -1,11 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=eval_xiaomi_calvin
-#SBATCH --mem=200G
+#SBATCH --mem=48G
 #SBATCH --gres=gpu:1
 #SBATCH --time=48:00:00
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/ziyinx/logs/%x_%j.out
 #SBATCH --error=/data/user_data/ziyinx/logs/%x_%j.err
+
+exec > >(tee -a "eval_xiaomi.log") 2>&1
 
 merged_config_file=online_evaluation_calvin/configs/merged_config_val_abc_d.yaml
 task_config_file=online_evaluation_calvin/configs/new_playtable_tasks.yaml

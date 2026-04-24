@@ -86,6 +86,19 @@ class Model:
         # Keep strict=False for compatibility across model variants.
         self.policy.load_state_dict(stripped, strict=False)
 
+    def _build_eval_grounding_kwargs(self, batch_size, device):
+        """Mirror training-time dropped-grounding behavior at online eval."""
+        if self.args.model_type != "flower_actor_3d_grounding_cond":
+            return {}
+        return {
+            "grounding_3d": torch.zeros(
+                batch_size, 3, device=device, dtype=torch.float32
+            ),
+            "grounding_keep_mask": torch.zeros(
+                batch_size, device=device, dtype=torch.bool
+            ),
+        }
+
     def _extract_proprio(self, obs_list):
         proprio_list = []  # (B, proprio_dim), one per parallel env
         for obs in obs_list:
@@ -168,6 +181,10 @@ class Model:
                 instr = tok_out.input_ids.cuda(non_blocking=True)
                 instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
 
+        grounding_kwargs = self._build_eval_grounding_kwargs(
+            batch_size=batch_size,
+            device=self.args.device,
+        )
         trajectory = self.policy(
             None,
             traj_mask,
@@ -178,6 +195,7 @@ class Model:
             obs_dict["proprio"],
             run_inference=True,
             instr_mask=instr_mask,
+            **grounding_kwargs,
         ).view(batch_size, self.args.prediction_len, 1, action_dim)
 
         # Use first step action for online control.

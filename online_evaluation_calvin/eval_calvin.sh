@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=eval_calvin_cond_llm_visual
+#SBATCH --job-name=eval_calvin_flower_3dfavla
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1
-#SBATCH --time=3:30:00
+#SBATCH --time=7:00:00
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/ziyinx/logs/%x_%j.out
 #SBATCH --error=/data/user_data/ziyinx/logs/%x_%j.err
@@ -17,16 +17,16 @@ ann_config_file=online_evaluation_calvin/configs/new_playtable_validation.yaml
 
 # Things you may want to change if you train/eval a new model
 seed=0
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/qwen_flower_actor_3d_grounding_cond_qwen3d-CalvinContact10th-C1024-B16-lr3e-5-tristage_flower-H1-rectified_flow-qwen3vl-finetuned_false-job7172546/60000.pth
-base_log_dir=eval_logs/CALVIN/grounding_cond_qwen3d/
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/flower_actor_3d_grounding_cond-CalvinContact10th-C1024-B8-lr2e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-job7218660/last.pth
+base_log_dir=eval_logs/CALVIN/flower_3dfavla_cond/
 save_video=false
 
 # Things you can change if you customize the model architecture
-model_type=qwen_flower_actor_3d_grounding_cond_qwen3d
+model_type=flower_actor_3d_grounding_cond
 pred_len=10
 pre_tokenize=true
 custom_img_size=224
-backbone=qwen3vl
+backbone=florence2
 num_finetune_vision_layers=24
 vision_lora_rank=0
 vision_lora_alpha=32

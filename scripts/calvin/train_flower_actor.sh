@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=calvin_flower_cond
+#SBATCH --job-name=calvin_flower_cond0.6
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -40,6 +40,7 @@ wd=0.05
 train_iters=60000
 use_compile=false
 use_ema=true
+grounding_dropout_prob=0.6
 
 # Model arguments, change (some of) these for new architectures
 # flower_actor_3d: no contact-point conditioning
@@ -68,7 +69,7 @@ denoise_timesteps=5
 denoise_model=rectified_flow
 
 main_dir=calvin
-run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone
+run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
 # train from scratch:
 checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
 finetune=false
@@ -125,4 +126,5 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --finetune $finetune \
     --num_finetune_vision_layers $num_finetune_vision_layers \
     --vision_lr_scale $vision_lr_scale \
-    --projector_lr_scale $projector_lr_scale
+    --projector_lr_scale $projector_lr_scale \
+    --grounding_dropout_prob $grounding_dropout_prob
