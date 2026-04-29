@@ -101,6 +101,8 @@ class MotionExpertFeatureOutput:
     visual_grid: torch.Tensor
     visual_tokens: torch.Tensor
     text_tokens: torch.Tensor
+    visual_grid_hw: Tuple[int, int]
+    visual_patch_size: int
 
 
 QwenFeatureOutput = MotionExpertFeatureOutput
@@ -143,8 +145,12 @@ class QwenTraceFeatureExtractor(nn.Module):
     def text_token_dim(self) -> int:
         return int(self.backbone.llm_hidden_size)
 
+    @property
+    def visual_patch_size(self) -> int:
+        return int(self.backbone.patch_size)
+
     def estimate_visual_token_count(self, input_height: int, input_width: int) -> int:
-        patch_size = int(self.backbone.patch_size)
+        patch_size = self.visual_patch_size
         return (input_height // patch_size) * (input_width // patch_size)
 
     def _visual_dtype(self) -> torch.dtype:
@@ -194,6 +200,8 @@ class QwenTraceFeatureExtractor(nn.Module):
             visual_grid=pre_merge_visual,
             visual_tokens=visual_tokens,
             text_tokens=text_tokens,
+            visual_grid_hw=(int(pre_merge_visual.shape[-3]), int(pre_merge_visual.shape[-2])),
+            visual_patch_size=self.visual_patch_size,
         )
 
 
@@ -255,9 +263,13 @@ class FlorenceTraceFeatureExtractor(nn.Module):
     def text_token_dim(self) -> int:
         return self.hidden_dim
 
+    @property
+    def visual_patch_size(self) -> int:
+        return 8
+
     def estimate_visual_token_count(self, input_height: int, input_width: int) -> int:
-        h_feat = 2 * math.ceil(int(input_height) / 32.0)
-        w_feat = 2 * math.ceil(int(input_width) / 32.0)
+        h_feat = math.ceil(int(input_height) / float(self.visual_patch_size))
+        w_feat = math.ceil(int(input_width) / float(self.visual_patch_size))
         return h_feat * w_feat
 
     def _backbone_dtype(self) -> torch.dtype:
@@ -354,4 +366,6 @@ class FlorenceTraceFeatureExtractor(nn.Module):
             visual_grid=visual_grid,
             visual_tokens=visual_tokens,
             text_tokens=text_tokens,
+            visual_grid_hw=(int(visual_grid.shape[-3]), int(visual_grid.shape[-2])),
+            visual_patch_size=self.visual_patch_size,
         )

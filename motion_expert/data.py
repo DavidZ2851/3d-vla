@@ -15,6 +15,9 @@ class MotionExpertBatch:
     text_token_ids: Optional[torch.Tensor] = None
     text_attention_mask: Optional[torch.Tensor] = None
     text_valid_lens: Optional[torch.Tensor] = None
+    depth: Optional[torch.Tensor] = None
+    intrinsics: Optional[torch.Tensor] = None
+    extrinsics: Optional[torch.Tensor] = None
     query_uv: Optional[torch.Tensor] = None
     query_world_xyz: Optional[torch.Tensor] = None
     traj_3d_xyz: Optional[torch.Tensor] = None
@@ -43,12 +46,16 @@ def build_regular_query_uv(
     device=None,
     dtype=torch.float32,
 ) -> torch.Tensor:
-    """Build a regular query grid in UV order [u, v]."""
+    """Build a regular query grid in UV order [u, v].
+
+    When normalized=True, the returned coordinates use the grid_sample convention
+    [-1, 1].
+    """
     height, width = int(image_hw[0]), int(image_hw[1])
 
     if normalized:
-        xs = (torch.arange(grid_size, device=device, dtype=dtype) + 0.5) / grid_size
-        ys = (torch.arange(grid_size, device=device, dtype=dtype) + 0.5) / grid_size
+        xs = ((torch.arange(grid_size, device=device, dtype=dtype) + 0.5) / grid_size) * 2.0 - 1.0
+        ys = ((torch.arange(grid_size, device=device, dtype=dtype) + 0.5) / grid_size) * 2.0 - 1.0
     else:
         xs = (torch.arange(grid_size, device=device, dtype=dtype) + 0.5) * (
             width / float(grid_size)

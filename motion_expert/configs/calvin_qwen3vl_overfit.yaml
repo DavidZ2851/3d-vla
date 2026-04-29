@@ -1,0 +1,79 @@
+model:
+  backbone_type: qwen
+  grid_size: 20
+  future_steps: 15
+  decoder_type: sparse_factorized
+  knn_k: 16
+  flow_timesteps: 100
+  use_motion_weighted_loss: true
+  motion_weight_tau: 0.005
+  motion_weight_temp: 5.0
+  motion_weight_gamma: 1.0
+  motion_weight_static_floor: 0.05
+  input_height: 224
+  input_width: 224
+  text_max_length: 128
+  image_pad_value: 0.5
+  query_uv_is_normalized: true
+  dropout: 0.1
+  use_calvin_percentile_normalization: true
+  sparse_decoder:
+    hidden_dim: 512
+    point_encoder_layers: 6
+    decoder_layers: 8
+    num_attention_heads: 8
+    mlp_ratio: 4
+  qwen:
+    model_name_or_path: /home/ziyinx/Xiaomi-Robotics-0-Pretrain
+    freeze_backbone: true
+    gradient_checkpointing: false
+    vision_lora_rank: 0
+    llm_lora_rank: 0
+
+train:
+  output_dir: /data/user_data/ziyinx/datasets/train_logs/motion_expert/calvin_qwen3vl_overfit
+  device: cuda
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  lr: 1.0e-4
+  weight_decay: 5.0e-3
+  clip_grad_norm: 1.0
+  mixed_precision: true
+  train_iters: 2000
+  train_log_every: 20
+  train_eval_every: 100
+  train_eval_loss_batches: 2
+  train_eval_generation_batches: 1
+  save_every_iters: 200
+  val_every_iters: 200
+  val_loss_batches: 2
+  val_num_inference_steps: 20
+  val_generation_batches: 1
+  guidance_scale: 1.0
+  use_calvin_normalization: true
+  normalization_stats_path: /data/user_data/ziyinx/analogical_manipulation_clean/datasets/calvin_motion_normalization_stats.json
+  normalization_chunk_size: 512
+  wandb:
+    enabled: true
+    project: motion-expert
+    name: calvin-qwen3vl-overfit
+    mode: offline
+    tags:
+      - calvin
+      - motion_expert
+      - qwen3vl
+      - overfit
+
+data:
+  train_zarr: /data/user_data/ziyinx/datasets/zarr_datasets/calvin_motion_zarr/train_rechunked8.zarr
+  val_zarr: /data/user_data/ziyinx/datasets/zarr_datasets/calvin_motion_zarr/train_rechunked8.zarr
+  instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/train_instructions.json
+  train_instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/train_instructions.json
+  val_instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/train_instructions.json
+  instruction_id_key: instr_id
+  mem_limit_gb: 16.0
+  traj_3d_xyz_is_delta: true
+  max_train_samples: 16
+  max_val_samples: 16

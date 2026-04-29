@@ -2,7 +2,15 @@ from .config import (
     FlorenceFeatureExtractorConfig,
     MotionExpertConfig,
     QwenFeatureExtractorConfig,
+    SparseMotionDecoderConfig,
     TraceGenDecoderConfig,
+)
+from .compute_calvin_normalization_stats import (
+    DEFAULT_CALVIN_SOURCE_ROOT,
+    compute_calvin_normalization_stats,
+    extract_calvin_normalization_tensors,
+    load_calvin_normalization_stats,
+    save_calvin_normalization_stats,
 )
 from .data import MotionExpertBatch, build_regular_query_uv
 from .extractor import (
@@ -27,14 +35,20 @@ __all__ = [
     "MotionExpertFeatureOutput",
     "MotionExpertPipeline",
     "MotionExpertTrainer",
+    "DEFAULT_CALVIN_SOURCE_ROOT",
     "FlorenceTraceFeatureExtractor",
     "QwenFeatureExtractorConfig",
     "QwenFeatureOutput",
     "QwenTraceFeatureExtractor",
+    "SparseMotionDecoderConfig",
     "TraceGenDecoderConfig",
     "build_regular_query_uv",
     "build_default_inference_scheduler",
+    "compute_calvin_normalization_stats",
     "compute_motion_expert_metrics",
+    "extract_calvin_normalization_tensors",
+    "load_calvin_normalization_stats",
+    "save_calvin_normalization_stats",
 ]
 
 try:
@@ -45,6 +59,7 @@ try:
         MotionExpertTextTokenizer,
         MotionExpertZarrDataset,
         compute_query_xyz_statistics,
+        compute_query_xyz_statistics_from_dataset,
     )
 except Exception:
     pass
@@ -57,5 +72,6 @@ else:
             "MotionExpertTextTokenizer",
             "MotionExpertZarrDataset",
             "compute_query_xyz_statistics",
+            "compute_query_xyz_statistics_from_dataset",
         ]
     )

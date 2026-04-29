@@ -1,15 +1,31 @@
 import argparse
+import datetime
 import json
 import os
 from pathlib import Path
+from typing import Dict, Optional
 
 import torch
+import torch.distributed as dist
 import yaml
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
+try:
+    import wandb
+except Exception:
+    wandb = None
+
+from .compute_calvin_normalization_stats import (
+    compute_calvin_normalization_stats,
+    extract_calvin_normalization_tensors,
+    load_calvin_normalization_stats,
+    save_calvin_normalization_stats,
+)
 from .config import (
     FlorenceFeatureExtractorConfig,
     MotionExpertConfig,
+    SparseMotionDecoderConfig,
     QwenFeatureExtractorConfig,
     TraceGenDecoderConfig,
 )
@@ -19,7 +35,13 @@ from .zarr_dataset import (
     MotionExpertCollator,
     MotionExpertQwenTokenizer,
     MotionExpertZarrDataset,
+    compute_calvin_zarr_normalization_stats,
     compute_query_xyz_statistics,
+    compute_query_xyz_statistics_from_dataset,
+)
+
+DEFAULT_CALVIN_NORMALIZATION_STATS_PATH = Path(
+    "/data/user_data/ziyinx/analogical_manipulation_clean/datasets/calvin_motion_normalization_stats.json"
 )
 
 
@@ -34,30 +56,142 @@ def _build_motion_expert_config(raw_cfg: dict) -> MotionExpertConfig:
     qwen_cfg = raw_cfg.get("qwen", {})
     florence_cfg = raw_cfg.get("florence", {})
     decoder_cfg = raw_cfg.get("decoder", {})
+    sparse_decoder_cfg = raw_cfg.get("sparse_decoder", {})
     return MotionExpertConfig(
         backbone_type=raw_cfg.get("backbone_type", "qwen"),
         grid_size=raw_cfg.get("grid_size", 20),
-        future_steps=raw_cfg.get("future_steps", 16),
+        future_steps=raw_cfg.get("future_steps", 15),
+        decoder_type=raw_cfg.get("decoder_type", "sparse_factorized"),
+        knn_k=raw_cfg.get("knn_k", 16),
+        flow_timesteps=raw_cfg.get("flow_timesteps", 100),
+        use_motion_weighted_loss=raw_cfg.get("use_motion_weighted_loss", True),
+        motion_weight_tau=raw_cfg.get("motion_weight_tau", 0.005),
+        motion_weight_temp=raw_cfg.get("motion_weight_temp", 5.0),
+        motion_weight_gamma=raw_cfg.get("motion_weight_gamma", 1.0),
+        motion_weight_static_floor=raw_cfg.get("motion_weight_static_floor", 0.05),
         input_height=raw_cfg.get("input_height", 384),
         input_width=raw_cfg.get("input_width", 640),
         text_max_length=raw_cfg.get("text_max_length", 128),
         image_pad_value=raw_cfg.get("image_pad_value", 0.5),
         query_uv_is_normalized=raw_cfg.get("query_uv_is_normalized", False),
         dropout=raw_cfg.get("dropout", 0.1),
+        use_calvin_percentile_normalization=raw_cfg.get(
+            "use_calvin_percentile_normalization",
+            False,
+        ),
         query_xyz_center=tuple(raw_cfg.get("query_xyz_center", [0.0, 0.0, 0.0])),
         query_xyz_scale=tuple(raw_cfg.get("query_xyz_scale", [1.0, 1.0, 1.0])),
         delta_range_xyz=tuple(raw_cfg.get("delta_range_xyz", [0.05, 0.05, 0.04])),
+        query_centered_xyz_center=tuple(raw_cfg.get("query_centered_xyz_center", [0.0, 0.0, 0.0])),
+        query_centered_xyz_scale=tuple(raw_cfg.get("query_centered_xyz_scale", [1.0, 1.0, 1.0])),
+        traj_delta_xyz_center=tuple(raw_cfg.get("traj_delta_xyz_center", [0.0, 0.0, 0.0])),
+        traj_delta_xyz_scale=tuple(raw_cfg.get("traj_delta_xyz_scale", [1.0, 1.0, 1.0])),
+        sparse_decoder=SparseMotionDecoderConfig(**sparse_decoder_cfg),
         qwen=QwenFeatureExtractorConfig(**qwen_cfg),
         florence=FlorenceFeatureExtractorConfig(**florence_cfg),
         decoder=TraceGenDecoderConfig(**decoder_cfg),
     )
 
 
+def _looks_like_calvin_source(*values: object) -> bool:
+    joined = " ".join(str(v) for v in values if v is not None).lower()
+    return "calvin" in joined
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train MotionExpert.")
     parser.add_argument("--config", type=str, required=True, help="YAML or JSON config.")
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint path.")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Load a checkpoint and run validation only.",
+    )
     return parser.parse_args()
+
+
+def _init_wandb(
+    raw_cfg: dict,
+    train_cfg: dict,
+    validate_only: bool = False,
+):
+    wandb_cfg = train_cfg.get("wandb", {})
+    enabled = bool(wandb_cfg.get("enabled", True))
+    mode = str(wandb_cfg.get("mode", os.environ.get("WANDB_MODE", "online"))).lower()
+    if not enabled or mode == "disabled" or wandb is None:
+        return None
+
+    output_dir = Path(train_cfg["output_dir"])
+    run_name = wandb_cfg.get("name") or output_dir.name
+    if validate_only:
+        run_name = f"{run_name}-val"
+
+    return wandb.init(
+        project=wandb_cfg.get("project", "motion-expert"),
+        name=run_name,
+        dir=str(wandb_cfg.get("dir", output_dir)),
+        mode=mode,
+        config=raw_cfg,
+        group=wandb_cfg.get("group"),
+        tags=wandb_cfg.get("tags"),
+        resume="allow",
+    )
+
+
+def _log_wandb_metrics(metrics: Dict[str, float], step: int) -> None:
+    if wandb is None or wandb.run is None or not metrics:
+        return
+    wandb.log(metrics, step=step)
+
+
+def _prefixed(metrics: Dict[str, float], prefix: str) -> Dict[str, float]:
+    return {f"{prefix}/{key}": value for key, value in metrics.items()}
+
+
+def _update_running_metrics(
+    totals: Dict[str, float],
+    metrics: Dict[str, float],
+) -> None:
+    for key, value in metrics.items():
+        totals[key] = totals.get(key, 0.0) + float(value)
+
+
+def _average_running_metrics(
+    totals: Dict[str, float],
+    count: int,
+) -> Dict[str, float]:
+    if count <= 0:
+        return {}
+    return {key: value / float(count) for key, value in totals.items()}
+
+
+def _is_distributed() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def _is_main_process() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _setup_distributed() -> tuple[torch.device, int, bool]:
+    distributed = _is_distributed()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if distributed:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=datetime.timedelta(hours=2),
+        )
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return device, local_rank, distributed
+
+
+def _barrier_if_distributed(distributed: bool) -> None:
+    if distributed and dist.is_initialized():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
 
 
 def main():
@@ -73,7 +207,8 @@ def main():
     if model_cfg.florence.model_name_or_path is not None:
         os.environ["FLORENCE2_MODEL_PATH"] = model_cfg.florence.model_name_or_path
 
-    device = torch.device(train_cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    device, local_rank, distributed = _setup_distributed()
+    is_main_process = _is_main_process()
     backbone_type = str(model_cfg.backbone_type).lower()
     tokenizer_model_path = (
         model_cfg.qwen.model_name_or_path
@@ -89,35 +224,49 @@ def main():
 
     train_dataset = MotionExpertZarrDataset(
         root=data_cfg["train_zarr"],
-        instructions_path=data_cfg["instructions_path"],
+        instructions_path=data_cfg.get("train_instructions_path", data_cfg["instructions_path"]),
         image_size=(model_cfg.input_height, model_cfg.input_width),
         instruction_id_key=data_cfg.get("instruction_id_key"),
         query_uv_is_normalized=model_cfg.query_uv_is_normalized,
         image_pad_value=model_cfg.image_pad_value,
         mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
+        traj_3d_xyz_is_delta=data_cfg.get("traj_3d_xyz_is_delta"),
+        max_samples=data_cfg.get("max_train_samples"),
     )
     val_dataset = None
     if data_cfg.get("val_zarr"):
         val_dataset = MotionExpertZarrDataset(
             root=data_cfg["val_zarr"],
-            instructions_path=data_cfg["instructions_path"],
+            instructions_path=data_cfg.get(
+                "val_instructions_path",
+                data_cfg.get("train_instructions_path", data_cfg["instructions_path"]),
+            ),
             image_size=(model_cfg.input_height, model_cfg.input_width),
             instruction_id_key=data_cfg.get("instruction_id_key"),
             query_uv_is_normalized=model_cfg.query_uv_is_normalized,
             image_pad_value=model_cfg.image_pad_value,
             mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
+            traj_3d_xyz_is_delta=data_cfg.get("traj_3d_xyz_is_delta"),
+            max_samples=data_cfg.get("max_val_samples"),
         )
+
+    train_sampler = None
+    if distributed:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(train_cfg.get("batch_size", 2)),
-        shuffle=True,
+        shuffle=train_sampler is None,
         num_workers=int(train_cfg.get("num_workers", 4)),
         pin_memory=bool(train_cfg.get("pin_memory", False)),
         collate_fn=collator,
+        sampler=train_sampler,
+        persistent_workers=bool(train_cfg.get("persistent_workers", False))
+        and int(train_cfg.get("num_workers", 4)) > 0,
     )
     val_loader = None
-    if val_dataset is not None:
+    if val_dataset is not None and is_main_process:
         val_loader = DataLoader(
             val_dataset,
             batch_size=int(train_cfg.get("batch_size", 2)),
@@ -125,23 +274,84 @@ def main():
             num_workers=int(train_cfg.get("num_workers", 4)),
             pin_memory=bool(train_cfg.get("pin_memory", False)),
             collate_fn=collator,
+            persistent_workers=bool(train_cfg.get("persistent_workers", False))
+            and int(train_cfg.get("num_workers", 4)) > 0,
         )
 
     pipeline = MotionExpertPipeline.from_backbone(model_cfg)
 
-    stats_path = Path(train_cfg.get("query_stats_path", Path(train_cfg["output_dir"]) / "query_xyz_stats.pt"))
-    if stats_path.exists():
-        stats = torch.load(stats_path, map_location="cpu")
-        query_center = stats["center"]
-        query_scale = stats["scale"]
-    else:
-        query_center, query_scale = compute_query_xyz_statistics(
-            [data_cfg["train_zarr"]],
-            mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
+    use_calvin_normalization = bool(
+        train_cfg.get(
+            "use_calvin_normalization",
+            _looks_like_calvin_source(
+                data_cfg.get("train_zarr"),
+                data_cfg.get("train_instructions_path", data_cfg.get("instructions_path")),
+            ),
         )
-        stats_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"center": query_center, "scale": query_scale}, stats_path)
-    pipeline.set_query_xyz_statistics(query_center, query_scale)
+    )
+    if use_calvin_normalization:
+        default_stats_path = (
+            DEFAULT_CALVIN_NORMALIZATION_STATS_PATH
+            if _looks_like_calvin_source(
+                data_cfg.get("train_zarr"),
+                data_cfg.get("train_instructions_path", data_cfg.get("instructions_path")),
+            )
+            else Path(train_cfg["output_dir"]) / "calvin_normalization_stats.json"
+        )
+        stats_path = Path(
+            train_cfg.get(
+                "normalization_stats_path",
+                default_stats_path,
+            )
+        )
+        num_bins = int(train_cfg.get("normalization_num_bins", 131072))
+        if stats_path.exists():
+            stats = load_calvin_normalization_stats(stats_path)
+        else:
+            source_root_cfg = train_cfg.get("normalization_source_root")
+            if source_root_cfg is not None:
+                stats = compute_calvin_normalization_stats(
+                    source_root=Path(source_root_cfg),
+                    num_bins=num_bins,
+                )
+            else:
+                stats = compute_calvin_zarr_normalization_stats(
+                    [data_cfg["train_zarr"]],
+                    mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
+                    chunk_size=int(train_cfg.get("normalization_chunk_size", 512)),
+                )
+            save_calvin_normalization_stats(stats, stats_path)
+        query_center, query_scale, traj_center, traj_scale = extract_calvin_normalization_tensors(stats)
+        pipeline.set_calvin_normalization_statistics(
+            torch.from_numpy(query_center),
+            torch.from_numpy(query_scale),
+            torch.from_numpy(traj_center),
+            torch.from_numpy(traj_scale),
+        )
+    else:
+        stats_path = Path(
+            train_cfg.get(
+                "query_stats_path",
+                Path(train_cfg["output_dir"]) / "query_xyz_stats.pt",
+            )
+        )
+        if stats_path.exists():
+            stats = torch.load(stats_path, map_location="cpu")
+            query_center = stats["center"]
+            query_scale = stats["scale"]
+        else:
+            if "query_world_xyz" in train_dataset.annos:
+                query_center, query_scale = compute_query_xyz_statistics(
+                    [data_cfg["train_zarr"]],
+                    mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
+                )
+            else:
+                query_center, query_scale = compute_query_xyz_statistics_from_dataset(
+                    train_dataset
+                )
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"center": query_center, "scale": query_scale}, stats_path)
+        pipeline.set_query_xyz_statistics(query_center, query_scale)
 
     trainer = MotionExpertTrainer(
         pipeline=pipeline,
@@ -154,39 +364,157 @@ def main():
         weight_decay=float(train_cfg.get("weight_decay", 5e-3)),
         clip_grad_norm=float(train_cfg.get("clip_grad_norm", 1.0)),
         mixed_precision=bool(train_cfg.get("mixed_precision", False)),
+        local_rank=local_rank,
+        distributed=distributed,
+        find_unused_parameters=bool(train_cfg.get("find_unused_parameters", False)),
+        train_sampler=train_sampler,
     )
 
-    start_epoch = 0
+    start_step = 0
     if args.resume:
-        start_epoch = trainer.load_checkpoint(args.resume)
+        start_step = trainer.load_checkpoint(args.resume)
+    _barrier_if_distributed(distributed)
 
-    epochs = int(train_cfg.get("epochs", 1))
-    save_every = int(train_cfg.get("save_every", 1))
-    val_every = int(train_cfg.get("val_every", 1))
+    wandb_run = _init_wandb(raw_cfg, train_cfg, validate_only=args.validate_only) if is_main_process else None
+
+    if args.validate_only:
+        if is_main_process and val_loader is None:
+            raise ValueError("Validation-only mode requires `data.val_zarr`.")
+        if is_main_process:
+            val_loss = trainer.evaluate_loss()
+            val_gen = trainer.evaluate_generation(
+                num_inference_steps=int(train_cfg.get("val_num_inference_steps", 20)),
+                guidance_scale=float(train_cfg.get("guidance_scale", 1.0)),
+                max_batches=int(train_cfg.get("val_generation_batches", 1)),
+            )
+            metrics = {}
+            metrics.update(_prefixed(val_loss, "val"))
+            metrics.update(_prefixed(val_gen, "val"))
+            print(f"[val-only] checkpoint={args.resume} step={start_step} metrics={metrics}")
+            _log_wandb_metrics(metrics, step=start_step)
+            if wandb_run is not None:
+                wandb_run.summary.update(metrics)
+                wandb.finish()
+        _barrier_if_distributed(distributed)
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
+        return
+
+    train_iters = int(
+        train_cfg.get(
+            "train_iters",
+            int(train_cfg.get("epochs", 1)) * max(len(train_loader), 1),
+        )
+    )
+    train_log_every = int(train_cfg.get("train_log_every", 100))
+    train_eval_every = int(train_cfg.get("train_eval_every", train_cfg.get("val_freq", 0)))
+    train_eval_loss_batches = int(train_cfg.get("train_eval_loss_batches", 10))
+    train_eval_generation_batches = int(train_cfg.get("train_eval_generation_batches", 2))
+    val_every = int(train_cfg.get("val_every_iters", 0))
+    val_loss_batches = int(train_cfg.get("val_loss_batches", 500))
+    save_every = int(
+        train_cfg.get(
+            "save_every_iters",
+            val_every if val_every > 0 else train_eval_every,
+        )
+    )
     inference_steps = int(train_cfg.get("val_num_inference_steps", 20))
     guidance_scale = float(train_cfg.get("guidance_scale", 1.0))
     val_gen_batches = int(train_cfg.get("val_generation_batches", 1))
+    running_train: Dict[str, float] = {}
+    running_train_count = 0
 
-    for epoch in range(start_epoch, epochs):
-        train_metrics = trainer.train_epoch()
-        print(f"[train] epoch={epoch} loss={train_metrics['loss']:.6f}")
+    for step in range(start_step, train_iters):
+        completed_step = step + 1
+        train_metrics = trainer.train_step()
+        _update_running_metrics(running_train, train_metrics)
+        running_train_count += 1
 
-        if val_loader is not None and ((epoch + 1) % val_every == 0 or epoch == epochs - 1):
-            val_loss = trainer.evaluate_loss()
+        if train_log_every > 0 and (
+            completed_step % train_log_every == 0 or completed_step == train_iters
+        ):
+            if is_main_process:
+                avg_train = _average_running_metrics(running_train, running_train_count)
+                print(
+                    f"[train] step={completed_step}/{train_iters} "
+                    f"loss={avg_train.get('loss', 0.0):.6f}"
+                )
+                log_payload = {
+                    "step": float(completed_step),
+                    "train/lr": float(trainer.optimizer.param_groups[0]["lr"]),
+                    **_prefixed(avg_train, "train"),
+                }
+                _log_wandb_metrics(log_payload, step=completed_step)
+            running_train = {}
+            running_train_count = 0
+
+        if is_main_process and train_eval_every > 0 and completed_step % train_eval_every == 0:
+            train_eval_loss = trainer.evaluate_loss(
+                loader=train_loader,
+                max_batches=train_eval_loss_batches,
+            )
+            train_eval_gen = trainer.evaluate_generation(
+                loader=train_loader,
+                num_inference_steps=inference_steps,
+                guidance_scale=guidance_scale,
+                max_batches=train_eval_generation_batches,
+            )
+            train_eval_metrics = {}
+            train_eval_metrics.update(_prefixed(train_eval_loss, "train_eval"))
+            train_eval_metrics.update(_prefixed(train_eval_gen, "train_eval"))
+            print(
+                f"[train-eval] step={completed_step} "
+                f"loss={train_eval_loss.get('loss', 0.0):.6f} "
+                f"endpoint_acc_001={train_eval_gen.get('endpoint_acc_001', 0.0):.4f}"
+            )
+            _log_wandb_metrics(train_eval_metrics, step=completed_step)
+
+        ran_val = False
+        if (
+            is_main_process
+            and val_loader is not None
+            and val_every > 0
+            and completed_step % val_every == 0
+        ):
+            val_loss = trainer.evaluate_loss(
+                loader=val_loader,
+                max_batches=val_loss_batches,
+            )
             val_gen = trainer.evaluate_generation(
+                loader=val_loader,
                 num_inference_steps=inference_steps,
                 guidance_scale=guidance_scale,
                 max_batches=val_gen_batches,
             )
             val_loss_value = val_loss.get("loss", float("inf"))
-            print(f"[val] epoch={epoch} loss={val_loss_value:.6f} metrics={val_gen}")
+            log_payload = {}
+            log_payload.update(_prefixed(val_loss, "val"))
+            log_payload.update(_prefixed(val_gen, "val"))
+            print(
+                f"[val] step={completed_step} loss={val_loss_value:.6f} "
+                f"endpoint_acc_001={val_gen.get('endpoint_acc_001', 0.0):.4f}"
+            )
             is_best = val_loss_value < trainer.best_val_loss
             if is_best:
                 trainer.best_val_loss = val_loss_value
-            if (epoch + 1) % save_every == 0 or is_best:
-                trainer.save_checkpoint(epoch, is_best=is_best)
-        elif (epoch + 1) % save_every == 0:
-            trainer.save_checkpoint(epoch, is_best=False)
+                log_payload["val/best_loss"] = float(trainer.best_val_loss)
+            trainer.save_checkpoint(completed_step, is_best=is_best)
+            _log_wandb_metrics(log_payload, step=completed_step)
+            ran_val = True
+
+        if is_main_process and not ran_val and save_every > 0 and completed_step % save_every == 0:
+            trainer.save_checkpoint(completed_step, is_best=False)
+
+        _barrier_if_distributed(distributed)
+
+    if is_main_process and (save_every <= 0 or train_iters % save_every != 0):
+        trainer.save_checkpoint(train_iters, is_best=False)
+
+    if wandb_run is not None:
+        wandb.finish()
+    _barrier_if_distributed(distributed)
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

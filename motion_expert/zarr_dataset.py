@@ -13,9 +13,68 @@ from datasets.utils import read_zarr_with_cache, to_tensor
 from .data import MotionExpertBatch, flatten_future_grid, flatten_query_grid
 from .geometry import (
     aspect_resize_and_pad_rgb_and_query_uv,
+    aspect_resize_and_pad_depth,
+    center_query_world_xyz,
     compute_stepwise_future_delta,
+    fill_invalid_delta_with_zero,
     fill_invalid_traj_with_last_valid,
+    query_uv_depth_to_world_xyz,
+    transform_intrinsics_for_resize_pad,
 )
+
+
+def _center_finite_query_xyz_np(query_world_xyz: np.ndarray) -> np.ndarray:
+    query_world_xyz = np.asarray(query_world_xyz, dtype=np.float32).reshape(-1, 3)
+    finite = np.isfinite(query_world_xyz).all(axis=1)
+    if not finite.any():
+        return np.empty((0, 3), dtype=np.float32)
+    valid_xyz = query_world_xyz[finite]
+    center = valid_xyz.mean(axis=0, keepdims=True)
+    return valid_xyz - center
+
+
+def _update_axis_sums(
+    values: np.ndarray,
+    sums: np.ndarray,
+    sumsq: np.ndarray,
+) -> int:
+    if values.size == 0:
+        return 0
+    values = np.asarray(values, dtype=np.float64).reshape(-1, 3)
+    sums[:] += values.sum(axis=0)
+    sumsq[:] += np.square(values).sum(axis=0)
+    return int(values.shape[0])
+
+
+def _mean_std_from_sums(
+    sums: np.ndarray,
+    sumsq: np.ndarray,
+    count: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if count <= 0:
+        raise RuntimeError("Cannot compute normalization statistics without valid XYZ values.")
+    mean = sums / float(count)
+    var = np.maximum(sumsq / float(count) - np.square(mean), 1e-12)
+    std = np.maximum(np.sqrt(var), 1e-6)
+    return (
+        torch.from_numpy(mean.astype(np.float32)),
+        torch.from_numpy(std.astype(np.float32)),
+    )
+
+
+def _axis_summary_from_sums(
+    sums: np.ndarray,
+    sumsq: np.ndarray,
+    count: int,
+) -> Dict[str, object]:
+    mean, std = _mean_std_from_sums(sums, sumsq, count)
+    return {
+        "count": int(count),
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "center": mean.tolist(),
+        "scale": std.tolist(),
+    }
 
 
 @dataclass
@@ -113,6 +172,8 @@ class MotionExpertZarrDataset(Dataset):
         query_uv_is_normalized: bool = False,
         image_pad_value: float = 0.5,
         mem_limit_gb: float = 16.0,
+        traj_3d_xyz_is_delta: Optional[bool] = None,
+        max_samples: Optional[int] = None,
     ):
         super().__init__()
         self.annos = read_zarr_with_cache(root, mem_gb=mem_limit_gb)
@@ -120,7 +181,25 @@ class MotionExpertZarrDataset(Dataset):
         self.image_size = (int(image_size[0]), int(image_size[1]))
         self.query_uv_is_normalized = bool(query_uv_is_normalized)
         self.image_pad_value = float(image_pad_value)
+        self.max_samples = None if max_samples is None else int(max_samples)
+        if self.max_samples is not None and self.max_samples <= 0:
+            raise ValueError("max_samples must be positive when provided.")
         self.instruction_id_key = self._resolve_instruction_key(instruction_id_key)
+        self.traj_mask_key = self._resolve_traj_mask_key()
+        self.traj_3d_xyz_is_delta = self._resolve_traj_delta_semantics(
+            root=root,
+            instructions_path=instructions_path,
+            requested=traj_3d_xyz_is_delta,
+        )
+        self.depth_key = self._resolve_optional_key(("depth",))
+        self.intrinsics_key = self._resolve_optional_key(("intrinsics", "camera_intrinsics"))
+        self.extrinsics_key = self._resolve_optional_key(("extrinsics", "camera_extrinsics"))
+
+    def _resolve_optional_key(self, candidates: Sequence[str]) -> Optional[str]:
+        for candidate in candidates:
+            if candidate in self.annos:
+                return candidate
+        return None
 
     def _resolve_instruction_key(self, requested_key: Optional[str]) -> str:
         if requested_key is not None:
@@ -137,8 +216,28 @@ class MotionExpertZarrDataset(Dataset):
             "`instruction_id`, and `task_id`."
         )
 
+    def _resolve_traj_mask_key(self) -> str:
+        for candidate in ("traj_mask", "valid_mask"):
+            if candidate in self.annos:
+                return candidate
+        raise KeyError("Could not find a trajectory mask key. Tried `traj_mask` and `valid_mask`.")
+
+    def _resolve_traj_delta_semantics(
+        self,
+        root: str,
+        instructions_path: str,
+        requested: Optional[bool],
+    ) -> bool:
+        if requested is not None:
+            return bool(requested)
+        joined = f"{root} {instructions_path}".lower()
+        return "calvin" in joined
+
     def __len__(self) -> int:
-        return len(self.annos["rgb"])
+        full_length = len(self.annos["rgb"])
+        if self.max_samples is None:
+            return full_length
+        return min(full_length, self.max_samples)
 
     def _load_tensor(self, key: str, idx: int, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         value = to_tensor(self.annos[key][idx])
@@ -158,54 +257,106 @@ class MotionExpertZarrDataset(Dataset):
             query_uv = query_uv.unsqueeze(0)
         query_uv = flatten_query_grid(query_uv)
 
-        query_world_xyz = self._load_tensor("query_world_xyz", idx, dtype=torch.float32)
-        if query_world_xyz.dim() == 3:
-            query_world_xyz = query_world_xyz.unsqueeze(0)
-        query_world_xyz = flatten_query_grid(query_world_xyz)
+        query_world_xyz = None
+        if "query_world_xyz" in self.annos:
+            query_world_xyz = self._load_tensor("query_world_xyz", idx, dtype=torch.float32)
+            if query_world_xyz.dim() == 3:
+                query_world_xyz = query_world_xyz.unsqueeze(0)
+            query_world_xyz = flatten_query_grid(query_world_xyz)
 
         traj_3d_xyz = self._load_tensor("traj_3d_xyz", idx, dtype=torch.float32)
         if traj_3d_xyz.dim() == 4:
             traj_3d_xyz = traj_3d_xyz.unsqueeze(0)
         traj_3d_xyz = flatten_future_grid(traj_3d_xyz)
 
-        traj_mask = self._load_tensor("traj_mask", idx).bool()
-        if traj_mask.dim() == 3:
+        traj_mask = self._load_tensor(self.traj_mask_key, idx).bool()
+        if traj_mask.dim() == 4:
+            traj_mask = traj_mask.all(dim=-1)
+        if (
+            traj_mask.dim() == 3
+            and traj_mask.shape[-1] == 3
+            and traj_mask.shape[:2] == traj_3d_xyz.shape[:2]
+        ):
             traj_mask = traj_mask.all(dim=-1)
         if traj_mask.dim() == 3:
             traj_mask = traj_mask.unsqueeze(0)
         traj_mask = flatten_future_grid(traj_mask).bool()
 
-        rgb, query_uv_norm = aspect_resize_and_pad_rgb_and_query_uv(
+        src_hw = (int(rgb.shape[-2]), int(rgb.shape[-1]))
+        rgb, query_uv_grid = aspect_resize_and_pad_rgb_and_query_uv(
             rgb=rgb,
             query_uv=query_uv.float(),
             target_hw=self.image_size,
             uv_is_normalized=self.query_uv_is_normalized,
             pad_value=self.image_pad_value,
         )
-        traj_3d_xyz = fill_invalid_traj_with_last_valid(
-            traj_3d_xyz=traj_3d_xyz.float(),
-            traj_mask=traj_mask,
-            anchor_xyz=query_world_xyz.float(),
-        )
-        future_delta_xyz = compute_stepwise_future_delta(
-            traj_3d_xyz=traj_3d_xyz,
-            query_world_xyz=query_world_xyz.float(),
-        )
+        depth = None
+        intrinsics = None
+        extrinsics = None
+        if self.depth_key is not None:
+            depth = self._load_tensor(self.depth_key, idx, dtype=torch.float32)
+            depth = aspect_resize_and_pad_depth(depth, self.image_size)
+        if self.intrinsics_key is not None:
+            intrinsics = self._load_tensor(self.intrinsics_key, idx, dtype=torch.float32)
+            intrinsics = transform_intrinsics_for_resize_pad(intrinsics, src_hw, self.image_size)
+        if self.extrinsics_key is not None:
+            extrinsics = self._load_tensor(self.extrinsics_key, idx, dtype=torch.float32)
+
+        if query_world_xyz is None and (depth is None or intrinsics is None or extrinsics is None):
+            raise KeyError(
+                "Zarr sample must contain query_world_xyz, or depth + intrinsics + extrinsics."
+            )
+        if query_world_xyz is None:
+            query_world_xyz, _ = query_uv_depth_to_world_xyz(
+                query_uv=query_uv_grid.unsqueeze(0),
+                depth=depth.unsqueeze(0),
+                intrinsics=intrinsics.unsqueeze(0),
+                extrinsics=extrinsics.unsqueeze(0),
+            )
+            query_world_xyz = query_world_xyz.squeeze(0)
+
+        query_world_xyz_raw = query_world_xyz.float()
+        if self.traj_3d_xyz_is_delta:
+            future_delta_xyz = fill_invalid_delta_with_zero(
+                traj_delta_xyz=traj_3d_xyz.float(),
+                traj_mask=traj_mask,
+            )
+            traj_3d_xyz = future_delta_xyz
+        else:
+            if query_world_xyz is None:
+                raise KeyError("Absolute traj_3d_xyz requires query_world_xyz for stepwise deltas.")
+            traj_3d_xyz = fill_invalid_traj_with_last_valid(
+                traj_3d_xyz=traj_3d_xyz.float(),
+                traj_mask=traj_mask,
+                anchor_xyz=query_world_xyz_raw,
+            )
+            future_delta_xyz = compute_stepwise_future_delta(
+                traj_3d_xyz=traj_3d_xyz,
+                query_world_xyz=query_world_xyz_raw,
+            )
+        query_world_xyz = center_query_world_xyz(query_world_xyz_raw)
 
         instruction_id = int(self._load_tensor(self.instruction_id_key, idx).item())
         instruction_text = self.instructions.resolve(instruction_id)
 
-        return {
+        sample = {
             "rgb": rgb,
             "instruction_text": instruction_text,
             "instruction_id": instruction_id,
-            "query_uv": query_uv_norm.float(),
-            "query_world_xyz": query_world_xyz.float(),
+            "query_uv": query_uv_grid.float(),
             "traj_3d_xyz": traj_3d_xyz.float(),
             "future_delta_xyz": future_delta_xyz.float(),
             "traj_mask": traj_mask.bool(),
             "image_hw": torch.tensor(self.image_size, dtype=torch.long),
         }
+        sample["query_world_xyz"] = query_world_xyz.float()
+        if depth is not None:
+            sample["depth"] = depth.float()
+        if intrinsics is not None:
+            sample["intrinsics"] = intrinsics.float()
+        if extrinsics is not None:
+            sample["extrinsics"] = extrinsics.float()
+        return sample
 
 
 class MotionExpertCollator:
@@ -226,8 +377,27 @@ class MotionExpertCollator:
             text_token_ids=tokenized.input_ids,
             text_attention_mask=attention_mask,
             text_valid_lens=attention_mask.sum(dim=1),
+            depth=(
+                torch.stack([sample["depth"] for sample in batch])
+                if all("depth" in sample for sample in batch)
+                else None
+            ),
+            intrinsics=(
+                torch.stack([sample["intrinsics"] for sample in batch])
+                if all("intrinsics" in sample for sample in batch)
+                else None
+            ),
+            extrinsics=(
+                torch.stack([sample["extrinsics"] for sample in batch])
+                if all("extrinsics" in sample for sample in batch)
+                else None
+            ),
             query_uv=torch.stack([sample["query_uv"] for sample in batch]),
-            query_world_xyz=torch.stack([sample["query_world_xyz"] for sample in batch]),
+            query_world_xyz=(
+                torch.stack([sample["query_world_xyz"] for sample in batch])
+                if all("query_world_xyz" in sample for sample in batch)
+                else None
+            ),
             traj_3d_xyz=torch.stack([sample["traj_3d_xyz"] for sample in batch]),
             future_delta_xyz=torch.stack([sample["future_delta_xyz"] for sample in batch]),
             traj_mask=torch.stack([sample["traj_mask"] for sample in batch]),
@@ -241,26 +411,120 @@ def compute_query_xyz_statistics(
     mem_limit_gb: float = 16.0,
     chunk_size: int = 512,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xyz_min = None
-    xyz_max = None
+    sums = np.zeros(3, dtype=np.float64)
+    sumsq = np.zeros(3, dtype=np.float64)
+    count = 0
 
     for zarr_path in zarr_paths:
         annos = read_zarr_with_cache(zarr_path, mem_gb=mem_limit_gb)
         arr = annos[query_key]
         for start in range(0, len(arr), chunk_size):
-            chunk = np.asarray(arr[start : start + chunk_size], dtype=np.float32).reshape(-1, 3)
-            finite = np.isfinite(chunk).all(axis=1)
-            if not finite.any():
-                continue
-            chunk = chunk[finite]
-            chunk_min = torch.from_numpy(chunk.min(axis=0))
-            chunk_max = torch.from_numpy(chunk.max(axis=0))
-            xyz_min = chunk_min if xyz_min is None else torch.minimum(xyz_min, chunk_min)
-            xyz_max = chunk_max if xyz_max is None else torch.maximum(xyz_max, chunk_max)
+            chunk_arr = np.asarray(arr[start : start + chunk_size], dtype=np.float32)
+            chunk = chunk_arr.reshape(chunk_arr.shape[0], -1, 3)
+            for sample in chunk:
+                centered_sample = _center_finite_query_xyz_np(sample)
+                count += _update_axis_sums(centered_sample, sums, sumsq)
 
-    if xyz_min is None or xyz_max is None:
+    if count <= 0:
         raise RuntimeError("Could not compute query XYZ statistics from the provided zarr files.")
 
-    center = (xyz_min + xyz_max) / 2.0
-    scale = torch.clamp((xyz_max - xyz_min) / 2.0, min=1e-6)
+    center, scale = _mean_std_from_sums(sums, sumsq, count)
     return center.float(), scale.float()
+
+
+def compute_query_xyz_statistics_from_dataset(
+    dataset: MotionExpertZarrDataset,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    sums = torch.zeros(3, dtype=torch.float64)
+    sumsq = torch.zeros(3, dtype=torch.float64)
+    count = 0
+    for idx in range(len(dataset)):
+        query_world_xyz = center_query_world_xyz(dataset[idx]["query_world_xyz"]).reshape(-1, 3)
+        finite = torch.isfinite(query_world_xyz).all(dim=-1)
+        if not finite.any():
+            continue
+        query_world_xyz = query_world_xyz[finite].to(torch.float64)
+        sums += query_world_xyz.sum(dim=0)
+        sumsq += query_world_xyz.square().sum(dim=0)
+        count += int(query_world_xyz.shape[0])
+
+    if count <= 0:
+        raise RuntimeError("Could not compute query XYZ statistics from the dataset.")
+    center = sums / float(count)
+    var = torch.clamp(sumsq / float(count) - center.square(), min=1e-12)
+    scale = torch.clamp(var.sqrt(), min=1e-6)
+    return center.float(), scale.float()
+
+
+def compute_calvin_zarr_normalization_stats(
+    zarr_paths: Sequence[str],
+    query_key: str = "query_world_xyz",
+    traj_key: str = "traj_3d_xyz",
+    mem_limit_gb: float = 16.0,
+    chunk_size: int = 512,
+) -> Dict[str, object]:
+    query_sums = np.zeros(3, dtype=np.float64)
+    query_sumsq = np.zeros(3, dtype=np.float64)
+    traj_sums = np.zeros(3, dtype=np.float64)
+    traj_sumsq = np.zeros(3, dtype=np.float64)
+    query_count = 0
+    traj_count = 0
+
+    for zarr_path in zarr_paths:
+        annos = read_zarr_with_cache(zarr_path, mem_gb=mem_limit_gb)
+        if query_key not in annos:
+            raise KeyError(f"Calvin zarr normalization requires `{query_key}`.")
+        if traj_key not in annos:
+            raise KeyError(f"Calvin zarr normalization requires `{traj_key}`.")
+        mask_key = "traj_mask" if "traj_mask" in annos else "valid_mask"
+        if mask_key not in annos:
+            raise KeyError("Calvin zarr normalization requires `traj_mask` or `valid_mask`.")
+
+        query_arr = annos[query_key]
+        traj_arr = annos[traj_key]
+        mask_arr = annos[mask_key]
+        if len(query_arr) != len(traj_arr) or len(query_arr) != len(mask_arr):
+            raise ValueError("query, trajectory, and mask arrays must have the same length.")
+
+        for start in range(0, len(query_arr), chunk_size):
+            query_chunk_arr = np.asarray(query_arr[start : start + chunk_size], dtype=np.float32)
+            query_chunk = query_chunk_arr.reshape(query_chunk_arr.shape[0], -1, 3)
+            for query_sample in query_chunk:
+                centered_query = _center_finite_query_xyz_np(query_sample)
+                query_count += _update_axis_sums(centered_query, query_sums, query_sumsq)
+
+            traj_chunk_arr = np.asarray(traj_arr[start : start + chunk_size], dtype=np.float32)
+            traj_chunk = traj_chunk_arr.reshape(traj_chunk_arr.shape[0], -1, traj_chunk_arr.shape[-2], 3)
+            mask_chunk_arr = np.asarray(mask_arr[start : start + chunk_size]).astype(bool)
+            if mask_chunk_arr.shape == traj_chunk_arr.shape:
+                mask_chunk_arr = mask_chunk_arr.all(axis=-1)
+            mask_chunk = mask_chunk_arr.reshape(
+                traj_chunk_arr.shape[0],
+                -1,
+                traj_chunk_arr.shape[-2],
+            )
+            finite_traj = np.isfinite(traj_chunk).all(axis=-1)
+            valid_traj = mask_chunk & finite_traj
+            traj_values = traj_chunk[valid_traj]
+            traj_count += _update_axis_sums(traj_values, traj_sums, traj_sumsq)
+
+    if query_count <= 0 or traj_count <= 0:
+        raise RuntimeError("Could not compute Calvin zarr normalization statistics.")
+
+    return {
+        "source_zarr_paths": [str(path) for path in zarr_paths],
+        "estimation_method": {
+            "type": "streaming_mean_std",
+            "note": "query_world_xyz is centered per sample before accumulating statistics.",
+        },
+        "query_centered_xyz": _axis_summary_from_sums(
+            query_sums,
+            query_sumsq,
+            query_count,
+        ),
+        "traj_delta_xyz": _axis_summary_from_sums(
+            traj_sums,
+            traj_sumsq,
+            traj_count,
+        ),
+    }

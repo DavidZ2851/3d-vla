@@ -1,79 +1,47 @@
-# MotionExpert V1 Plan
+# Sparse MotionExpert Implementation
 
 ## Summary
 
-- Single-view MotionExpert for a `20 x 20` point grid.
-- Condition on:
-  - whole-image backbone visual tokens
-  - backbone text-token hidden states
-  - per-point `query_uv` and `query_world_xyz`
-- Predict stepwise world-frame `delta_xyz` only.
-- Run the backbone online; do not cache features.
-- Keep TraceGen-style CogVideoX flow conditioning and decoder attention.
+- Standalone sparse scene-flow expert for a `20 x 20` query grid.
+- Predicts exactly 15 future stepwise world-frame `delta_xyz` values.
+- Uses query-local visual features, kNN point encoding, flow matching, and a sparse spatial-temporal decoder.
+- Keeps action-expert fusion out of this first implementation.
 
-Supported backbones:
+## Interfaces
 
-- `qwen`: pre-merge Qwen visual patches + final text tokens
-- `florence2`: Florence2 encoder + Flower-style ViT-FPN / DPT-like visual neck
+- `MotionExpertConfig.future_steps = 15`
+- `decoder_type = "sparse_factorized"`
+- `knn_k = 16`
+- `SparseMotionDecoderConfig` controls hidden size, encoder depth, decoder depth, heads, and MLP ratio.
+- `MotionExpertBatch` supports optional `depth`, `intrinsics`, and `extrinsics`.
+- No `valid_depth`, robot, or gripper fields are added.
 
-## Dataset Contract
+## Data And Conditioning
 
-Each zarr sample stores:
-
-- `rgb`: `[3, H, W]`
-- `query_uv`: `[400, 2]`
-- `query_world_xyz`: `[400, 3]`
-- `traj_3d_xyz`: `[400, T, 3]`
-- `traj_mask`: `[400, T]`
-- an instruction ID key such as `instr_id`, `instruction_id`, or `task_id`
-
-There is no `point_mask`.
-
-## Preprocessing
-
-- Use aspect-preserving resize + padding to a fixed `(input_h, input_w)` canvas.
-- Apply the same resize + pad transform to `query_uv`.
-- Normalize final `query_uv` into `[0, 1]` in padded-image coordinates.
-- Fill invalid future tails with the last valid absolute point for tensor stability.
-
-## Normalization
-
-Absolute query positions use frozen train-split bounds:
-
-- `query_world_xyz_norm = (query_world_xyz - query_xyz_center) / query_xyz_scale`
-
-Delta targets use fixed predefined symmetric ranges:
-
-- `future_delta_xyz[:, 0] = traj_3d_xyz[:, 0] - query_world_xyz`
-- `future_delta_xyz[:, t] = traj_3d_xyz[:, t] - traj_3d_xyz[:, t - 1]` for `t > 0`
-- `future_delta_xyz_norm = clamp(future_delta_xyz / delta_range_xyz, -1, 1)`
-
-`query_xyz_center` and `query_xyz_scale` are computed once from the training-set
-`query_world_xyz` values and then frozen. `delta_range_xyz` stays predefined so
-training and unseen-domain inference share the same target scaling.
+- Prefer stored `query_world_xyz`.
+- If absent, reconstruct query XYZ from normalized padded `query_uv`, depth, intrinsics, and extrinsics.
+- Use only `traj_mask` as the training supervision mask.
+- Qwen3-VL features are pre-merge patch-16 visual features.
+- Florence2 features use the DPT/FPN path and patch-8 visual grid.
+- Per-query visual features are sampled from `visual_grid`; global visual mean and text tokens condition the decoder.
 
 ## Model
 
-1. Reuse the repo's Qwen encoder path for:
-   - pre-merge visual tokens
-   - final text-token hidden states
-2. Or reuse the repo's Florence2 path for:
-   - Florence image/text encoder
-   - Flower-style ViT-FPN / DPT-like visual feature neck
-   - Florence instruction-token features
-3. Build one query token per point from `query_uv` and normalized `query_world_xyz`.
-4. Concatenate `query_tokens + visual_tokens + text_tokens`.
-5. Feed the concatenated sequence into the TraceGen CogVideoX flow decoder as `encoder_hidden_states`.
+- Build point features from `xyz`, normalized `xyz`, `uv`, depth, and sampled visual features.
+- Build the kNN graph once from current-frame observed XYZ.
+- Encode points with local geometry attention and relative XYZ/distance bias.
+- Decode flow-matching velocity over `[B, 400, 15, 3]` with:
+  - local spatial attention
+  - temporal attention
+  - global visual/text cross-attention
+  - FFN
 
-## Training And Metrics
+## Loss And Metrics
 
-- Train on normalized delta XYZ.
-- Use `traj_mask` in the diffusion loss.
-- Evaluate by unnormalizing predictions and comparing delta trajectories directly in world units.
-- Absolute future XYZ reconstruction is optional for visualization only.
-
-Backbone training modes:
-
-- frozen backbone
-- full backbone finetuning
-- whole-backbone LoRA
+- Normalize future deltas once before flow matching.
+- Train with `x_tau = (1 - tau) * noise + tau * target` and `v_target = target - noise`.
+- Optional moving-point weighting is enabled by default:
+  - `motion_score = sigmoid((||future_delta_xyz|| - tau) * temp / tau)`
+  - `loss_weight = traj_mask * max(motion_score^gamma, static_floor)`
+  - default `tau=0.005`, `temp=5.0`, `gamma=1.0`, `static_floor=0.05`
+- Metrics report delta L1/MSE, endpoint L1, moved-point L1, and static-point L1 in meters.
