@@ -61,6 +61,10 @@ class SparseMotionDecoderConfig:
     num_attention_heads: int = 8
     mlp_ratio: int = 4
     visual_global_tokens: int = 1
+    decoder_spatial_attention: str = "knn"
+    decoder_serialized_patch_size: int = 32
+    decoder_serialized_orders: Tuple[str, ...] = ("z", "z-trans")
+    decoder_serialized_depth: int = 16
 
 
 @dataclass
@@ -81,6 +85,7 @@ class MotionExpertConfig:
     text_max_length: int = 128
     image_pad_value: float = 0.5
     query_uv_is_normalized: bool = False
+    checkpoint_activations: bool = True
     dropout: float = 0.1
     use_calvin_percentile_normalization: bool = False
     query_xyz_center: Tuple[float, float, float] = (0.0, 0.0, 0.0)

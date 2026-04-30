@@ -22,7 +22,7 @@
 - If absent, reconstruct query XYZ from normalized padded `query_uv`, depth, intrinsics, and extrinsics.
 - Use only `traj_mask` as the training supervision mask.
 - Qwen3-VL features are pre-merge patch-16 visual features.
-- Florence2 features use the DPT/FPN path and patch-8 visual grid.
+- Florence2 features use native patch-32 visual tokens without the DPT/FPN neck.
 - Per-query visual features are sampled from `visual_grid`; global visual mean and text tokens condition the decoder.
 
 ## Model

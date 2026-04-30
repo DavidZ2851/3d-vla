@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=motionexpert_train_florence2
+#SBATCH --job-name=motionexpert_florence2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=240G
+#SBATCH --mem=200G
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=general
@@ -18,6 +18,7 @@ NGPUS=${NGPUS:-4}
 MASTER_PORT=${MASTER_PORT:-$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))}
 
 export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_API_KEY=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
 export FLORENCE2_MODEL_PATH=${FLORENCE2_MODEL_PATH:-microsoft/Florence-2-large}
 
 cd "$REPO_ROOT"

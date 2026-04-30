@@ -10,6 +10,7 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from utils.common_utils import count_parameters
 
 try:
     import wandb
@@ -74,6 +75,7 @@ def _build_motion_expert_config(raw_cfg: dict) -> MotionExpertConfig:
         text_max_length=raw_cfg.get("text_max_length", 128),
         image_pad_value=raw_cfg.get("image_pad_value", 0.5),
         query_uv_is_normalized=raw_cfg.get("query_uv_is_normalized", False),
+        checkpoint_activations=raw_cfg.get("checkpoint_activations", True),
         dropout=raw_cfg.get("dropout", 0.1),
         use_calvin_percentile_normalization=raw_cfg.get(
             "use_calvin_percentile_normalization",
@@ -165,6 +167,87 @@ def _average_running_metrics(
     return {key: value / float(count) for key, value in totals.items()}
 
 
+def _count_params(module: torch.nn.Module, trainable_only: bool = False) -> int:
+    return sum(
+        param.numel()
+        for param in module.parameters()
+        if (param.requires_grad or not trainable_only)
+    )
+
+
+def _format_params(num_params: int) -> str:
+    return f"{num_params:,}"
+
+
+def _print_param_row(name: str, module: Optional[torch.nn.Module]) -> None:
+    if module is None:
+        return
+    total = _count_params(module)
+    trainable = _count_params(module, trainable_only=True)
+    frozen = total - trainable
+    print(
+        f"[params] {name}: total={_format_params(total)} "
+        f"trainable={_format_params(trainable)} frozen={_format_params(frozen)}"
+    )
+
+
+def _chunk_loader_batch_size(raw_batch_size: int, chunk_size: int) -> int:
+    return max(1, int(raw_batch_size) // max(1, int(chunk_size)))
+
+
+def _log_motion_expert_summary(
+    pipeline: MotionExpertPipeline,
+    model_cfg: MotionExpertConfig,
+    train_cfg: dict,
+    train_dataset: MotionExpertZarrDataset,
+    val_dataset: Optional[MotionExpertZarrDataset],
+) -> None:
+    print("[params] detailed MotionExpert parameter summary")
+    _print_param_row("pipeline", pipeline)
+    _print_param_row("feature_extractor", pipeline.feature_extractor)
+    _print_param_row("model", pipeline.model)
+
+    feature_extractor = pipeline.feature_extractor
+    if feature_extractor is not None:
+        _print_param_row("feature_extractor.backbone", getattr(feature_extractor, "backbone", None))
+        backbone = getattr(feature_extractor, "backbone", None)
+        vlm = getattr(backbone, "vlm", None)
+        _print_param_row("feature_extractor.backbone.vlm", vlm)
+        _print_param_row("feature_extractor.backbone.vlm.visual", getattr(vlm, "visual", None))
+        language_model = getattr(vlm, "language_model", None)
+        _print_param_row("feature_extractor.backbone.vlm.language_model", language_model)
+        layers = getattr(language_model, "layers", None)
+        if layers is not None:
+            print(f"[params] feature_extractor.backbone.vlm.language_model.layers={len(layers)}")
+        _print_param_row("feature_extractor.text_norm", getattr(feature_extractor, "text_norm", None))
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    raw_batch_size = int(train_cfg.get("batch_size", 2))
+    chunk_size = int(getattr(train_dataset, "chunk_size", 1))
+    loader_batch_size = _chunk_loader_batch_size(raw_batch_size, chunk_size)
+    raw_per_gpu = loader_batch_size * chunk_size
+    raw_global = raw_per_gpu * max(world_size, 1)
+    motion_tokens_per_sample = int(model_cfg.num_query_tokens * model_cfg.future_steps)
+    print(
+        f"[data] train_chunk_items={len(train_dataset)} "
+        f"train_raw_samples={getattr(train_dataset, '_effective_raw_length', 'unknown')} "
+        f"chunk_size={chunk_size} configured_raw_batch_size={raw_batch_size} "
+        f"loader_batch_size_chunks={loader_batch_size} "
+        f"raw_samples_per_gpu={raw_per_gpu} raw_samples_global={raw_global} "
+        f"world_size={world_size}"
+    )
+    if val_dataset is not None:
+        print(
+            f"[data] val_chunk_items={len(val_dataset)} "
+            f"val_raw_samples={getattr(val_dataset, '_effective_raw_length', 'unknown')}"
+        )
+    print(
+        f"[data] motion_tokens_per_sample={motion_tokens_per_sample} "
+        f"nominal_motion_tokens_per_gpu={raw_per_gpu * motion_tokens_per_sample}"
+    )
+    print(f"[data] checkpoint_activations={bool(model_cfg.checkpoint_activations)}")
+
+
 def _is_distributed() -> bool:
     return int(os.environ.get("WORLD_SIZE", "1")) > 1
 
@@ -232,6 +315,7 @@ def main():
         mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
         traj_3d_xyz_is_delta=data_cfg.get("traj_3d_xyz_is_delta"),
         max_samples=data_cfg.get("max_train_samples"),
+        chunk_size=int(data_cfg.get("chunk_size", 1)),
     )
     val_dataset = None
     if data_cfg.get("val_zarr"):
@@ -248,6 +332,7 @@ def main():
             mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
             traj_3d_xyz_is_delta=data_cfg.get("traj_3d_xyz_is_delta"),
             max_samples=data_cfg.get("max_val_samples"),
+            chunk_size=int(data_cfg.get("chunk_size", 1)),
         )
 
     train_sampler = None
@@ -256,7 +341,10 @@ def main():
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=int(train_cfg.get("batch_size", 2)),
+        batch_size=_chunk_loader_batch_size(
+            int(train_cfg.get("batch_size", 2)),
+            int(data_cfg.get("chunk_size", 1)),
+        ),
         shuffle=train_sampler is None,
         num_workers=int(train_cfg.get("num_workers", 4)),
         pin_memory=bool(train_cfg.get("pin_memory", False)),
@@ -269,7 +357,10 @@ def main():
     if val_dataset is not None and is_main_process:
         val_loader = DataLoader(
             val_dataset,
-            batch_size=int(train_cfg.get("batch_size", 2)),
+            batch_size=_chunk_loader_batch_size(
+                int(train_cfg.get("batch_size", 2)),
+                int(data_cfg.get("chunk_size", 1)),
+            ),
             shuffle=False,
             num_workers=int(train_cfg.get("num_workers", 4)),
             pin_memory=bool(train_cfg.get("pin_memory", False)),
@@ -279,6 +370,15 @@ def main():
         )
 
     pipeline = MotionExpertPipeline.from_backbone(model_cfg)
+    if is_main_process:
+        count_parameters(pipeline)
+        _log_motion_expert_summary(
+            pipeline=pipeline,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+        )
 
     use_calvin_normalization = bool(
         train_cfg.get(
@@ -418,6 +518,7 @@ def main():
             val_every if val_every > 0 else train_eval_every,
         )
     )
+    archive_ckpt_start_step = int(train_cfg.get("archive_ckpt_start_step", 30000))
     inference_steps = int(train_cfg.get("val_num_inference_steps", 20))
     guidance_scale = float(train_cfg.get("guidance_scale", 1.0))
     val_gen_batches = int(train_cfg.get("val_generation_batches", 1))
@@ -476,6 +577,7 @@ def main():
             and val_every > 0
             and completed_step % val_every == 0
         ):
+            should_archive_step = completed_step >= archive_ckpt_start_step
             val_loss = trainer.evaluate_loss(
                 loader=val_loader,
                 max_batches=val_loss_batches,
@@ -498,17 +600,34 @@ def main():
             if is_best:
                 trainer.best_val_loss = val_loss_value
                 log_payload["val/best_loss"] = float(trainer.best_val_loss)
-            trainer.save_checkpoint(completed_step, is_best=is_best)
+                trainer.save_checkpoint(
+                    completed_step,
+                    is_best=True,
+                    save_latest=True,
+                    archive_step=should_archive_step,
+                )
             _log_wandb_metrics(log_payload, step=completed_step)
             ran_val = True
 
         if is_main_process and not ran_val and save_every > 0 and completed_step % save_every == 0:
-            trainer.save_checkpoint(completed_step, is_best=False)
+            should_archive_step = completed_step >= archive_ckpt_start_step
+            trainer.save_checkpoint(
+                completed_step,
+                is_best=False,
+                save_latest=True,
+                archive_step=should_archive_step,
+            )
 
         _barrier_if_distributed(distributed)
 
     if is_main_process and (save_every <= 0 or train_iters % save_every != 0):
-        trainer.save_checkpoint(train_iters, is_best=False)
+        should_archive_step = train_iters >= archive_ckpt_start_step
+        trainer.save_checkpoint(
+            train_iters,
+            is_best=False,
+            save_latest=True,
+            archive_step=should_archive_step,
+        )
 
     if wandb_run is not None:
         wandb.finish()

@@ -21,8 +21,12 @@ model:
     hidden_dim: 512
     point_encoder_layers: 6
     decoder_layers: 8
-    num_attention_heads: 8
+    num_attention_heads: 16
     mlp_ratio: 4
+    decoder_spatial_attention: serialized_flash
+    decoder_serialized_patch_size: 32
+    decoder_serialized_orders: [z, z-trans]
+    decoder_serialized_depth: 16
   qwen:
     model_name_or_path: /home/ziyinx/Xiaomi-Robotics-0-Pretrain
     freeze_backbone: true
@@ -31,9 +35,9 @@ model:
     llm_lora_rank: 0
 
 train:
-  output_dir: /data/user_data/ziyinx/datasets/train_logs/motion_expert/calvin_qwen3vl_overfit
+  output_dir: /data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/calvin_qwen3vl_overfit
   device: cuda
-  batch_size: 2
+  batch_size: 32
   num_workers: 0
   pin_memory: false
   persistent_workers: false
@@ -75,5 +79,6 @@ data:
   instruction_id_key: instr_id
   mem_limit_gb: 16.0
   traj_3d_xyz_is_delta: true
-  max_train_samples: 16
-  max_val_samples: 16
+  chunk_size: 8
+  max_train_samples: 96
+  max_val_samples: 96

@@ -1,16 +1,25 @@
 import math
-from typing import Optional, Tuple
+import warnings
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from timm.models.vision_transformer import RmsNorm
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .config import MotionExpertConfig
 from .geometry import center_query_world_xyz
 
 
 NORMALIZED_CLAMP_ABS = 2.0
+
+try:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
+except ImportError:
+    flash_attn_varlen_qkvpacked_func = None
+
+_FLASH_ATTN_FALLBACK_WARNED = False
 
 
 class TokenProjector(nn.Module):
@@ -71,6 +80,63 @@ def gather_neighbors(x: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tenso
         index=gather_idx,
     )
     return gathered.reshape(batch_size, num_points, k, *trailing_shape)
+
+
+def _normalize_xyz_for_serialization(xyz: torch.Tensor) -> torch.Tensor:
+    xyz = torch.nan_to_num(xyz.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    xyz_min = xyz.amin(dim=1, keepdim=True)
+    xyz_max = xyz.amax(dim=1, keepdim=True)
+    span = (xyz_max - xyz_min).clamp_min(1e-6)
+    return (xyz - xyz_min) / span
+
+
+def _normalized_xyz_to_grid(xyz_norm: torch.Tensor, depth: int) -> torch.Tensor:
+    max_coord = (1 << int(depth)) - 1
+    return torch.clamp((xyz_norm * max_coord).floor().long(), 0, max_coord)
+
+
+def _morton3d_code(grid: torch.Tensor, depth: int, order: str) -> torch.Tensor:
+    if order == "z":
+        coord = grid
+    elif order == "z-trans":
+        coord = grid[..., [1, 0, 2]]
+    else:
+        raise ValueError(
+            "Serialized decoder spatial attention currently supports "
+            f"`z` and `z-trans` orders, got `{order}`."
+        )
+
+    x = coord[..., 0].long()
+    y = coord[..., 1].long()
+    z = coord[..., 2].long()
+    code = torch.zeros_like(x)
+    for bit in range(int(depth)):
+        code |= ((x >> bit) & 1) << (3 * bit)
+        code |= ((y >> bit) & 1) << (3 * bit + 1)
+        code |= ((z >> bit) & 1) << (3 * bit + 2)
+    return code
+
+
+def _prepare_flash_attn_dtype(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "cuda":
+        return tensor
+    target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return tensor.to(target_dtype) if tensor.dtype != target_dtype else tensor
+
+
+def _warn_flash_attn_fallback() -> None:
+    global _FLASH_ATTN_FALLBACK_WARNED
+    if _FLASH_ATTN_FALLBACK_WARNED:
+        return
+    _FLASH_ATTN_FALLBACK_WARNED = True
+    warnings.warn(
+        "flash_attn_varlen_qkvpacked_func is not being used for serialized "
+        "MotionExpert decoder spatial attention; falling back to PyTorch "
+        "scaled_dot_product_attention. This is expected to use more memory "
+        "and may be slower.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 class FeedForward(nn.Module):
@@ -149,6 +215,140 @@ class LocalGeometryAttentionLayer(nn.Module):
         return x + self.ffn(self.norm2(x))
 
 
+class SerializedLocalAttentionLayer(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: int,
+        dropout: float,
+        patch_size: int = 32,
+        orders: Sequence[str] = ("z", "z-trans"),
+        depth: int = 16,
+        order_index: int = 0,
+    ):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"hidden dim {dim} must be divisible by {num_heads} heads.")
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.dim // self.num_heads
+        self.patch_size = int(patch_size)
+        if self.patch_size <= 0:
+            raise ValueError("decoder_serialized_patch_size must be positive.")
+        self.orders = tuple(str(order) for order in orders)
+        if not self.orders:
+            raise ValueError("decoder_serialized_orders must contain at least one order.")
+        self.depth = int(depth)
+        if self.depth <= 0 or self.depth > 20:
+            raise ValueError("decoder_serialized_depth must be in [1, 20] for int64 Morton codes.")
+        self.order_index = int(order_index)
+        self.scale = self.head_dim ** -0.5
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.coord_proj = nn.Linear(3, dim, bias=False)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = FeedForward(dim, mlp_ratio=mlp_ratio, dropout=dropout)
+
+    def _ordered_qkv(
+        self,
+        x_norm: torch.Tensor,
+        xyz: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_points, _ = x_norm.shape
+        xyz_norm = _normalize_xyz_for_serialization(xyz)
+        grid = _normalized_xyz_to_grid(xyz_norm, self.depth)
+        order_name = self.orders[self.order_index % len(self.orders)]
+        code = _morton3d_code(grid, self.depth, order_name)
+        order = torch.argsort(code, dim=1, stable=True)
+        inverse = torch.empty_like(order)
+        inverse.scatter_(
+            1,
+            order,
+            torch.arange(num_points, device=order.device).expand(batch_size, -1),
+        )
+
+        gather_idx = order.unsqueeze(-1).expand(-1, -1, self.dim)
+        x_with_coord = x_norm + self.coord_proj(xyz_norm.to(dtype=x_norm.dtype))
+        x_ordered = torch.gather(x_with_coord, dim=1, index=gather_idx)
+        qkv = self.qkv(x_ordered).view(
+            batch_size * num_points,
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        return qkv, inverse
+
+    def _cu_seqlens(self, batch_size: int, num_points: int, device: torch.device) -> torch.Tensor:
+        full_windows, remainder = divmod(num_points, self.patch_size)
+        lengths = [self.patch_size] * full_windows
+        if remainder:
+            lengths.append(remainder)
+        if not lengths:
+            lengths = [num_points]
+        lengths_tensor = torch.tensor(lengths, dtype=torch.int32, device=device).repeat(batch_size)
+        cu_seqlens = torch.cumsum(lengths_tensor, dim=0, dtype=torch.int32)
+        return F.pad(cu_seqlens, (1, 0)).to(dtype=torch.int32)
+
+    def _flash_attention(self, qkv: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        qkv_prepared = _prepare_flash_attn_dtype(qkv)
+        out = flash_attn_varlen_qkvpacked_func(
+            qkv_prepared,
+            cu_seqlens,
+            max_seqlen=self.patch_size,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            softmax_scale=self.scale,
+        )
+        return out.to(dtype=qkv.dtype)
+
+    def _sdpa_attention(self, qkv: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        _warn_flash_attn_fallback()
+        outputs = []
+        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+            q, k, v = qkv[start:end].unbind(dim=1)
+            q = q.permute(1, 0, 2).unsqueeze(0)
+            k = k.permute(1, 0, 2).unsqueeze(0)
+            v = v.permute(1, 0, 2).unsqueeze(0)
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+            outputs.append(out.squeeze(0).permute(1, 0, 2))
+        return torch.cat(outputs, dim=0)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        xyz: torch.Tensor,
+        neighbor_idx: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del neighbor_idx
+        residual = x
+        batch_size, num_points, _ = x.shape
+        x_norm = self.norm1(x)
+        qkv, inverse = self._ordered_qkv(x_norm, xyz)
+        cu_seqlens = self._cu_seqlens(batch_size, num_points, x.device)
+
+        if flash_attn_varlen_qkvpacked_func is not None and qkv.device.type == "cuda":
+            out_ordered = self._flash_attention(qkv, cu_seqlens)
+        else:
+            out_ordered = self._sdpa_attention(qkv, cu_seqlens)
+
+        out_ordered = out_ordered.reshape(batch_size, num_points, self.dim)
+        out = torch.gather(
+            out_ordered,
+            dim=1,
+            index=inverse.unsqueeze(-1).expand(-1, -1, self.dim),
+        )
+        x = residual + self.dropout(self.out_proj(out))
+        return x + self.ffn(self.norm2(x))
+
+
 class SparsePointEncoder(nn.Module):
     def __init__(
         self,
@@ -157,8 +357,10 @@ class SparsePointEncoder(nn.Module):
         num_heads: int,
         mlp_ratio: int,
         dropout: float,
+        checkpoint_blocks: bool = True,
     ):
         super().__init__()
+        self.checkpoint_blocks = bool(checkpoint_blocks)
         self.layers = nn.ModuleList(
             [
                 LocalGeometryAttentionLayer(dim, num_heads, mlp_ratio, dropout)
@@ -173,14 +375,46 @@ class SparsePointEncoder(nn.Module):
         neighbor_idx: torch.Tensor,
     ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, xyz, neighbor_idx)
+            if self.training and self.checkpoint_blocks and torch.is_grad_enabled():
+                x = checkpoint(layer, x, xyz, neighbor_idx, use_reentrant=False)
+            else:
+                x = layer(x, xyz, neighbor_idx)
         return x
 
 
 class SparseDecoderBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: int, dropout: float):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: int,
+        dropout: float,
+        spatial_attention: str = "knn",
+        serialized_patch_size: int = 32,
+        serialized_orders: Sequence[str] = ("z", "z-trans"),
+        serialized_depth: int = 16,
+        order_index: int = 0,
+    ):
         super().__init__()
-        self.spatial = LocalGeometryAttentionLayer(dim, num_heads, mlp_ratio, dropout)
+        spatial_attention = str(spatial_attention).lower()
+        if spatial_attention == "knn":
+            self.spatial = LocalGeometryAttentionLayer(dim, num_heads, mlp_ratio, dropout)
+        elif spatial_attention == "serialized_flash":
+            self.spatial = SerializedLocalAttentionLayer(
+                dim=dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                patch_size=serialized_patch_size,
+                orders=serialized_orders,
+                depth=serialized_depth,
+                order_index=order_index,
+            )
+        else:
+            raise ValueError(
+                "decoder_spatial_attention must be `knn` or `serialized_flash`, "
+                f"got `{spatial_attention}`."
+            )
         self.temporal_norm = nn.LayerNorm(dim)
         self.temporal_attn = nn.MultiheadAttention(
             embed_dim=dim,
@@ -245,9 +479,15 @@ class SparseFlowDecoder(nn.Module):
         num_heads: int,
         mlp_ratio: int,
         dropout: float,
+        checkpoint_blocks: bool = True,
+        spatial_attention: str = "knn",
+        serialized_patch_size: int = 32,
+        serialized_orders: Sequence[str] = ("z", "z-trans"),
+        serialized_depth: int = 16,
     ):
         super().__init__()
         self.future_steps = int(future_steps)
+        self.checkpoint_blocks = bool(checkpoint_blocks)
         self.noisy_delta_proj = nn.Linear(3, dim)
         self.step_embed = nn.Embedding(self.future_steps, dim)
         self.tau_mlp = nn.Sequential(
@@ -257,8 +497,18 @@ class SparseFlowDecoder(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                SparseDecoderBlock(dim, num_heads, mlp_ratio, dropout)
-                for _ in range(num_layers)
+                SparseDecoderBlock(
+                    dim,
+                    num_heads,
+                    mlp_ratio,
+                    dropout,
+                    spatial_attention=spatial_attention,
+                    serialized_patch_size=serialized_patch_size,
+                    serialized_orders=serialized_orders,
+                    serialized_depth=serialized_depth,
+                    order_index=idx,
+                )
+                for idx in range(num_layers)
             ]
         )
         self.out_norm = nn.LayerNorm(dim)
@@ -287,7 +537,17 @@ class SparseFlowDecoder(nn.Module):
             + tau_embed[:, None, None, :].to(x_tau.dtype)
         )
         for block in self.blocks:
-            x = block(x, xyz, neighbor_idx, cond_tokens)
+            if self.training and self.checkpoint_blocks and torch.is_grad_enabled():
+                x = checkpoint(
+                    block,
+                    x,
+                    xyz,
+                    neighbor_idx,
+                    cond_tokens,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(x, xyz, neighbor_idx, cond_tokens)
         return self.velocity_head(self.out_norm(x))
 
 
@@ -330,6 +590,7 @@ class MotionExpertModel(nn.Module):
             num_heads=sparse_cfg.num_attention_heads,
             mlp_ratio=sparse_cfg.mlp_ratio,
             dropout=config.dropout,
+            checkpoint_blocks=config.checkpoint_activations,
         )
         self.flow_decoder = SparseFlowDecoder(
             dim=self.token_dim,
@@ -338,6 +599,11 @@ class MotionExpertModel(nn.Module):
             num_heads=sparse_cfg.num_attention_heads,
             mlp_ratio=sparse_cfg.mlp_ratio,
             dropout=config.dropout,
+            checkpoint_blocks=config.checkpoint_activations,
+            spatial_attention=sparse_cfg.decoder_spatial_attention,
+            serialized_patch_size=sparse_cfg.decoder_serialized_patch_size,
+            serialized_orders=sparse_cfg.decoder_serialized_orders,
+            serialized_depth=sparse_cfg.decoder_serialized_depth,
         )
 
         self.register_buffer(
@@ -486,7 +752,7 @@ class MotionExpertModel(nn.Module):
         if visual_tokens is None:
             return None
         batch_size, num_tokens, channels = visual_tokens.shape
-        patch_size = 8 if str(self.config.backbone_type).lower() == "florence2" else 16
+        patch_size = 32 if str(self.config.backbone_type).lower() == "florence2" else 16
         h = math.ceil(int(self.config.input_height) / float(patch_size))
         w = math.ceil(int(self.config.input_width) / float(patch_size))
         if h * w == num_tokens:

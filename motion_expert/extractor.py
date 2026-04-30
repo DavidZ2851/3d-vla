@@ -6,12 +6,10 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 from einops import rearrange
-from timm.models.vision_transformer import RmsNorm
 from torch import nn
 
 from modeling.encoder.vision.florence2 import CLIPTransform, Florence2
 from modeling.encoder.vision.qwen3vl import Qwen3VLBackbone, Qwen3VLNormalize
-from modeling.encoder.vision.vit_fpn import ViTFPN
 
 from .config import FlorenceFeatureExtractorConfig, QwenFeatureExtractorConfig
 
@@ -33,6 +31,11 @@ def _is_peft_wrapped(module: nn.Module) -> bool:
 def _set_trainable_lora_only(module: nn.Module) -> None:
     for name, param in module.named_parameters():
         param.requires_grad = "lora_" in name
+
+
+def _set_requires_grad_all(module: nn.Module, requires_grad: bool) -> None:
+    for param in module.parameters():
+        param.requires_grad = requires_grad
 
 
 def _resolve_model_path(
@@ -114,12 +117,18 @@ class QwenTraceFeatureExtractor(nn.Module):
 
     Outputs:
       - pre-merge Qwen vision patches
-      - text tokens from the Qwen LLM final hidden state
+      - text tokens from the Qwen LLM final hidden state after image-text fusion
     """
 
     def __init__(self, config: Optional[QwenFeatureExtractorConfig] = None):
         super().__init__()
         self.config = config or QwenFeatureExtractorConfig()
+        self._use_vision_lora = bool(
+            self.config.vision_lora_rank > 0 and self.config.vision_lora_num_layers > 0
+        )
+        self._use_llm_lora = bool(
+            self.config.llm_lora_rank > 0 and self.config.llm_lora_num_layers > 0
+        )
         self.normalize = Qwen3VLNormalize(self.config.model_name_or_path)
         self.backbone = Qwen3VLBackbone(
             model_name_or_path=self.config.model_name_or_path,
@@ -136,6 +145,7 @@ class QwenTraceFeatureExtractor(nn.Module):
             gradient_checkpointing=self.config.gradient_checkpointing,
             use_multiscale=False,
         )
+        self._configure_backbone_trainability()
 
     @property
     def visual_token_dim(self) -> int:
@@ -158,6 +168,25 @@ class QwenTraceFeatureExtractor(nn.Module):
         for param in visual_inner.parameters():
             return param.dtype
         return torch.float32
+
+    def _configure_backbone_trainability(self) -> None:
+        vlm = self.backbone.vlm
+        if not self.config.freeze_backbone:
+            _set_requires_grad_all(vlm, True)
+            return
+
+        _set_requires_grad_all(vlm, False)
+        if self._use_vision_lora:
+            _set_trainable_lora_only(vlm.visual)
+        if self._use_llm_lora:
+            _set_trainable_lora_only(vlm.language_model)
+
+    def _backbone_needs_grad(self) -> bool:
+        return (
+            not self.config.freeze_backbone
+            or self._use_vision_lora
+            or self._use_llm_lora
+        )
 
     def forward(
         self,
@@ -182,7 +211,7 @@ class QwenTraceFeatureExtractor(nn.Module):
         if images.dtype != visual_dtype:
             images = images.to(dtype=visual_dtype)
 
-        grad_ctx = nullcontext() if not self.config.freeze_backbone else torch.no_grad()
+        grad_ctx = nullcontext() if self._backbone_needs_grad() else torch.no_grad()
         with grad_ctx:
             pre_merge_visual, text_tokens, _ = self.backbone(
                 images,
@@ -190,6 +219,13 @@ class QwenTraceFeatureExtractor(nn.Module):
                 text_attention_mask=text_attention_mask,
                 text_valid_lens=text_valid_lens,
             )
+
+        if not self._backbone_needs_grad():
+            pre_merge_visual = pre_merge_visual.detach()
+            text_tokens = text_tokens.detach()
+            self.backbone._pre_merge_features = None
+            if self.backbone.use_multiscale:
+                self.backbone._multiscale_features = {}
 
         visual_tokens = pre_merge_visual.reshape(
             pre_merge_visual.shape[0],
@@ -209,15 +245,15 @@ class FlorenceTraceFeatureExtractor(nn.Module):
     """
     Florence2 feature wrapper for MotionExpert.
 
-    It mirrors the Florence path used in the Flower stack:
+    It mirrors the Florence VLM feature contract used in the Flower stack:
       - Florence image+text encoder
-      - DPT/FPN-style visual neck built from hidden states
+      - native Florence visual tokens, without the DPT/FPN neck
       - instruction tokens from the Florence encoder output
 
     Training modes:
       - frozen backbone: `freeze_backbone=True`, `lora_rank=0`
-      - full finetune: `freeze_backbone=False`, `lora_rank=0`
-      - whole-backbone LoRA: `lora_rank>0`
+      - LoRA-only finetune: `freeze_backbone=True`, `lora_rank>0`
+      - full VLM finetune: `freeze_backbone=False`
     """
 
     def __init__(self, config: Optional[FlorenceFeatureExtractorConfig] = None):
@@ -236,24 +272,15 @@ class FlorenceTraceFeatureExtractor(nn.Module):
             self.backbone.vlm.gradient_checkpointing_enable()
 
         self.hidden_dim = int(self.backbone.vlm.config.text_config.d_model)
-        self.visual_neck = ViTFPN(
-            out_res="res3",
-            out_dim=self.hidden_dim,
-            features=[128, 256, 512, 1024],
-            vit_feat_dim=self.hidden_dim,
-        )
-        self.text_norm = RmsNorm(self.hidden_dim)
         self.resolved_lora_target_modules: Sequence[str] = []
+        self._use_lora = bool(self.config.lora_rank > 0)
 
-        if self.config.lora_rank > 0:
+        if self._use_lora:
             self.backbone.vlm, self.resolved_lora_target_modules = _apply_florence_lora(
                 self.backbone.vlm,
                 self.config,
             )
-            _set_trainable_lora_only(self.backbone.vlm)
-        else:
-            for param in self.backbone.parameters():
-                param.requires_grad = not self.config.freeze_backbone
+        self._configure_backbone_trainability()
 
     @property
     def visual_token_dim(self) -> int:
@@ -265,7 +292,7 @@ class FlorenceTraceFeatureExtractor(nn.Module):
 
     @property
     def visual_patch_size(self) -> int:
-        return 8
+        return 32
 
     def estimate_visual_token_count(self, input_height: int, input_width: int) -> int:
         h_feat = math.ceil(int(input_height) / float(self.visual_patch_size))
@@ -277,10 +304,19 @@ class FlorenceTraceFeatureExtractor(nn.Module):
             return param.dtype
         return torch.float32
 
+    def _configure_backbone_trainability(self) -> None:
+        if not self.config.freeze_backbone:
+            _set_requires_grad_all(self.backbone.vlm, True)
+            return
+
+        if self._use_lora:
+            _set_requires_grad_all(self.backbone.vlm, False)
+            _set_trainable_lora_only(self.backbone.vlm)
+        else:
+            _set_requires_grad_all(self.backbone.vlm, False)
+
     def _backbone_needs_grad(self) -> bool:
-        if self.config.lora_rank > 0:
-            return True
-        return not self.config.freeze_backbone
+        return self._use_lora or not self.config.freeze_backbone
 
     def forward(
         self,
@@ -307,55 +343,23 @@ class FlorenceTraceFeatureExtractor(nn.Module):
 
         grad_ctx = nullcontext() if self._backbone_needs_grad() else torch.no_grad()
         with grad_ctx:
-            hidden_states, text_tokens = self.backbone(
+            visual_tokens, text_tokens = self.backbone(
                 images,
                 text_token_ids,
-                output_hidden_states=True,
+                output_hidden_states=False,
             )
 
         h_feat_rgb = math.ceil(height / 32.0)
         w_feat_rgb = math.ceil(width / 32.0)
-        visual_grid = self.visual_neck(
-            {
-                "res5": rearrange(
-                    hidden_states[:, 3],
-                    "b (nc h w) c -> (b nc) c h w",
-                    nc=num_cameras,
-                    h=h_feat_rgb,
-                    w=w_feat_rgb,
-                ),
-                "res4": rearrange(
-                    hidden_states[:, 2],
-                    "b (nc h w) c -> (b nc) c h w",
-                    nc=num_cameras,
-                    h=h_feat_rgb,
-                    w=w_feat_rgb,
-                ),
-                "res3": rearrange(
-                    hidden_states[:, 1],
-                    "b (nc h w) c -> (b nc) c h w",
-                    nc=num_cameras,
-                    h=h_feat_rgb,
-                    w=w_feat_rgb,
-                ),
-                "res2": rearrange(
-                    hidden_states[:, 0],
-                    "b (nc h w) c -> (b nc) c h w",
-                    nc=num_cameras,
-                    h=h_feat_rgb,
-                    w=w_feat_rgb,
-                ),
-            }
-        )
         visual_grid = rearrange(
-            visual_grid,
-            "(b nc) c h w -> b nc h w c",
-            b=batch_size,
+            visual_tokens,
+            "b (nc h w) c -> b nc h w c",
             nc=num_cameras,
+            h=h_feat_rgb,
+            w=w_feat_rgb,
         )
         visual_tokens = visual_grid.reshape(batch_size, -1, visual_grid.shape[-1])
 
-        text_tokens = self.text_norm(text_tokens)
         if text_attention_mask is not None:
             text_tokens = text_tokens * text_attention_mask.to(
                 device=text_tokens.device,

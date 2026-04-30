@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
+import shutil
 from typing import Dict, Optional
 
 import torch
@@ -61,6 +62,7 @@ class MotionExpertTrainer:
         self.clip_grad_norm = float(clip_grad_norm)
         self.mixed_precision = bool(mixed_precision and device.type == "cuda")
         self.best_val_loss = float("inf")
+        self._best_is_last = False
         self._train_iter = None
         self._train_epoch = 0
         if self.train_sampler is not None:
@@ -195,7 +197,14 @@ class MotionExpertTrainer:
             count += 1
         return {key: value / max(count, 1) for key, value in totals.items()}
 
-    def save_checkpoint(self, step: int, is_best: bool = False) -> Path:
+    def save_checkpoint(
+        self,
+        step: int,
+        *,
+        is_best: bool = False,
+        save_latest: bool = True,
+        archive_step: bool = False,
+    ) -> Path:
         checkpoint = {
             "step": int(step),
             "epoch": int(step),
@@ -204,20 +213,47 @@ class MotionExpertTrainer:
             "config": asdict(self.config),
             "best_val_loss": self.best_val_loss,
         }
-        path = self.output_dir / f"checkpoint_step_{int(step)}.pt"
-        torch.save(checkpoint, path)
         last_path = self.output_dir / "last_model.pt"
-        torch.save(checkpoint, last_path)
+        best_path = self.output_dir / "best_model.pt"
+
+        # If "best == last" and we are about to overwrite last with a non-best
+        # state, persist the previous best checkpoint first.
+        if (
+            save_latest
+            and not is_best
+            and self._best_is_last
+            and last_path.exists()
+        ):
+            shutil.copy2(last_path, best_path)
+            self._best_is_last = False
+
+        if save_latest:
+            torch.save(checkpoint, last_path)
+        archive_path = self.output_dir / f"checkpoint_step_{int(step)}.pt"
+        if archive_step:
+            torch.save(checkpoint, archive_path)
         if is_best:
-            best_path = self.output_dir / "best_model.pt"
-            torch.save(checkpoint, best_path)
-        return path
+            if save_latest:
+                # latest and best are identical; keep only last on disk.
+                if best_path.exists():
+                    best_path.unlink()
+                self._best_is_last = True
+            else:
+                torch.save(checkpoint, best_path)
+                self._best_is_last = False
+
+        if save_latest:
+            return last_path
+        if archive_step:
+            return archive_path
+        return best_path
 
     def load_checkpoint(self, checkpoint_path: str) -> int:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.module.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.best_val_loss = checkpoint.get("best_val_loss", self.best_val_loss)
+        self._best_is_last = not (self.output_dir / "best_model.pt").exists()
         if "step" in checkpoint:
             return int(checkpoint["step"])
         return int(checkpoint.get("epoch", -1)) + 1

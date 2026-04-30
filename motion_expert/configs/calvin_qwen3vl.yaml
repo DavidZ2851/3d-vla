@@ -23,6 +23,10 @@ model:
     decoder_layers: 8
     num_attention_heads: 16
     mlp_ratio: 4
+    decoder_spatial_attention: serialized_flash
+    decoder_serialized_patch_size: 32
+    decoder_serialized_orders: [z, z-trans]
+    decoder_serialized_depth: 16
   qwen:
     model_name_or_path: /home/ziyinx/Xiaomi-Robotics-0-Pretrain
     freeze_backbone: true
@@ -31,9 +35,9 @@ model:
     llm_lora_rank: 0
 
 train:
-  output_dir: /data/user_data/ziyinx/datasets/train_logs/motion_expert/calvin_qwen3vl
+  output_dir: /data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/calvin_qwen3vl
   device: cuda
-  batch_size: 128
+  batch_size: 64
   num_workers: 4
   pin_memory: true
   lr: 1.0e-4
@@ -43,12 +47,12 @@ train:
   train_iters: 50000
   train_log_every: 100
   train_eval_every: 5000
-  train_eval_loss_batches: 10
+  train_eval_loss_batches: 500
   train_eval_generation_batches: 2
   save_every_iters: 10000
   val_every_iters: 10000
   val_loss_batches: 500
-  val_num_inference_steps: 20
+  val_num_inference_steps: 10
   val_generation_batches: 8
   guidance_scale: 1.0
   use_calvin_normalization: true
@@ -57,7 +61,7 @@ train:
   wandb:
     enabled: true
     project: 3d-vla
-    name: calvin-qwen3vl-sparse
+    name: motion-qwen3vl-calvin
     mode: online
     tags:
       - calvin
@@ -66,10 +70,11 @@ train:
 
 data:
   train_zarr: /data/user_data/ziyinx/datasets/zarr_datasets/calvin_motion_zarr/train_rechunked8.zarr
-  val_zarr: /data/user_data/ziyinx/datasets/zarr_datasets/calvin_motion_zarr/val_rechunked8.zarr
-  instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/train_instructions.json
-  train_instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/train_instructions.json
-  val_instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/val_instructions.json
+  val_zarr: /data/user_data/ziyinx/datasets/zarr_datasets/calvin_motion_zarr/train_rechunked8.zarr
+  instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/train_motion_instructions_full.json
+  train_instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/train_motion_instructions_full.json
+  val_instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/val_motion_instructions_full.json
   instruction_id_key: instr_id
   mem_limit_gb: 16.0
   traj_3d_xyz_is_delta: true
+  chunk_size: 8

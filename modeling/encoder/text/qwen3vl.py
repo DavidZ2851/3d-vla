@@ -24,12 +24,12 @@ class Qwen3VLTokenizer:
         self.processor = None
         try:
             self.processor = AutoProcessor.from_pretrained(
-                model_name_or_path, trust_remote_code=True
+                model_name_or_path, trust_remote_code=True, use_fast=False
             )
             self.tokenizer = self.processor.tokenizer
         except Exception:
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name_or_path, trust_remote_code=True
+                model_name_or_path, trust_remote_code=True, use_fast=False
             )
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token

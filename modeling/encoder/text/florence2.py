@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoProcessor
+from transformers import AutoProcessor, BartTokenizerFast
 
 
 class Florence2Tokenizer:
@@ -7,10 +7,13 @@ class Florence2Tokenizer:
     def __init__(self, model_name="microsoft/Florence-2-large"):
         super().__init__()
         # Setup processor and tokenizer
-        processor = AutoProcessor.from_pretrained(
-            model_name, trust_remote_code=True
-        )
-        self.tokenizer = processor.tokenizer
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+            self.tokenizer = processor.tokenizer
+        except Exception:
+            self.tokenizer = BartTokenizerFast.from_pretrained(model_name)
 
     @torch.inference_mode()
     def __call__(self, instructions):

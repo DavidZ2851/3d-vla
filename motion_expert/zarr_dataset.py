@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -6,7 +7,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer, BartTokenizerFast
 
 from datasets.utils import read_zarr_with_cache, to_tensor
 
@@ -87,19 +88,49 @@ class InstructionTable:
     def __init__(self, instruction_source: str):
         with open(instruction_source, "r") as handle:
             raw = json.load(handle)
+        self._instructions = self._parse_instruction_source(raw)
+
+    @staticmethod
+    def _coerce_text(value: object) -> str:
+        if isinstance(value, dict):
+            value = value.get("text", value.get("instruction", value))
+        return str(value)
+
+    @classmethod
+    def _parse_instruction_source(cls, raw: object) -> Dict[int, str]:
+        # New schema: {"schema_version": ..., "instructions": [...]}
+        if isinstance(raw, dict) and "instructions" in raw:
+            raw = raw["instructions"]
+
         if isinstance(raw, list):
-            self._instructions = {int(idx): str(text) for idx, text in enumerate(raw)}
-        elif isinstance(raw, dict):
+            mapped: Dict[int, str] = {}
+            # Preferred list format: [{"instruction_id": ..., "text": ...}, ...]
+            if raw and isinstance(raw[0], dict):
+                for entry in raw:
+                    if not isinstance(entry, dict):
+                        continue
+                    if "instruction_id" not in entry:
+                        continue
+                    mapped[int(entry["instruction_id"])] = cls._coerce_text(entry)
+                if mapped:
+                    return mapped
+            # Fallback list format: plain text list indexed by position.
+            return {int(idx): cls._coerce_text(text) for idx, text in enumerate(raw)}
+
+        if isinstance(raw, dict):
             mapped = {}
             for key, value in raw.items():
-                if isinstance(value, dict):
-                    value = value.get("text", value.get("instruction", value))
-                mapped[int(key)] = str(value)
-            self._instructions = mapped
-        else:
-            raise ValueError(
-                f"Unsupported instruction table type: {type(raw).__name__}."
-            )
+                try:
+                    instruction_id = int(key)
+                except (TypeError, ValueError):
+                    continue
+                mapped[instruction_id] = cls._coerce_text(value)
+            if mapped:
+                return mapped
+
+        raise ValueError(
+            f"Unsupported instruction table structure: {type(raw).__name__}."
+        )
 
     def resolve(self, instruction_id: int) -> str:
         if instruction_id not in self._instructions:
@@ -130,17 +161,29 @@ class MotionExpertQwenTokenizer:
             )
         self.max_length = int(max_length)
         self.processor = None
-        try:
-            self.processor = AutoProcessor.from_pretrained(
-                model_name_or_path,
-                trust_remote_code=True,
-            )
-            self.tokenizer = self.processor.tokenizer
-        except Exception:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name_or_path,
-                trust_remote_code=True,
-            )
+        if self.backbone_type == "florence2":
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    model_name_or_path,
+                    trust_remote_code=True,
+                )
+                self.tokenizer = self.processor.tokenizer
+            except Exception:
+                self.tokenizer = BartTokenizerFast.from_pretrained(model_name_or_path)
+        else:
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    model_name_or_path,
+                    trust_remote_code=True,
+                    use_fast=False,
+                )
+                self.tokenizer = self.processor.tokenizer
+            except Exception:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_name_or_path,
+                    trust_remote_code=True,
+                    use_fast=False,
+                )
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -174,6 +217,7 @@ class MotionExpertZarrDataset(Dataset):
         mem_limit_gb: float = 16.0,
         traj_3d_xyz_is_delta: Optional[bool] = None,
         max_samples: Optional[int] = None,
+        chunk_size: int = 1,
     ):
         super().__init__()
         self.annos = read_zarr_with_cache(root, mem_gb=mem_limit_gb)
@@ -184,6 +228,15 @@ class MotionExpertZarrDataset(Dataset):
         self.max_samples = None if max_samples is None else int(max_samples)
         if self.max_samples is not None and self.max_samples <= 0:
             raise ValueError("max_samples must be positive when provided.")
+        self.chunk_size = int(chunk_size)
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_size must be positive.")
+        self._raw_length = len(self.annos["rgb"])
+        self._effective_raw_length = (
+            self._raw_length
+            if self.max_samples is None
+            else min(self._raw_length, self.max_samples)
+        )
         self.instruction_id_key = self._resolve_instruction_key(instruction_id_key)
         self.traj_mask_key = self._resolve_traj_mask_key()
         self.traj_3d_xyz_is_delta = self._resolve_traj_delta_semantics(
@@ -234,10 +287,11 @@ class MotionExpertZarrDataset(Dataset):
         return "calvin" in joined
 
     def __len__(self) -> int:
-        full_length = len(self.annos["rgb"])
-        if self.max_samples is None:
-            return full_length
-        return min(full_length, self.max_samples)
+        if self._effective_raw_length <= 0:
+            return 0
+        if self.chunk_size == 1:
+            return self._effective_raw_length
+        return int(math.ceil(self._effective_raw_length / float(self.chunk_size)))
 
     def _load_tensor(self, key: str, idx: int, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         value = to_tensor(self.annos[key][idx])
@@ -245,31 +299,47 @@ class MotionExpertZarrDataset(Dataset):
             value = value.to(dtype=dtype)
         return value
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        rgb = self._load_tensor("rgb", idx, dtype=torch.float32)
+    def _load_tensor_slice(
+        self,
+        key: str,
+        start: int,
+        end: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        value = to_tensor(self.annos[key][start:end])
+        if dtype is not None:
+            value = value.to(dtype=dtype)
+        return value
+
+    def _build_single_sample_from_prefetched(
+        self,
+        local_idx: int,
+        prefetched: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        rgb = prefetched["rgb"][local_idx].to(dtype=torch.float32)
         if rgb.dim() != 3:
             raise ValueError(f"Expected rgb to have shape [3, H, W], got {tuple(rgb.shape)}.")
         if rgb.max() > 1.0:
             rgb = rgb / 255.0
 
-        query_uv = self._load_tensor("query_uv", idx, dtype=torch.float32)
+        query_uv = prefetched["query_uv"][local_idx].to(dtype=torch.float32)
         if query_uv.dim() == 3:
             query_uv = query_uv.unsqueeze(0)
         query_uv = flatten_query_grid(query_uv)
 
         query_world_xyz = None
-        if "query_world_xyz" in self.annos:
-            query_world_xyz = self._load_tensor("query_world_xyz", idx, dtype=torch.float32)
+        if "query_world_xyz" in prefetched:
+            query_world_xyz = prefetched["query_world_xyz"][local_idx].to(dtype=torch.float32)
             if query_world_xyz.dim() == 3:
                 query_world_xyz = query_world_xyz.unsqueeze(0)
             query_world_xyz = flatten_query_grid(query_world_xyz)
 
-        traj_3d_xyz = self._load_tensor("traj_3d_xyz", idx, dtype=torch.float32)
+        traj_3d_xyz = prefetched["traj_3d_xyz"][local_idx].to(dtype=torch.float32)
         if traj_3d_xyz.dim() == 4:
             traj_3d_xyz = traj_3d_xyz.unsqueeze(0)
         traj_3d_xyz = flatten_future_grid(traj_3d_xyz)
 
-        traj_mask = self._load_tensor(self.traj_mask_key, idx).bool()
+        traj_mask = prefetched["traj_mask"][local_idx].bool()
         if traj_mask.dim() == 4:
             traj_mask = traj_mask.all(dim=-1)
         if (
@@ -293,14 +363,14 @@ class MotionExpertZarrDataset(Dataset):
         depth = None
         intrinsics = None
         extrinsics = None
-        if self.depth_key is not None:
-            depth = self._load_tensor(self.depth_key, idx, dtype=torch.float32)
+        if "depth" in prefetched:
+            depth = prefetched["depth"][local_idx].to(dtype=torch.float32)
             depth = aspect_resize_and_pad_depth(depth, self.image_size)
-        if self.intrinsics_key is not None:
-            intrinsics = self._load_tensor(self.intrinsics_key, idx, dtype=torch.float32)
+        if "intrinsics" in prefetched:
+            intrinsics = prefetched["intrinsics"][local_idx].to(dtype=torch.float32)
             intrinsics = transform_intrinsics_for_resize_pad(intrinsics, src_hw, self.image_size)
-        if self.extrinsics_key is not None:
-            extrinsics = self._load_tensor(self.extrinsics_key, idx, dtype=torch.float32)
+        if "extrinsics" in prefetched:
+            extrinsics = prefetched["extrinsics"][local_idx].to(dtype=torch.float32)
 
         if query_world_xyz is None and (depth is None or intrinsics is None or extrinsics is None):
             raise KeyError(
@@ -336,7 +406,7 @@ class MotionExpertZarrDataset(Dataset):
             )
         query_world_xyz = center_query_world_xyz(query_world_xyz_raw)
 
-        instruction_id = int(self._load_tensor(self.instruction_id_key, idx).item())
+        instruction_id = int(prefetched["instruction_id"][local_idx].item())
         instruction_text = self.instructions.resolve(instruction_id)
 
         sample = {
@@ -358,50 +428,160 @@ class MotionExpertZarrDataset(Dataset):
             sample["extrinsics"] = extrinsics.float()
         return sample
 
+    @staticmethod
+    def _pack_samples(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        if len(samples) == 1:
+            return samples[0]
+        packed = {
+            "rgb": torch.stack([sample["rgb"] for sample in samples]),
+            "instruction_text": [sample["instruction_text"] for sample in samples],
+            "instruction_id": torch.tensor(
+                [sample["instruction_id"] for sample in samples],
+                dtype=torch.long,
+            ),
+            "query_uv": torch.stack([sample["query_uv"] for sample in samples]),
+            "traj_3d_xyz": torch.stack([sample["traj_3d_xyz"] for sample in samples]),
+            "future_delta_xyz": torch.stack([sample["future_delta_xyz"] for sample in samples]),
+            "traj_mask": torch.stack([sample["traj_mask"] for sample in samples]),
+            "image_hw": torch.stack([sample["image_hw"] for sample in samples]),
+        }
+        if all("query_world_xyz" in sample for sample in samples):
+            packed["query_world_xyz"] = torch.stack([sample["query_world_xyz"] for sample in samples])
+        if all("depth" in sample for sample in samples):
+            packed["depth"] = torch.stack([sample["depth"] for sample in samples])
+        if all("intrinsics" in sample for sample in samples):
+            packed["intrinsics"] = torch.stack([sample["intrinsics"] for sample in samples])
+        if all("extrinsics" in sample for sample in samples):
+            packed["extrinsics"] = torch.stack([sample["extrinsics"] for sample in samples])
+        return packed
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        if self._effective_raw_length <= 0:
+            raise IndexError("Dataset is empty.")
+
+        if self.chunk_size == 1:
+            raw_start = idx % self._effective_raw_length
+            raw_end = raw_start + 1
+        else:
+            chunk_idx = idx % len(self)
+            raw_start = chunk_idx * self.chunk_size
+            raw_end = min(raw_start + self.chunk_size, self._effective_raw_length)
+
+        prefetched: Dict[str, torch.Tensor] = {
+            "rgb": self._load_tensor_slice("rgb", raw_start, raw_end, dtype=torch.float32),
+            "query_uv": self._load_tensor_slice("query_uv", raw_start, raw_end, dtype=torch.float32),
+            "traj_3d_xyz": self._load_tensor_slice("traj_3d_xyz", raw_start, raw_end, dtype=torch.float32),
+            "traj_mask": self._load_tensor_slice(self.traj_mask_key, raw_start, raw_end),
+            "instruction_id": self._load_tensor_slice(self.instruction_id_key, raw_start, raw_end),
+        }
+        if "query_world_xyz" in self.annos:
+            prefetched["query_world_xyz"] = self._load_tensor_slice(
+                "query_world_xyz",
+                raw_start,
+                raw_end,
+                dtype=torch.float32,
+            )
+        if self.depth_key is not None:
+            prefetched["depth"] = self._load_tensor_slice(
+                self.depth_key,
+                raw_start,
+                raw_end,
+                dtype=torch.float32,
+            )
+        if self.intrinsics_key is not None:
+            prefetched["intrinsics"] = self._load_tensor_slice(
+                self.intrinsics_key,
+                raw_start,
+                raw_end,
+                dtype=torch.float32,
+            )
+        if self.extrinsics_key is not None:
+            prefetched["extrinsics"] = self._load_tensor_slice(
+                self.extrinsics_key,
+                raw_start,
+                raw_end,
+                dtype=torch.float32,
+            )
+
+        sample_count = int(raw_end - raw_start)
+        samples = [
+            self._build_single_sample_from_prefetched(local_idx=local_idx, prefetched=prefetched)
+            for local_idx in range(sample_count)
+        ]
+        return self._pack_samples(samples)
+
 
 class MotionExpertCollator:
     def __init__(self, tokenizer: MotionExpertQwenTokenizer):
         self.tokenizer = tokenizer
 
+    @staticmethod
+    def _expand_packed_samples(sample: Dict[str, torch.Tensor]) -> List[Dict[str, torch.Tensor]]:
+        rgb = sample["rgb"]
+        if not torch.is_tensor(rgb) or rgb.dim() == 3:
+            return [sample]
+
+        chunk_len = int(rgb.shape[0])
+        expanded: List[Dict[str, torch.Tensor]] = []
+        for sample_idx in range(chunk_len):
+            flat_sample: Dict[str, torch.Tensor] = {}
+            for key, value in sample.items():
+                if key == "instruction_text":
+                    flat_sample[key] = value[sample_idx]
+                    continue
+                if torch.is_tensor(value):
+                    flat_sample[key] = value[sample_idx]
+                    continue
+                if isinstance(value, (list, tuple)):
+                    flat_sample[key] = value[sample_idx]
+                else:
+                    flat_sample[key] = value
+            expanded.append(flat_sample)
+        return expanded
+
     def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> MotionExpertBatch:
-        instructions = [sample["instruction_text"] for sample in batch]
+        flat_batch: List[Dict[str, torch.Tensor]] = []
+        for sample in batch:
+            flat_batch.extend(self._expand_packed_samples(sample))
+
+        instructions = [sample["instruction_text"] for sample in flat_batch]
         tokenized = self.tokenizer(instructions)
         attention_mask = tokenized.attention_mask
         return MotionExpertBatch(
-            rgb=torch.stack([sample["rgb"] for sample in batch]),
+            rgb=torch.stack([sample["rgb"] for sample in flat_batch]),
             instruction_text=instructions,
             instruction_id=torch.tensor(
-                [sample["instruction_id"] for sample in batch],
+                [sample["instruction_id"] for sample in flat_batch],
                 dtype=torch.long,
             ),
             text_token_ids=tokenized.input_ids,
             text_attention_mask=attention_mask,
             text_valid_lens=attention_mask.sum(dim=1),
             depth=(
-                torch.stack([sample["depth"] for sample in batch])
-                if all("depth" in sample for sample in batch)
+                torch.stack([sample["depth"] for sample in flat_batch])
+                if all("depth" in sample for sample in flat_batch)
                 else None
             ),
             intrinsics=(
-                torch.stack([sample["intrinsics"] for sample in batch])
-                if all("intrinsics" in sample for sample in batch)
+                torch.stack([sample["intrinsics"] for sample in flat_batch])
+                if all("intrinsics" in sample for sample in flat_batch)
                 else None
             ),
             extrinsics=(
-                torch.stack([sample["extrinsics"] for sample in batch])
-                if all("extrinsics" in sample for sample in batch)
+                torch.stack([sample["extrinsics"] for sample in flat_batch])
+                if all("extrinsics" in sample for sample in flat_batch)
                 else None
             ),
-            query_uv=torch.stack([sample["query_uv"] for sample in batch]),
+            query_uv=torch.stack([sample["query_uv"] for sample in flat_batch]),
             query_world_xyz=(
-                torch.stack([sample["query_world_xyz"] for sample in batch])
-                if all("query_world_xyz" in sample for sample in batch)
+                torch.stack([sample["query_world_xyz"] for sample in flat_batch])
+                if all("query_world_xyz" in sample for sample in flat_batch)
                 else None
             ),
-            traj_3d_xyz=torch.stack([sample["traj_3d_xyz"] for sample in batch]),
-            future_delta_xyz=torch.stack([sample["future_delta_xyz"] for sample in batch]),
-            traj_mask=torch.stack([sample["traj_mask"] for sample in batch]),
-            image_hw=torch.stack([sample["image_hw"] for sample in batch]),
+            traj_3d_xyz=torch.stack([sample["traj_3d_xyz"] for sample in flat_batch]),
+            future_delta_xyz=torch.stack([sample["future_delta_xyz"] for sample in flat_batch]),
+            traj_mask=torch.stack([sample["traj_mask"] for sample in flat_batch]),
+            image_hw=torch.stack([sample["image_hw"] for sample in flat_batch]),
         )
 
 

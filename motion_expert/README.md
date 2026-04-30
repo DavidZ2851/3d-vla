@@ -14,7 +14,7 @@ The model combines:
 Two backbone families are supported:
 
 - `qwen`: pre-merge Qwen3-VL visual patches, patch size 16
-- `florence2`: Florence2 encoder with the DPT/FPN neck, patch size 8
+- `florence2`: native Florence2 visual tokens, patch size 32
 
 ## Tensor Contract
 
