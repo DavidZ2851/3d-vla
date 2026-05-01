@@ -26,6 +26,7 @@ from .pipeline import (
 )
 from .trainer import MotionExpertTrainer
 from .tracegen_compat import build_default_inference_scheduler
+from .visualization import save_motion_expert_spaghetti_batch
 
 __all__ = [
     "MotionExpertBatch",
@@ -49,6 +50,7 @@ __all__ = [
     "extract_calvin_normalization_tensors",
     "load_calvin_normalization_stats",
     "save_calvin_normalization_stats",
+    "save_motion_expert_spaghetti_batch",
 ]
 
 try:

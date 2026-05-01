@@ -277,6 +277,39 @@ def _barrier_if_distributed(distributed: bool) -> None:
         dist.barrier(device_ids=[torch.cuda.current_device()])
 
 
+def _build_spaghetti_viz_kwargs(
+    train_cfg: dict,
+    *,
+    output_dir: str,
+    prefix: str,
+) -> Dict[str, object]:
+    max_samples = int(train_cfg.get("spaghetti_viz_max_samples", 0))
+    if max_samples <= 0:
+        return {}
+    viz_dir = Path(
+        train_cfg.get(
+            "spaghetti_viz_dir",
+            Path(output_dir) / "spaghetti_viz",
+        )
+    )
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    rgb_dir = Path(
+        train_cfg.get(
+            "spaghetti_rgb_viz_dir",
+            viz_dir / "rgb",
+        )
+    )
+    rgb_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "spaghetti_viz_output_dir": str(viz_dir),
+        "spaghetti_viz_prefix": str(prefix),
+        "spaghetti_viz_max_samples": max_samples,
+        "spaghetti_motion_threshold": float(train_cfg.get("spaghetti_motion_threshold", 0.005)),
+        "spaghetti_max_points_per_sample": int(train_cfg.get("spaghetti_max_points_per_sample", 200)),
+        "spaghetti_rgb_output_dir": str(rgb_dir),
+    }
+
+
 def main():
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args = parse_args()
@@ -482,10 +515,16 @@ def main():
             raise ValueError("Validation-only mode requires `data.val_zarr`.")
         if is_main_process:
             val_loss = trainer.evaluate_loss()
+            val_viz_kwargs = _build_spaghetti_viz_kwargs(
+                train_cfg,
+                output_dir=train_cfg["output_dir"],
+                prefix=f"val_only_step_{start_step}",
+            )
             val_gen = trainer.evaluate_generation(
                 num_inference_steps=int(train_cfg.get("val_num_inference_steps", 20)),
                 guidance_scale=float(train_cfg.get("guidance_scale", 1.0)),
                 max_batches=int(train_cfg.get("val_generation_batches", 1)),
+                **val_viz_kwargs,
             )
             metrics = {}
             metrics.update(_prefixed(val_loss, "val"))
@@ -518,7 +557,7 @@ def main():
             val_every if val_every > 0 else train_eval_every,
         )
     )
-    archive_ckpt_start_step = int(train_cfg.get("archive_ckpt_start_step", 30000))
+    archive_ckpt_start_step = int(train_cfg.get("archive_ckpt_start_step", 10000))
     inference_steps = int(train_cfg.get("val_num_inference_steps", 20))
     guidance_scale = float(train_cfg.get("guidance_scale", 1.0))
     val_gen_batches = int(train_cfg.get("val_generation_batches", 1))
@@ -554,11 +593,17 @@ def main():
                 loader=train_loader,
                 max_batches=train_eval_loss_batches,
             )
+            train_eval_viz_kwargs = _build_spaghetti_viz_kwargs(
+                train_cfg,
+                output_dir=train_cfg["output_dir"],
+                prefix=f"train_eval_step_{completed_step}",
+            )
             train_eval_gen = trainer.evaluate_generation(
                 loader=train_loader,
                 num_inference_steps=inference_steps,
                 guidance_scale=guidance_scale,
                 max_batches=train_eval_generation_batches,
+                **train_eval_viz_kwargs,
             )
             train_eval_metrics = {}
             train_eval_metrics.update(_prefixed(train_eval_loss, "train_eval"))
@@ -582,11 +627,17 @@ def main():
                 loader=val_loader,
                 max_batches=val_loss_batches,
             )
+            val_viz_kwargs = _build_spaghetti_viz_kwargs(
+                train_cfg,
+                output_dir=train_cfg["output_dir"],
+                prefix=f"val_step_{completed_step}",
+            )
             val_gen = trainer.evaluate_generation(
                 loader=val_loader,
                 num_inference_steps=inference_steps,
                 guidance_scale=guidance_scale,
                 max_batches=val_gen_batches,
+                **val_viz_kwargs,
             )
             val_loss_value = val_loss.get("loss", float("inf"))
             log_payload = {}

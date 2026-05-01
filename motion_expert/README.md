@@ -108,3 +108,21 @@ pipeline = MotionExpertPipeline.from_backbone(MotionExpertConfig(backbone_type="
 
 The zarr training path accepts `query_world_xyz` directly, or `depth` +
 `intrinsics` + `extrinsics` as a fallback for reconstructing query XYZ.
+
+## Validation Spaghetti Visualization
+
+Validation generation can now save 3D spaghetti plots for moving points only:
+
+- GT trajectory: pink
+- Pred trajectory: green
+- History is preserved (anchor + all valid future waypoints)
+
+Configure in your train config under `train`:
+
+```yaml
+train:
+  spaghetti_viz_max_samples: 8
+  spaghetti_viz_dir: /path/to/output/spaghetti_viz  # optional
+  spaghetti_motion_threshold: 0.005                 # optional (meters)
+  spaghetti_max_points_per_sample: 200              # optional
+```

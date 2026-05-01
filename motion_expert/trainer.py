@@ -16,6 +16,7 @@ from .config import MotionExpertConfig
 from .data import MotionExpertBatch
 from .pipeline import MotionExpertPipeline
 from .tracegen_compat import build_default_inference_scheduler
+from .visualization import save_motion_expert_spaghetti_batch
 
 
 class MotionExpertTrainer:
@@ -168,6 +169,12 @@ class MotionExpertTrainer:
         num_inference_steps: int = 20,
         guidance_scale: float = 1.0,
         max_batches: int = 1,
+        spaghetti_viz_output_dir: Optional[str] = None,
+        spaghetti_viz_prefix: str = "val",
+        spaghetti_viz_max_samples: int = 0,
+        spaghetti_motion_threshold: float = 0.005,
+        spaghetti_max_points_per_sample: int = 200,
+        spaghetti_rgb_output_dir: Optional[str] = None,
     ) -> Dict[str, float]:
         loader = self.val_loader if loader is None else loader
         if loader is None:
@@ -178,6 +185,11 @@ class MotionExpertTrainer:
         )
         totals: Dict[str, float] = {}
         count = 0
+        viz_saved = 0
+        viz_enabled = (
+            spaghetti_viz_output_dir is not None
+            and int(spaghetti_viz_max_samples) > 0
+        )
         for batch_idx, batch in enumerate(loader):
             if batch_idx >= max_batches:
                 break
@@ -194,8 +206,40 @@ class MotionExpertTrainer:
                 if key == "pred_delta_xyz":
                     continue
                 totals[key] = totals.get(key, 0.0) + float(value.item())
+
+            if viz_enabled and viz_saved < int(spaghetti_viz_max_samples):
+                pred_delta_xyz = outputs.get("pred_delta_xyz")
+                if (
+                    pred_delta_xyz is not None
+                    and batch.query_world_xyz is not None
+                    and batch.future_delta_xyz is not None
+                    and batch.traj_mask is not None
+                ):
+                    remaining = int(spaghetti_viz_max_samples) - viz_saved
+                    try:
+                        saved_paths = save_motion_expert_spaghetti_batch(
+                            query_world_xyz=batch.query_world_xyz.detach().cpu(),
+                            gt_delta_xyz=batch.future_delta_xyz.detach().cpu(),
+                            pred_delta_xyz=pred_delta_xyz.detach().cpu(),
+                            traj_mask=batch.traj_mask.detach().cpu(),
+                            output_dir=spaghetti_viz_output_dir,
+                            prefix=spaghetti_viz_prefix,
+                            start_index=viz_saved,
+                            max_samples=remaining,
+                            motion_threshold=float(spaghetti_motion_threshold),
+                            max_points_per_sample=int(spaghetti_max_points_per_sample),
+                            instruction_text=batch.instruction_text,
+                            rgb=batch.rgb.detach().cpu() if batch.rgb is not None else None,
+                            rgb_output_dir=spaghetti_rgb_output_dir,
+                        )
+                        viz_saved += len(saved_paths)
+                    except Exception as exc:
+                        print(f"[motion_expert][viz] failed to render spaghetti plots: {exc}")
             count += 1
-        return {key: value / max(count, 1) for key, value in totals.items()}
+        averaged = {key: value / max(count, 1) for key, value in totals.items()}
+        if viz_enabled:
+            averaged["spaghetti_viz_saved"] = float(viz_saved)
+        return averaged
 
     def save_checkpoint(
         self,

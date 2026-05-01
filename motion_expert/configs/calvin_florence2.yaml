@@ -36,21 +36,21 @@ model:
 train:
   output_dir: /data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/calvin_florence2
   device: cuda
-  batch_size: 64
+  batch_size: 32
   num_workers: 4
   pin_memory: true
   lr: 1.0e-4
   weight_decay: 5.0e-3
   clip_grad_norm: 1.0
   mixed_precision: true
-  train_iters: 50000
+  train_iters: 20000
   train_log_every: 100
-  train_eval_every: 5000
-  train_eval_loss_batches: 500
+  train_eval_every: 1000
+  train_eval_loss_batches: 200
   train_eval_generation_batches: 2
-  save_every_iters: 10000
-  val_every_iters: 10000
-  val_loss_batches: 500
+  save_every_iters: 2000
+  val_every_iters: 2000
+  val_loss_batches: 200
   val_num_inference_steps: 10
   val_generation_batches: 8
   guidance_scale: 1.0
