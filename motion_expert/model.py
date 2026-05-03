@@ -9,7 +9,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from .config import MotionExpertConfig
-from .geometry import center_query_world_xyz
+from .geometry import center_query_world_xyz, validate_query_uv_grid
 
 
 NORMALIZED_CLAMP_ABS = 2.0
@@ -226,6 +226,7 @@ class SerializedLocalAttentionLayer(nn.Module):
         orders: Sequence[str] = ("z", "z-trans"),
         depth: int = 16,
         order_index: int = 0,
+        shift_windows: bool = True,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -243,6 +244,7 @@ class SerializedLocalAttentionLayer(nn.Module):
         if self.depth <= 0 or self.depth > 20:
             raise ValueError("decoder_serialized_depth must be in [1, 20] for int64 Morton codes.")
         self.order_index = int(order_index)
+        self.shift_windows = bool(shift_windows)
         self.scale = self.head_dim ** -0.5
 
         self.norm1 = nn.LayerNorm(dim)
@@ -282,13 +284,32 @@ class SerializedLocalAttentionLayer(nn.Module):
         )
         return qkv, inverse
 
-    def _cu_seqlens(self, batch_size: int, num_points: int, device: torch.device) -> torch.Tensor:
-        full_windows, remainder = divmod(num_points, self.patch_size)
-        lengths = [self.patch_size] * full_windows
+    def _shift_offset(self, num_points: int) -> int:
+        if not self.shift_windows or num_points <= self.patch_size or self.patch_size <= 1:
+            return 0
+        order_cycle = self.order_index // len(self.orders)
+        if order_cycle % 2 == 0:
+            return 0
+        return min(num_points, self.patch_size // 2)
+
+    def _window_lengths(self, num_points: int) -> Tuple[int, ...]:
+        shift_offset = self._shift_offset(num_points)
+        remaining = num_points
+        lengths = []
+        if shift_offset > 0:
+            lengths.append(shift_offset)
+            remaining -= shift_offset
+
+        full_windows, remainder = divmod(remaining, self.patch_size)
+        lengths.extend([self.patch_size] * full_windows)
         if remainder:
             lengths.append(remainder)
         if not lengths:
             lengths = [num_points]
+        return tuple(lengths)
+
+    def _cu_seqlens(self, batch_size: int, num_points: int, device: torch.device) -> torch.Tensor:
+        lengths = self._window_lengths(num_points)
         lengths_tensor = torch.tensor(lengths, dtype=torch.int32, device=device).repeat(batch_size)
         cu_seqlens = torch.cumsum(lengths_tensor, dim=0, dtype=torch.int32)
         return F.pad(cu_seqlens, (1, 0)).to(dtype=torch.int32)
@@ -394,6 +415,7 @@ class SparseDecoderBlock(nn.Module):
         serialized_orders: Sequence[str] = ("z", "z-trans"),
         serialized_depth: int = 16,
         order_index: int = 0,
+        serialized_shift_windows: bool = True,
     ):
         super().__init__()
         spatial_attention = str(spatial_attention).lower()
@@ -409,6 +431,7 @@ class SparseDecoderBlock(nn.Module):
                 orders=serialized_orders,
                 depth=serialized_depth,
                 order_index=order_index,
+                shift_windows=serialized_shift_windows,
             )
         else:
             raise ValueError(
@@ -440,6 +463,7 @@ class SparseDecoderBlock(nn.Module):
         xyz: torch.Tensor,
         neighbor_idx: torch.Tensor,
         cond_tokens: torch.Tensor,
+        cond_key_padding_mask: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, num_points, num_steps, dim = x.shape
         x_bt = x.permute(0, 2, 1, 3).reshape(batch_size * num_steps, num_points, dim)
@@ -464,7 +488,13 @@ class SparseDecoderBlock(nn.Module):
 
         x_flat = x.reshape(batch_size, num_points * num_steps, dim)
         cond_in = self.cond_norm(x_flat)
-        cond_out, _ = self.cond_attn(cond_in, cond_tokens, cond_tokens, need_weights=False)
+        cond_out, _ = self.cond_attn(
+            cond_in,
+            cond_tokens,
+            cond_tokens,
+            key_padding_mask=cond_key_padding_mask,
+            need_weights=False,
+        )
         x_flat = x_flat + self.cond_dropout(cond_out)
         x_flat = x_flat + self.ffn(self.ffn_norm(x_flat))
         return x_flat.reshape(batch_size, num_points, num_steps, dim)
@@ -484,6 +514,7 @@ class SparseFlowDecoder(nn.Module):
         serialized_patch_size: int = 32,
         serialized_orders: Sequence[str] = ("z", "z-trans"),
         serialized_depth: int = 16,
+        serialized_shift_windows: bool = True,
     ):
         super().__init__()
         self.future_steps = int(future_steps)
@@ -507,6 +538,7 @@ class SparseFlowDecoder(nn.Module):
                     serialized_orders=serialized_orders,
                     serialized_depth=serialized_depth,
                     order_index=idx,
+                    serialized_shift_windows=serialized_shift_windows,
                 )
                 for idx in range(num_layers)
             ]
@@ -522,6 +554,8 @@ class SparseFlowDecoder(nn.Module):
         xyz: torch.Tensor,
         neighbor_idx: torch.Tensor,
         cond_tokens: torch.Tensor,
+        cond_key_padding_mask: torch.Tensor,
+        return_hidden: bool = False,
     ) -> torch.Tensor:
         batch_size, num_points, num_steps, _ = x_tau.shape
         if num_steps != self.future_steps:
@@ -544,11 +578,16 @@ class SparseFlowDecoder(nn.Module):
                     xyz,
                     neighbor_idx,
                     cond_tokens,
+                    cond_key_padding_mask,
                     use_reentrant=False,
                 )
             else:
-                x = block(x, xyz, neighbor_idx, cond_tokens)
-        return self.velocity_head(self.out_norm(x))
+                x = block(x, xyz, neighbor_idx, cond_tokens, cond_key_padding_mask)
+        hidden = self.out_norm(x)
+        velocity = self.velocity_head(hidden)
+        if return_hidden:
+            return velocity, hidden
+        return velocity
 
 
 class MotionExpertModel(nn.Module):
@@ -569,6 +608,9 @@ class MotionExpertModel(nn.Module):
         sparse_cfg = config.sparse_decoder
         self.token_dim = sparse_cfg.hidden_dim
         self.max_conditioning_tokens = max_conditioning_tokens
+        self.visual_global_tokens = int(sparse_cfg.visual_global_tokens)
+        if self.visual_global_tokens <= 0:
+            raise ValueError("sparse_decoder.visual_global_tokens must be positive.")
         self.knn_k = int(config.knn_k)
 
         self.point_scalar_proj = nn.Sequential(
@@ -604,6 +646,7 @@ class MotionExpertModel(nn.Module):
             serialized_patch_size=sparse_cfg.decoder_serialized_patch_size,
             serialized_orders=sparse_cfg.decoder_serialized_orders,
             serialized_depth=sparse_cfg.decoder_serialized_depth,
+            serialized_shift_windows=sparse_cfg.decoder_serialized_shift_windows,
         )
 
         self.register_buffer(
@@ -762,20 +805,54 @@ class MotionExpertModel(nn.Module):
             return visual_tokens.reshape(batch_size, side, side, channels)
         return None
 
+    @staticmethod
+    def _visual_pool_hw(num_tokens: int) -> Tuple[int, int]:
+        pool_h = max(1, int(math.floor(math.sqrt(num_tokens))))
+        pool_w = int(math.ceil(num_tokens / float(pool_h)))
+        return pool_h, pool_w
+
+    def _pool_visual_conditioning_tokens(
+        self,
+        visual_tokens: torch.Tensor,
+        visual_grid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.visual_global_tokens == 1:
+            return visual_tokens.mean(dim=1, keepdim=True)
+
+        pool_h, pool_w = self._visual_pool_hw(self.visual_global_tokens)
+        if visual_grid is not None and visual_grid.dim() in (4, 5):
+            grid = visual_grid
+            if grid.dim() == 5:
+                batch_size, num_cameras, height, width, channels = grid.shape
+                grid = grid.reshape(batch_size, num_cameras * height, width, channels)
+            grid_nchw = grid.permute(0, 3, 1, 2).contiguous()
+            pooled = F.adaptive_avg_pool2d(grid_nchw.float(), (pool_h, pool_w))
+            pooled = pooled.flatten(2).transpose(1, 2)
+            return pooled[:, : self.visual_global_tokens].to(dtype=visual_tokens.dtype)
+
+        pooled = F.adaptive_avg_pool1d(
+            visual_tokens.transpose(1, 2).float(),
+            self.visual_global_tokens,
+        )
+        return pooled.transpose(1, 2).to(dtype=visual_tokens.dtype)
+
     def sample_visual_features(
         self,
         query_uv: torch.Tensor,
         visual_tokens: torch.Tensor,
         visual_grid: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        query_uv = validate_query_uv_grid(query_uv)
         if visual_grid is None:
             visual_grid = self._infer_visual_grid(visual_tokens)
-        if visual_grid is not None:
-            if visual_grid.dim() == 5:
-                visual_grid = visual_grid[:, 0]
-            if visual_grid.dim() != 4:
-                raise ValueError(f"visual_grid must have shape [B, H, W, C] or [B, ncam, H, W, C], got {tuple(visual_grid.shape)}.")
-            grid_nchw = visual_grid.permute(0, 3, 1, 2).contiguous()
+        global_visual = self._pool_visual_conditioning_tokens(visual_tokens, visual_grid)
+        sampling_grid = visual_grid
+        if sampling_grid is not None:
+            if sampling_grid.dim() == 5:
+                sampling_grid = sampling_grid[:, 0]
+            if sampling_grid.dim() != 4:
+                raise ValueError(f"visual_grid must have shape [B, H, W, C] or [B, ncam, H, W, C], got {tuple(sampling_grid.shape)}.")
+            grid_nchw = sampling_grid.permute(0, 3, 1, 2).contiguous()
             sample_grid = query_uv.float().unsqueeze(2)
             sampled = F.grid_sample(
                 grid_nchw.float(),
@@ -787,8 +864,37 @@ class MotionExpertModel(nn.Module):
             sampled = sampled.squeeze(-1).transpose(1, 2).to(visual_tokens.dtype)
         else:
             sampled = visual_tokens.mean(dim=1, keepdim=True).expand(-1, query_uv.shape[1], -1)
-        global_visual = visual_tokens.mean(dim=1, keepdim=True)
         return sampled, global_visual
+
+    def _build_conditioning_key_padding_mask(
+        self,
+        text_tokens: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor],
+        global_token_count: int,
+    ) -> torch.Tensor:
+        batch_size, text_token_count, _ = text_tokens.shape
+        global_mask = torch.zeros(
+            batch_size,
+            int(global_token_count),
+            dtype=torch.bool,
+            device=text_tokens.device,
+        )
+        if text_attention_mask is None:
+            text_mask = torch.zeros(
+                batch_size,
+                text_token_count,
+                dtype=torch.bool,
+                device=text_tokens.device,
+            )
+        else:
+            if text_attention_mask.shape != text_tokens.shape[:2]:
+                raise ValueError(
+                    "text_attention_mask must match text_tokens shape [B, L], "
+                    f"got {tuple(text_attention_mask.shape)} for text_tokens "
+                    f"{tuple(text_tokens.shape[:2])}."
+                )
+            text_mask = text_attention_mask.to(device=text_tokens.device) <= 0
+        return torch.cat([global_mask, text_mask], dim=1)
 
     def build_point_context(
         self,
@@ -796,9 +902,11 @@ class MotionExpertModel(nn.Module):
         query_world_xyz: torch.Tensor,
         visual_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor] = None,
         visual_grid: Optional[torch.Tensor] = None,
         query_depth: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        query_uv = validate_query_uv_grid(query_uv)
         query_world_xyz = center_query_world_xyz(query_world_xyz)
         query_world_xyz_norm = self.normalize_query_xyz(query_world_xyz)
 
@@ -819,7 +927,12 @@ class MotionExpertModel(nn.Module):
         global_visual_tokens = self.visual_proj(global_visual) + self.global_visual_type_embed
         text_cond_tokens = self.text_proj(text_tokens) + self.text_type_embed
         cond_tokens = torch.cat([global_visual_tokens, text_cond_tokens], dim=1)
-        return point_context, neighbor_idx, cond_tokens
+        cond_key_padding_mask = self._build_conditioning_key_padding_mask(
+            text_tokens=text_tokens,
+            text_attention_mask=text_attention_mask,
+            global_token_count=global_visual_tokens.shape[1],
+        )
+        return point_context, neighbor_idx, cond_tokens, cond_key_padding_mask
 
     def build_conditioning_tokens(
         self,
@@ -827,12 +940,14 @@ class MotionExpertModel(nn.Module):
         query_world_xyz: torch.Tensor,
         visual_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        point_context, _, cond_tokens = self.build_point_context(
+        point_context, _, cond_tokens, _ = self.build_point_context(
             query_uv=query_uv,
             query_world_xyz=query_world_xyz,
             visual_tokens=visual_tokens,
             text_tokens=text_tokens,
+            text_attention_mask=text_attention_mask,
         )
         return torch.cat([point_context, cond_tokens], dim=1)
 
@@ -843,16 +958,18 @@ class MotionExpertModel(nn.Module):
         visual_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
         target_delta_xyz_norm: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor] = None,
         visual_grid: Optional[torch.Tensor] = None,
         query_depth: Optional[torch.Tensor] = None,
     ):
         batch_size = target_delta_xyz_norm.shape[0]
         query_world_xyz = center_query_world_xyz(query_world_xyz)
-        point_context, neighbor_idx, cond_tokens = self.build_point_context(
+        point_context, neighbor_idx, cond_tokens, cond_key_padding_mask = self.build_point_context(
             query_uv=query_uv,
             query_world_xyz=query_world_xyz,
             visual_tokens=visual_tokens,
             text_tokens=text_tokens,
+            text_attention_mask=text_attention_mask,
             visual_grid=visual_grid,
             query_depth=query_depth,
         )
@@ -872,6 +989,7 @@ class MotionExpertModel(nn.Module):
             xyz=query_world_xyz,
             neighbor_idx=neighbor_idx,
             cond_tokens=cond_tokens,
+            cond_key_padding_mask=cond_key_padding_mask,
         )
         return {
             "pred_velocity": pred_velocity,
@@ -884,23 +1002,90 @@ class MotionExpertModel(nn.Module):
             "neighbor_idx": neighbor_idx,
         }
 
+    def extract_one_ode_step_latent(
+        self,
+        query_uv: torch.Tensor,
+        query_world_xyz: torch.Tensor,
+        visual_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor] = None,
+        visual_grid: Optional[torch.Tensor] = None,
+        query_depth: Optional[torch.Tensor] = None,
+        solver_steps: int = 10,
+        steps_to_run: int = 1,
+        generator: Optional[torch.Generator] = None,
+    ) -> dict:
+        del solver_steps
+        if int(steps_to_run) != 1:
+            raise ValueError(
+                "Motion latent extraction currently supports exactly one ODE "
+                f"solver step, got steps_to_run={steps_to_run}."
+            )
+        motion_pos = torch.nan_to_num(
+            query_world_xyz.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        query_world_xyz = center_query_world_xyz(query_world_xyz)
+        point_context, neighbor_idx, cond_tokens, cond_key_padding_mask = self.build_point_context(
+            query_uv=query_uv,
+            query_world_xyz=query_world_xyz,
+            visual_tokens=visual_tokens,
+            text_tokens=text_tokens,
+            text_attention_mask=text_attention_mask,
+            visual_grid=visual_grid,
+            query_depth=query_depth,
+        )
+        batch_size, num_points, _ = query_world_xyz.shape
+        x = torch.randn(
+            batch_size,
+            num_points,
+            self.config.future_steps,
+            3,
+            device=query_world_xyz.device,
+            dtype=point_context.dtype,
+            generator=generator,
+        )
+        tau = torch.zeros(
+            batch_size,
+            device=query_world_xyz.device,
+            dtype=x.dtype,
+        )
+        _, motion_hidden = self.flow_decoder(
+            x_tau=x,
+            tau=tau,
+            point_context=point_context,
+            xyz=query_world_xyz,
+            neighbor_idx=neighbor_idx,
+            cond_tokens=cond_tokens,
+            cond_key_padding_mask=cond_key_padding_mask,
+            return_hidden=True,
+        )
+        return {
+            "motion_hidden": motion_hidden,
+            "motion_pos": motion_pos,
+        }
+
     def predict(
         self,
         query_uv: torch.Tensor,
         query_world_xyz: torch.Tensor,
         visual_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor] = None,
         visual_grid: Optional[torch.Tensor] = None,
         query_depth: Optional[torch.Tensor] = None,
         num_inference_steps: int = 50,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         query_world_xyz = center_query_world_xyz(query_world_xyz)
-        point_context, neighbor_idx, cond_tokens = self.build_point_context(
+        point_context, neighbor_idx, cond_tokens, cond_key_padding_mask = self.build_point_context(
             query_uv=query_uv,
             query_world_xyz=query_world_xyz,
             visual_tokens=visual_tokens,
             text_tokens=text_tokens,
+            text_attention_mask=text_attention_mask,
             visual_grid=visual_grid,
             query_depth=query_depth,
         )
@@ -930,6 +1115,7 @@ class MotionExpertModel(nn.Module):
                 xyz=query_world_xyz,
                 neighbor_idx=neighbor_idx,
                 cond_tokens=cond_tokens,
+                cond_key_padding_mask=cond_key_padding_mask,
             )
             x = x + velocity * dt
         x = torch.clamp(x, -NORMALIZED_CLAMP_ABS, NORMALIZED_CLAMP_ABS)

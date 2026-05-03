@@ -205,7 +205,11 @@ class MotionExpertPipeline(nn.Module):
             if ((config.input_width // patch_size) % spatial_merge_size) != 0:
                 raise ValueError("input_width is incompatible with Qwen spatial merge size.")
 
-        max_conditioning_tokens = config.num_query_tokens + 1 + config.text_max_length
+        max_conditioning_tokens = (
+            config.num_query_tokens
+            + int(config.sparse_decoder.visual_global_tokens)
+            + config.text_max_length
+        )
         model = MotionExpertModel(
             config=config,
             visual_input_dim=feature_extractor.visual_token_dim,
@@ -318,6 +322,7 @@ class MotionExpertPipeline(nn.Module):
             query_world_xyz=query_world_xyz,
             visual_tokens=visual_tokens,
             text_tokens=text_tokens,
+            text_attention_mask=batch.text_attention_mask,
             target_delta_xyz_norm=future_delta_xyz_norm,
             visual_grid=visual_grid,
             query_depth=query_depth,
@@ -370,6 +375,7 @@ class MotionExpertPipeline(nn.Module):
             query_world_xyz=query_world_xyz,
             visual_tokens=visual_tokens,
             text_tokens=text_tokens,
+            text_attention_mask=batch.text_attention_mask,
             visual_grid=visual_grid,
             query_depth=query_depth,
             num_inference_steps=num_inference_steps,

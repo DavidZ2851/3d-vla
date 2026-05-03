@@ -58,6 +58,11 @@ def _build_motion_expert_config(raw_cfg: dict) -> MotionExpertConfig:
     florence_cfg = raw_cfg.get("florence", {})
     decoder_cfg = raw_cfg.get("decoder", {})
     sparse_decoder_cfg = raw_cfg.get("sparse_decoder", {})
+    if "query_uv_is_normalized" in raw_cfg:
+        raise ValueError(
+            "`query_uv_is_normalized` is deprecated and ambiguous. "
+            "Use `query_uv_format` with one of: source_pixels, source_unit, model_grid."
+        )
     return MotionExpertConfig(
         backbone_type=raw_cfg.get("backbone_type", "qwen"),
         grid_size=raw_cfg.get("grid_size", 20),
@@ -72,9 +77,9 @@ def _build_motion_expert_config(raw_cfg: dict) -> MotionExpertConfig:
         motion_weight_static_floor=raw_cfg.get("motion_weight_static_floor", 0.05),
         input_height=raw_cfg.get("input_height", 384),
         input_width=raw_cfg.get("input_width", 640),
-        text_max_length=raw_cfg.get("text_max_length", 128),
+        text_max_length=raw_cfg.get("text_max_length", 16),
         image_pad_value=raw_cfg.get("image_pad_value", 0.5),
-        query_uv_is_normalized=raw_cfg.get("query_uv_is_normalized", False),
+        query_uv_format=raw_cfg.get("query_uv_format", "source_pixels"),
         checkpoint_activations=raw_cfg.get("checkpoint_activations", True),
         dropout=raw_cfg.get("dropout", 0.1),
         use_calvin_percentile_normalization=raw_cfg.get(
@@ -343,7 +348,7 @@ def main():
         instructions_path=data_cfg.get("train_instructions_path", data_cfg["instructions_path"]),
         image_size=(model_cfg.input_height, model_cfg.input_width),
         instruction_id_key=data_cfg.get("instruction_id_key"),
-        query_uv_is_normalized=model_cfg.query_uv_is_normalized,
+        query_uv_format=model_cfg.query_uv_format,
         image_pad_value=model_cfg.image_pad_value,
         mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
         traj_3d_xyz_is_delta=data_cfg.get("traj_3d_xyz_is_delta"),
@@ -360,7 +365,7 @@ def main():
             ),
             image_size=(model_cfg.input_height, model_cfg.input_width),
             instruction_id_key=data_cfg.get("instruction_id_key"),
-            query_uv_is_normalized=model_cfg.query_uv_is_normalized,
+            query_uv_format=model_cfg.query_uv_format,
             image_pad_value=model_cfg.image_pad_value,
             mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
             traj_3d_xyz_is_delta=data_cfg.get("traj_3d_xyz_is_delta"),
@@ -386,6 +391,21 @@ def main():
         persistent_workers=bool(train_cfg.get("persistent_workers", False))
         and int(train_cfg.get("num_workers", 4)) > 0,
     )
+    train_eval_loader = None
+    if is_main_process:
+        train_eval_loader = DataLoader(
+            train_dataset,
+            batch_size=_chunk_loader_batch_size(
+                int(train_cfg.get("batch_size", 2)),
+                int(data_cfg.get("chunk_size", 1)),
+            ),
+            shuffle=False,
+            num_workers=int(train_cfg.get("num_workers", 4)),
+            pin_memory=bool(train_cfg.get("pin_memory", False)),
+            collate_fn=collator,
+            persistent_workers=bool(train_cfg.get("persistent_workers", False))
+            and int(train_cfg.get("num_workers", 4)) > 0,
+        )
     val_loader = None
     if val_dataset is not None and is_main_process:
         val_loader = DataLoader(
@@ -502,6 +522,21 @@ def main():
         find_unused_parameters=bool(train_cfg.get("find_unused_parameters", False)),
         train_sampler=train_sampler,
     )
+    train_iters = int(
+        train_cfg.get(
+            "train_iters",
+            int(train_cfg.get("epochs", 1)) * max(len(train_loader), 1),
+        )
+    )
+    scheduler_type = str(train_cfg.get("lr_scheduler", "cosine_with_warmup")).lower()
+    warmup_steps = int(train_cfg.get("lr_warmup_steps", max(500, int(0.03 * train_iters))))
+    min_lr = float(train_cfg.get("min_lr", max(1e-6, 0.1 * float(train_cfg.get("lr", 1e-4)))))
+    trainer.configure_lr_scheduler(
+        total_steps=train_iters,
+        scheduler_type=scheduler_type,
+        warmup_steps=warmup_steps,
+        min_lr=min_lr,
+    )
 
     start_step = 0
     if args.resume:
@@ -511,6 +546,8 @@ def main():
     wandb_run = _init_wandb(raw_cfg, train_cfg, validate_only=args.validate_only) if is_main_process else None
 
     if args.validate_only:
+        if not args.resume:
+            raise ValueError("`--validate-only` requires `--resume` to evaluate a trained checkpoint.")
         if is_main_process and val_loader is None:
             raise ValueError("Validation-only mode requires `data.val_zarr`.")
         if is_main_process:
@@ -539,12 +576,6 @@ def main():
             dist.destroy_process_group()
         return
 
-    train_iters = int(
-        train_cfg.get(
-            "train_iters",
-            int(train_cfg.get("epochs", 1)) * max(len(train_loader), 1),
-        )
-    )
     train_log_every = int(train_cfg.get("train_log_every", 100))
     train_eval_every = int(train_cfg.get("train_eval_every", train_cfg.get("val_freq", 0)))
     train_eval_loss_batches = int(train_cfg.get("train_eval_loss_batches", 10))
@@ -589,8 +620,10 @@ def main():
             running_train_count = 0
 
         if is_main_process and train_eval_every > 0 and completed_step % train_eval_every == 0:
+            if train_eval_loader is None:
+                raise RuntimeError("train_eval_loader is unavailable on main process.")
             train_eval_loss = trainer.evaluate_loss(
-                loader=train_loader,
+                loader=train_eval_loader,
                 max_batches=train_eval_loss_batches,
             )
             train_eval_viz_kwargs = _build_spaghetti_viz_kwargs(
@@ -599,7 +632,7 @@ def main():
                 prefix=f"train_eval_step_{completed_step}",
             )
             train_eval_gen = trainer.evaluate_generation(
-                loader=train_loader,
+                loader=train_eval_loader,
                 num_inference_steps=inference_steps,
                 guidance_scale=guidance_scale,
                 max_batches=train_eval_generation_batches,

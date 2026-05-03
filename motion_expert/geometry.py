@@ -3,6 +3,68 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+QUERY_UV_FORMAT_SOURCE_PIXELS = "source_pixels"
+QUERY_UV_FORMAT_SOURCE_UNIT = "source_unit"
+QUERY_UV_FORMAT_MODEL_GRID = "model_grid"
+QUERY_UV_FORMATS = (
+    QUERY_UV_FORMAT_SOURCE_PIXELS,
+    QUERY_UV_FORMAT_SOURCE_UNIT,
+    QUERY_UV_FORMAT_MODEL_GRID,
+)
+_UV_RANGE_EPS = 1e-4
+
+
+def normalize_query_uv_format(query_uv_format: str) -> str:
+    normalized = str(query_uv_format).lower()
+    if normalized not in QUERY_UV_FORMATS:
+        raise ValueError(
+            "query_uv_format must be one of "
+            f"{QUERY_UV_FORMATS}, got `{query_uv_format}`."
+        )
+    return normalized
+
+
+def _validate_query_uv_range(
+    query_uv: torch.Tensor,
+    *,
+    min_xy: Tuple[float, float],
+    max_xy: Tuple[float, float],
+    query_uv_format: str,
+    eps: float = _UV_RANGE_EPS,
+) -> torch.Tensor:
+    if query_uv.shape[-1] != 2:
+        raise ValueError(f"Expected query_uv last dim to be 2, got {tuple(query_uv.shape)}.")
+    uv = query_uv.float()
+    if not bool(torch.isfinite(uv).all().item()):
+        raise ValueError(f"query_uv contains non-finite values for format `{query_uv_format}`.")
+
+    min_tensor = uv.new_tensor(min_xy)
+    max_tensor = uv.new_tensor(max_xy)
+    below = uv < (min_tensor - eps)
+    above = uv > (max_tensor + eps)
+    if bool((below | above).any().item()):
+        reduce_dims = tuple(range(uv.dim() - 1))
+        observed_min_tensor = uv.amin(dim=reduce_dims) if reduce_dims else uv
+        observed_max_tensor = uv.amax(dim=reduce_dims) if reduce_dims else uv
+        observed_min = observed_min_tensor.detach().cpu().tolist()
+        observed_max = observed_max_tensor.detach().cpu().tolist()
+        raise ValueError(
+            f"query_uv values for format `{query_uv_format}` must be within "
+            f"[{list(min_xy)}, {list(max_xy)}], observed min={observed_min}, "
+            f"max={observed_max}."
+        )
+    return uv
+
+
+def validate_query_uv_grid(query_uv: torch.Tensor) -> torch.Tensor:
+    """Validate model-side UV in torch grid_sample convention [-1, 1]."""
+    return _validate_query_uv_range(
+        query_uv,
+        min_xy=(-1.0, -1.0),
+        max_xy=(1.0, 1.0),
+        query_uv_format=QUERY_UV_FORMAT_MODEL_GRID,
+    )
+
 
 def center_query_world_xyz(query_world_xyz: torch.Tensor) -> torch.Tensor:
     """Center query XYZ by the per-sample finite-point mean.
@@ -40,35 +102,53 @@ def compute_resize_pad_params(
     return scale, resized_h, resized_w, pad_top, pad_left
 
 
-def normalize_query_uv(
+def query_uv_to_source_pixels(
     query_uv: torch.Tensor,
     image_hw: Tuple[int, int],
-    uv_is_normalized: bool,
+    query_uv_format: str,
 ) -> torch.Tensor:
-    """Convert UV to raw pixel coordinates in the source image."""
-    if uv_is_normalized:
-        height, width = int(image_hw[0]), int(image_hw[1])
-        scale = query_uv.new_tensor(
-            [max(width - 1, 1), max(height - 1, 1)],
-            dtype=query_uv.dtype,
+    """Convert source-image UV to raw pixel coordinates."""
+    query_uv_format = normalize_query_uv_format(query_uv_format)
+    height, width = int(image_hw[0]), int(image_hw[1])
+    max_xy = (float(max(width - 1, 1)), float(max(height - 1, 1)))
+
+    if query_uv_format == QUERY_UV_FORMAT_SOURCE_PIXELS:
+        return _validate_query_uv_range(
+            query_uv,
+            min_xy=(0.0, 0.0),
+            max_xy=max_xy,
+            query_uv_format=query_uv_format,
         )
-        return query_uv * scale
-    return query_uv
+    if query_uv_format == QUERY_UV_FORMAT_SOURCE_UNIT:
+        query_uv_01 = _validate_query_uv_range(
+            query_uv,
+            min_xy=(0.0, 0.0),
+            max_xy=(1.0, 1.0),
+            query_uv_format=query_uv_format,
+        )
+        return query_uv_01 * query_uv_01.new_tensor(max_xy)
+
+    raise ValueError(
+        "`model_grid` UV is already in padded model-canvas coordinates and "
+        "cannot be converted to source pixels."
+    )
 
 
 def aspect_resize_and_pad_rgb_and_query_uv(
     rgb: torch.Tensor,
     query_uv: torch.Tensor,
     target_hw: Tuple[int, int],
-    uv_is_normalized: bool = False,
+    query_uv_format: str = QUERY_UV_FORMAT_SOURCE_PIXELS,
     pad_value: float = 0.5,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Resize while preserving aspect ratio, then center-pad to the target canvas.
 
-    Returns the padded image and the transformed UV normalized to [-1, 1] in the
-    padded image coordinate frame, matching torch.nn.functional.grid_sample.
+    Returns the padded image and UV in [-1, 1] padded model-canvas coordinates,
+    matching torch.nn.functional.grid_sample. Source UV can be raw pixels,
+    source-image [0, 1], or already-normalized model-grid coordinates.
     """
+    query_uv_format = normalize_query_uv_format(query_uv_format)
     if rgb.dim() != 3:
         raise ValueError(f"Expected rgb to have shape [3, H, W], got {tuple(rgb.shape)}.")
 
@@ -76,12 +156,6 @@ def aspect_resize_and_pad_rgb_and_query_uv(
     target_h, target_w = int(target_hw[0]), int(target_hw[1])
     if target_h <= 0 or target_w <= 0:
         raise ValueError(f"Invalid target size {(target_h, target_w)}.")
-
-    query_uv_px = normalize_query_uv(
-        query_uv.float(),
-        image_hw=(src_h, src_w),
-        uv_is_normalized=uv_is_normalized,
-    )
 
     scale, resized_h, resized_w, pad_top, pad_left = compute_resize_pad_params(
         (src_h, src_w),
@@ -99,6 +173,14 @@ def aspect_resize_and_pad_rgb_and_query_uv(
     padded_rgb = rgb.new_full((3, target_h, target_w), float(pad_value)).float()
     padded_rgb[:, pad_top : pad_top + resized_h, pad_left : pad_left + resized_w] = resized_rgb
 
+    if query_uv_format == QUERY_UV_FORMAT_MODEL_GRID:
+        return padded_rgb, validate_query_uv_grid(query_uv)
+
+    query_uv_px = query_uv_to_source_pixels(
+        query_uv.float(),
+        image_hw=(src_h, src_w),
+        query_uv_format=query_uv_format,
+    )
     query_uv_resized = query_uv_px * scale
     query_uv_resized[..., 0] += pad_left
     query_uv_resized[..., 1] += pad_top
@@ -107,8 +189,10 @@ def aspect_resize_and_pad_rgb_and_query_uv(
         [max(target_w - 1, 1), max(target_h - 1, 1)],
         dtype=query_uv_resized.dtype,
     )
-    query_uv_01 = torch.clamp(query_uv_resized / denom, 0.0, 1.0)
+    query_uv_01 = query_uv_resized / denom
     query_uv_grid = query_uv_01.mul(2.0).sub(1.0)
+    validate_query_uv_grid(query_uv_grid)
+    query_uv_grid = torch.clamp(query_uv_grid, -1.0, 1.0)
     return padded_rgb, query_uv_grid
 
 
@@ -167,6 +251,7 @@ def sample_depth_at_query_uv(
         depth = depth.unsqueeze(1)
     if depth.dim() != 4 or depth.shape[1] != 1:
         raise ValueError(f"Expected depth shape [B, H, W] or [B, 1, H, W], got {tuple(depth.shape)}.")
+    query_uv = validate_query_uv_grid(query_uv)
     grid = query_uv.float().unsqueeze(2)
     sampled = F.grid_sample(
         depth.float(),
@@ -199,6 +284,7 @@ def query_uv_depth_to_world_xyz(
     if extrinsics.dim() == 2:
         extrinsics = extrinsics.unsqueeze(0).expand(batch_size, -1, -1)
 
+    query_uv = validate_query_uv_grid(query_uv)
     query_depth = sample_depth_at_query_uv(depth, query_uv)
     query_uv_01 = query_uv.float().add(1.0).mul(0.5)
     uv_px = query_uv_01 * query_uv.new_tensor(

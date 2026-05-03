@@ -1,7 +1,6 @@
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
-import shutil
 from typing import Dict, Optional
 
 import torch
@@ -9,6 +8,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -55,15 +55,18 @@ class MotionExpertTrainer:
                 find_unused_parameters=find_unused_parameters,
             )
         self.pipeline = pipeline
+        trainable_params = [param for param in self.pipeline.parameters() if param.requires_grad]
+        if not trainable_params:
+            raise ValueError("MotionExpertTrainer requires at least one trainable parameter.")
         self.optimizer = AdamW(
-            self.pipeline.parameters(),
+            trainable_params,
             lr=lr,
             weight_decay=weight_decay,
         )
+        self.lr_scheduler = None
         self.clip_grad_norm = float(clip_grad_norm)
         self.mixed_precision = bool(mixed_precision and device.type == "cuda")
         self.best_val_loss = float("inf")
-        self._best_is_last = False
         self._train_iter = None
         self._train_epoch = 0
         if self.train_sampler is not None:
@@ -80,6 +83,13 @@ class MotionExpertTrainer:
             return torch.autocast(device_type=self.device.type, enabled=False)
         return torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
 
+    def _is_main_process(self) -> bool:
+        if not self.distributed:
+            return True
+        if not dist.is_available() or not dist.is_initialized():
+            return True
+        return dist.get_rank() == 0
+
     def _next_train_batch(self) -> MotionExpertBatch:
         if self._train_iter is None:
             self._train_iter = iter(self.train_loader)
@@ -92,6 +102,56 @@ class MotionExpertTrainer:
             self._train_iter = iter(self.train_loader)
             batch = next(self._train_iter)
         return batch
+
+    def configure_lr_scheduler(
+        self,
+        total_steps: int,
+        scheduler_type: str = "cosine_with_warmup",
+        warmup_steps: int = 0,
+        min_lr: float = 1e-6,
+    ) -> None:
+        total_steps = max(1, int(total_steps))
+        warmup_steps = max(0, min(int(warmup_steps), total_steps - 1))
+        scheduler_type = str(scheduler_type).lower()
+        if scheduler_type in ("none", "constant"):
+            self.lr_scheduler = None
+            return
+        if scheduler_type == "cosine":
+            self.lr_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=total_steps,
+                eta_min=float(min_lr),
+            )
+            return
+        if scheduler_type == "cosine_with_warmup":
+            if warmup_steps <= 0:
+                self.lr_scheduler = CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=total_steps,
+                    eta_min=float(min_lr),
+                )
+                return
+            warmup_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(1, total_steps - warmup_steps),
+                eta_min=float(min_lr),
+            )
+            self.lr_scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_steps],
+            )
+            return
+        raise ValueError(
+            "Unsupported lr scheduler type. Use one of: "
+            "`none`, `constant`, `cosine`, `cosine_with_warmup`."
+        )
 
     @staticmethod
     def _update_scalar_totals(
@@ -118,6 +178,8 @@ class MotionExpertTrainer:
         if self.clip_grad_norm > 0.0:
             nn.utils.clip_grad_norm_(self.pipeline.parameters(), self.clip_grad_norm)
         self.optimizer.step()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
 
         totals: Dict[str, float] = {}
         self._update_scalar_totals(totals, outputs)
@@ -125,6 +187,9 @@ class MotionExpertTrainer:
 
     def train_epoch(self) -> Dict[str, float]:
         self.pipeline.train()
+        if self.train_sampler is not None:
+            self.train_sampler.set_epoch(self._train_epoch)
+        self._train_iter = None
         totals: Dict[str, float] = {}
         total_batches = 0
         for batch in self.train_loader:
@@ -132,6 +197,8 @@ class MotionExpertTrainer:
             for key, value in step_metrics.items():
                 totals[key] = totals.get(key, 0.0) + value
             total_batches += 1
+        self._train_epoch += 1
+        self._train_iter = None
         return {
             key: value / max(total_batches, 1)
             for key, value in totals.items()
@@ -249,42 +316,35 @@ class MotionExpertTrainer:
         save_latest: bool = True,
         archive_step: bool = False,
     ) -> Path:
+        last_path = self.output_dir / "last_model.pt"
+        best_path = self.output_dir / "best_model.pt"
+        archive_path = self.output_dir / f"checkpoint_step_{int(step)}.pt"
+        if not self._is_main_process():
+            if is_best:
+                return best_path
+            if save_latest:
+                return last_path
+            if archive_step:
+                return archive_path
+            return best_path
         checkpoint = {
             "step": int(step),
-            "epoch": int(step),
+            "epoch": int(self._train_epoch),
+            "train_epoch": int(self._train_epoch),
             "model_state_dict": self.module.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "config": asdict(self.config),
             "best_val_loss": self.best_val_loss,
         }
-        last_path = self.output_dir / "last_model.pt"
-        best_path = self.output_dir / "best_model.pt"
-
-        # If "best == last" and we are about to overwrite last with a non-best
-        # state, persist the previous best checkpoint first.
-        if (
-            save_latest
-            and not is_best
-            and self._best_is_last
-            and last_path.exists()
-        ):
-            shutil.copy2(last_path, best_path)
-            self._best_is_last = False
+        if self.lr_scheduler is not None:
+            checkpoint["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
 
         if save_latest:
             torch.save(checkpoint, last_path)
-        archive_path = self.output_dir / f"checkpoint_step_{int(step)}.pt"
         if archive_step:
             torch.save(checkpoint, archive_path)
         if is_best:
-            if save_latest:
-                # latest and best are identical; keep only last on disk.
-                if best_path.exists():
-                    best_path.unlink()
-                self._best_is_last = True
-            else:
-                torch.save(checkpoint, best_path)
-                self._best_is_last = False
+            torch.save(checkpoint, best_path)
 
         if save_latest:
             return last_path
@@ -293,11 +353,25 @@ class MotionExpertTrainer:
         return best_path
 
     def load_checkpoint(self, checkpoint_path: str) -> int:
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=False,
+        )
         self.module.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if self.lr_scheduler is not None and "lr_scheduler_state_dict" in checkpoint:
+            self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
         self.best_val_loss = checkpoint.get("best_val_loss", self.best_val_loss)
-        self._best_is_last = not (self.output_dir / "best_model.pt").exists()
+        self._train_iter = None
+        if "train_epoch" in checkpoint:
+            self._train_epoch = int(checkpoint["train_epoch"])
+        elif "step" not in checkpoint and "epoch" in checkpoint:
+            self._train_epoch = int(checkpoint["epoch"])
+        else:
+            self._train_epoch = 0
+        if self.train_sampler is not None:
+            self.train_sampler.set_epoch(self._train_epoch)
         if "step" in checkpoint:
             return int(checkpoint["step"])
         return int(checkpoint.get("epoch", -1)) + 1

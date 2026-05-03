@@ -7,6 +7,7 @@ values with a sparse flow-matching decoder.
 The model combines:
 
 - query-local VLM features sampled at each point UV
+- pooled visual summary tokens for decoder cross-attention
 - PointWorld-style kNN point encoding over current-frame XYZ
 - TraceGen-style flow matching in normalized delta space
 - PhysCtrl-style spatial then temporal sparse trajectory decoding
@@ -32,6 +33,16 @@ Two backbone families are supported:
 
 No `valid_depth`, robot, or gripper fields are part of the batch API.
 
+The zarr training loader accepts raw `query_uv` in one explicit format:
+
+- `query_uv_format: source_pixels`: source RGB pixel coordinates `[u, v]`
+- `query_uv_format: source_unit`: source RGB unit coordinates in `[0, 1]`
+- `query_uv_format: model_grid`: already-normalized padded model-canvas coordinates in `[-1, 1]`
+
+CALVIN motion zarrs store `query_uv` as source-image pixel coordinates, so the
+CALVIN configs use `query_uv_format: source_pixels`. The model and pipeline
+always consume `MotionExpertBatch.query_uv` in `model_grid` form.
+
 ## Model Layout
 
 1. Extract or receive visual/text tokens.
@@ -40,7 +51,10 @@ No `valid_depth`, robot, or gripper fields are part of the batch API.
 4. Build a fixed kNN graph from centered current observed XYZ.
 5. Encode point context with local geometry attention.
 6. Denoise `[B, 400, 15, 3]` normalized deltas with sparse decoder blocks:
-   local spatial attention, temporal attention, global visual/text conditioning, and FFN.
+   local spatial attention, temporal attention, pooled visual/text conditioning, and FFN.
+
+`sparse_decoder.visual_global_tokens` controls how many pooled visual summary
+tokens are exposed to decoder cross-attention.
 
 Training uses one supervision mask: `traj_mask`.
 

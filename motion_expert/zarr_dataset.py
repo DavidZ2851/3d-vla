@@ -13,12 +13,14 @@ from datasets.utils import read_zarr_with_cache, to_tensor
 
 from .data import MotionExpertBatch, flatten_future_grid, flatten_query_grid
 from .geometry import (
+    QUERY_UV_FORMAT_SOURCE_PIXELS,
     aspect_resize_and_pad_rgb_and_query_uv,
     aspect_resize_and_pad_depth,
     center_query_world_xyz,
     compute_stepwise_future_delta,
     fill_invalid_delta_with_zero,
     fill_invalid_traj_with_last_valid,
+    normalize_query_uv_format,
     query_uv_depth_to_world_xyz,
     transform_intrinsics_for_resize_pad,
 )
@@ -212,7 +214,7 @@ class MotionExpertZarrDataset(Dataset):
         instructions_path: str,
         image_size: Tuple[int, int] = (384, 640),
         instruction_id_key: Optional[str] = None,
-        query_uv_is_normalized: bool = False,
+        query_uv_format: str = QUERY_UV_FORMAT_SOURCE_PIXELS,
         image_pad_value: float = 0.5,
         mem_limit_gb: float = 16.0,
         traj_3d_xyz_is_delta: Optional[bool] = None,
@@ -223,7 +225,7 @@ class MotionExpertZarrDataset(Dataset):
         self.annos = read_zarr_with_cache(root, mem_gb=mem_limit_gb)
         self.instructions = InstructionTable(instructions_path)
         self.image_size = (int(image_size[0]), int(image_size[1]))
-        self.query_uv_is_normalized = bool(query_uv_is_normalized)
+        self.query_uv_format = normalize_query_uv_format(query_uv_format)
         self.image_pad_value = float(image_pad_value)
         self.max_samples = None if max_samples is None else int(max_samples)
         if self.max_samples is not None and self.max_samples <= 0:
@@ -357,7 +359,7 @@ class MotionExpertZarrDataset(Dataset):
             rgb=rgb,
             query_uv=query_uv.float(),
             target_hw=self.image_size,
-            uv_is_normalized=self.query_uv_is_normalized,
+            query_uv_format=self.query_uv_format,
             pad_value=self.image_pad_value,
         )
         depth = None

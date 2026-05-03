@@ -12,9 +12,9 @@ model:
   motion_weight_static_floor: 0.05
   input_height: 224
   input_width: 224
-  text_max_length: 128
+  text_max_length: 16
   image_pad_value: 0.5
-  query_uv_is_normalized: true
+  query_uv_format: source_pixels
   dropout: 0.1
   use_calvin_percentile_normalization: true
   sparse_decoder:
@@ -27,6 +27,7 @@ model:
     decoder_serialized_patch_size: 32
     decoder_serialized_orders: [z, z-trans]
     decoder_serialized_depth: 16
+    decoder_serialized_shift_windows: true
   qwen:
     model_name_or_path: /home/ziyinx/Xiaomi-Robotics-0-Pretrain
     freeze_backbone: true
@@ -40,7 +41,10 @@ train:
   batch_size: 32
   num_workers: 4
   pin_memory: true
-  lr: 4.0e-5
+  lr: 1.0e-4
+  lr_scheduler: cosine_with_warmup
+  lr_warmup_steps: 1000
+  min_lr: 1.0e-5
   weight_decay: 5.0e-3
   clip_grad_norm: 1.0
   mixed_precision: true
