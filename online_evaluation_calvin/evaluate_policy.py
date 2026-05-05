@@ -75,7 +75,15 @@ def parse_arguments():
         ('relative_action', str2bool, True),
         ('rotation_format', str, 'euler'),
         ('denoise_timesteps', int, 10),
-        ('denoise_model', str, "rectified_flow")
+        ('denoise_model', str, "rectified_flow"),
+        # Model arguments: motion latent (flower_actor_3d_motion_latent)
+        ('motion_expert_config', str_none, None),
+        ('motion_expert_checkpoint', str_none, None),
+        ('motion_solver_steps', int, 10),
+        ('motion_steps_to_run', int, 1),
+        ('motion_finetune', str2bool, False),
+        ('motion_scene_fusion', str2bool, True),
+        ('motion_action_fusion', str2bool, False),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])

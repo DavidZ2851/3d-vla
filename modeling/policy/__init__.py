@@ -4,7 +4,12 @@ from .denoise_actor_3d_2dwrist import DenoiseActor as DenoiseActor2Dwrist
 from .flower.model import FLOWERVLA
 from .flower.model_peract2 import FLOWERVLA as FLOWERVLARLB
 from .flower.model_peract2_3d import FLOWERVLA3D
-from .flower_actor import FlowerActor3D, FlowerActor3DGroundingCond, FlowerActor2D
+from .flower_actor import (
+    FlowerActor3D,
+    FlowerActor3DGroundingCond,
+    FlowerActor3DMotionLatent,
+    FlowerActor2D,
+)
 from .flower_actor_qwen import QwenFlowerActor3D
 from .flower_actor_qwen_stagewise import QwenFlowerActor3DStagewise
 from .flower_actor_qwen_grounding import (
@@ -41,6 +46,8 @@ def fetch_model_class(model_type):
         return FlowerActor3D
     if model_type == 'flower_actor_3d_grounding_cond':
         return FlowerActor3DGroundingCond
+    if model_type == 'flower_actor_3d_motion_latent':
+        return FlowerActor3DMotionLatent
     if model_type == 'flower_actor_2d':
         return FlowerActor2D
     if model_type == 'qwen_flower_actor_3d':

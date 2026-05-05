@@ -15,12 +15,16 @@ set -euo pipefail
 
 REPO_ROOT=/data/user_data/ziyinx/analogical_manipulation_clean
 CONFIG_PATH=${CONFIG_PATH:-$REPO_ROOT/motion_expert/configs/calvin_florence2.yaml}
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-/data/user_data/ziyinx/datasets/train_logs/motion_expert/calvin_florence2/best_model.pt}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-$REPO_ROOT/train_logs/motion_expert/calvin_florence2/best_model.pt}
 
 export WANDB_MODE=${WANDB_MODE:-online}
 export FLORENCE2_MODEL_PATH=${FLORENCE2_MODEL_PATH:-microsoft/Florence-2-large}
 
 cd "$REPO_ROOT"
+if [ ! -f "$CHECKPOINT_PATH" ]; then
+  echo "Checkpoint not found: $CHECKPOINT_PATH"
+  exit 1
+fi
 python3 -m motion_expert.train \
   --config "$CONFIG_PATH" \
   --resume "$CHECKPOINT_PATH" \

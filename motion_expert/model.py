@@ -8,6 +8,7 @@ from timm.models.vision_transformer import RmsNorm
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from modeling.utils.flash_attention import FlashMultiheadAttention
 from .config import MotionExpertConfig
 from .geometry import center_query_world_xyz, validate_query_uv_grid
 
@@ -439,19 +440,21 @@ class SparseDecoderBlock(nn.Module):
                 f"got `{spatial_attention}`."
             )
         self.temporal_norm = nn.LayerNorm(dim)
-        self.temporal_attn = nn.MultiheadAttention(
+        self.temporal_attn = FlashMultiheadAttention(
             embed_dim=dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
+            flash_attn_name="MotionExpert temporal attention",
         )
         self.temporal_dropout = nn.Dropout(dropout)
         self.cond_norm = nn.LayerNorm(dim)
-        self.cond_attn = nn.MultiheadAttention(
+        self.cond_attn = FlashMultiheadAttention(
             embed_dim=dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
+            flash_attn_name="MotionExpert condition attention",
         )
         self.cond_dropout = nn.Dropout(dropout)
         self.ffn_norm = nn.LayerNorm(dim)

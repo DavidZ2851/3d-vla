@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=calvin_flower_cond0.6
+#SBATCH --job-name=calvin_flower_3dfa
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -45,7 +45,7 @@ grounding_dropout_prob=0.6
 # Model arguments, change (some of) these for new architectures
 # flower_actor_3d: no contact-point conditioning
 # flower_actor_3d_grounding_cond: condition decoder on 3D contact point when provided
-model_type=flower_actor_3d_grounding_cond
+model_type=flower_actor_3d
 bimanual=false
 keypose_only=false
 pre_tokenize=true

@@ -144,9 +144,9 @@ class BaseTrainTester:
             denoise_model=self.args.denoise_model,
             lv2_batch_size=self.args.lv2_batch_size,
         )
-        # Inject Qwen-specific kwargs based on model ctor support rather than brittle model_type string checks.
+        # Inject optional kwargs based on model ctor support rather than brittle model_type string checks.
         model_init_params = inspect.signature(self.model_cls.__init__).parameters
-        qwen_kwargs = {
+        optional_kwargs = {
             "vision_lora_rank": self.args.vision_lora_rank,
             "vision_lora_alpha": self.args.vision_lora_alpha,
             "vision_lora_dropout": self.args.vision_lora_dropout,
@@ -160,8 +160,15 @@ class BaseTrainTester:
             "gradient_checkpointing": getattr(self.args, "gradient_checkpointing", False),
             "use_multiscale": getattr(self.args, "use_multiscale", False),
             "grounding_loss_weight": getattr(self.args, "grounding_loss_weight", 10.0),
+            "motion_expert_config": getattr(self.args, "motion_expert_config", None),
+            "motion_expert_checkpoint": getattr(self.args, "motion_expert_checkpoint", None),
+            "motion_solver_steps": getattr(self.args, "motion_solver_steps", 10),
+            "motion_steps_to_run": getattr(self.args, "motion_steps_to_run", 1),
+            "motion_finetune": getattr(self.args, "motion_finetune", True),
+            "motion_scene_fusion": getattr(self.args, "motion_scene_fusion", True),
+            "motion_action_fusion": getattr(self.args, "motion_action_fusion", True),
         }
-        for key, value in qwen_kwargs.items():
+        for key, value in optional_kwargs.items():
             if key in model_init_params:
                 model_kwargs[key] = value
         _model = self.model_cls(**model_kwargs)

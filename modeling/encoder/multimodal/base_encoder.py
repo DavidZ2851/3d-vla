@@ -166,11 +166,21 @@ class Encoder(nn.Module):
         rgb3d = self.normalize(rgb3d)
         rgb3d_feats, instr_feats = self.backbone(rgb3d, text, output_hidden_states=True)
         # rgb3d_feats = self.cond_linear(self.cond_norm(rgb3d_feats))
-        instr_feats = self.cond_linear(self.cond_norm(instr_feats))
         nc = rgb3d.shape[1]
         #h_ = int(math.sqrt(rgb3d_feats.shape[2] // nc))  # NOTE: modify this to accept rectangular input
         h_feat_rgb = math.ceil(rgb3d.shape[-2] / 32)
         w_feat_rgb = math.ceil(rgb3d.shape[-1] / 32)
+        motion_visual_tokens = rgb3d_feats[:, -1]
+        self._last_motion_visual_grid = einops.rearrange(
+            motion_visual_tokens,
+            'b (nc h w) c -> b nc h w c',
+            nc=nc,
+            h=h_feat_rgb,
+            w=w_feat_rgb,
+        )
+        self._last_motion_visual_tokens = motion_visual_tokens
+        self._last_motion_text_tokens = instr_feats
+        instr_feats = self.cond_linear(self.cond_norm(instr_feats))
         rgb3d_feats = self.vit_fpn({
             'res5': einops.rearrange(rgb3d_feats[:, 3], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb),
             'res4': einops.rearrange(rgb3d_feats[:, 2], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb),

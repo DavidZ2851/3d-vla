@@ -7,7 +7,7 @@ set -euo pipefail
 
 REPO_ROOT=/data/user_data/ziyinx/analogical_manipulation_clean
 CONFIG_PATH=${CONFIG_PATH:-$REPO_ROOT/motion_expert/configs/calvin_qwen3vl_viz.yaml}
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/calvin_qwen3vl/checkpoint_step_18000.pt}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/calvin_qwen3vl/checkpoint_step_14000.pt}
 
 export WANDB_MODE=${WANDB_MODE:-disabled}
 export QWEN3VL_MODEL_PATH=${QWEN3VL_MODEL_PATH:-/home/ziyinx/Xiaomi-Robotics-0-Pretrain}

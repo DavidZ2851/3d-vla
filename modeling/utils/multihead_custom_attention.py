@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 import einops
 
+from .flash_attention import flash_attention_bshd
 from .position_encodings import RotaryPositionEncoding
 
 
@@ -11,13 +12,16 @@ class MultiheadCustomAttention(nn.MultiheadAttention):
     def __init__(self, embed_dim, num_heads, dropout=0.,
                  bias=True, add_bias_kv=False, add_zero_attn=False,
                  kdim=None, vdim=None, batch_first=False,
-                 device=None, dtype=None):
+                 device=None, dtype=None, use_flash_attn=False,
+                 flash_attn_name="attention"):
         super().__init__(
             embed_dim, num_heads, dropout=dropout,
             bias=bias, add_bias_kv=add_bias_kv, add_zero_attn=add_zero_attn,
             kdim=kdim, vdim=vdim, batch_first=batch_first,
             device=device, dtype=dtype
         )
+        self.use_flash_attn = bool(use_flash_attn)
+        self.flash_attn_name = str(flash_attn_name)
 
     def forward(
             self,
@@ -34,6 +38,59 @@ class MultiheadCustomAttention(nn.MultiheadAttention):
         output of same format as query
         """
         is_batched = query.dim() == 3
+
+        if (
+            self.use_flash_attn
+            and attn_mask is None
+            and is_batched
+            and self._qkv_same_embed_dim
+            and self.bias_k is None
+            and self.bias_v is None
+            and not self.add_zero_attn
+        ):
+            if self.batch_first:
+                query_bf, key_bf, value_bf = query, key, value
+            else:
+                query_bf, key_bf, value_bf = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
+
+            q, k, v = F._in_projection_packed(
+                query_bf,
+                key_bf,
+                value_bf,
+                self.in_proj_weight,
+                self.in_proj_bias,
+            )
+            if rotary_pe is not None:
+                qp, kvp = rotary_pe
+                q_cos, q_sin = qp[..., 0], qp[..., 1]
+                k_cos, k_sin = kvp[..., 0], kvp[..., 1]
+                q = RotaryPositionEncoding.embed_rotary(q, q_cos, q_sin)
+                k = RotaryPositionEncoding.embed_rotary(k, k_cos, k_sin)
+
+            batch_size, query_len, embed_dim = q.shape
+            key_len = k.shape[1]
+            head_dim = embed_dim // self.num_heads
+            q = q.reshape(batch_size, query_len, self.num_heads, head_dim)
+            k = k.reshape(batch_size, key_len, self.num_heads, head_dim)
+            v = v.reshape(batch_size, key_len, self.num_heads, head_dim)
+
+            key_padding_mask_bool = None
+            if key_padding_mask is not None:
+                key_padding_mask_bool = key_padding_mask.to(device=query_bf.device, dtype=torch.bool)
+
+            attn_output = flash_attention_bshd(
+                q,
+                k,
+                v,
+                key_padding_mask=key_padding_mask_bool,
+                dropout_p=self.dropout if self.training else 0.0,
+                fallback_name=self.flash_attn_name,
+            )
+            attn_output = attn_output.reshape(batch_size, query_len, embed_dim)
+            attn_output = F.linear(attn_output, self.out_proj.weight, self.out_proj.bias)
+            if self.batch_first:
+                return attn_output, None
+            return attn_output.transpose(0, 1), None
 
         key_padding_mask = F._canonical_mask(
             mask=key_padding_mask,

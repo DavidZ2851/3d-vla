@@ -132,6 +132,31 @@ def _normalise_quaternion(quat):
     return quat / denom
 
 
+def _invert_quaternion_wxyz(quat):
+    quat = np.asarray(quat, dtype=np.float32)
+    denom = np.sum(quat * quat, axis=-1, keepdims=True)
+    denom = np.clip(denom, 1e-8, None)
+    inv = quat.copy()
+    inv[..., 1:] *= -1.0
+    return inv / denom
+
+
+def _multiply_quaternion_wxyz(quat_a, quat_b):
+    quat_a = np.asarray(quat_a, dtype=np.float32)
+    quat_b = np.asarray(quat_b, dtype=np.float32)
+    w1, x1, y1, z1 = np.moveaxis(quat_a, -1, 0)
+    w2, x2, y2, z2 = np.moveaxis(quat_b, -1, 0)
+    return np.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        axis=-1,
+    )
+
+
 class RoboTwinEvalPreprocessor:
     def __init__(self, num_history=1, custom_imsize=224, depth2cloud=None):
         self.num_history = num_history
@@ -217,6 +242,18 @@ class Model:
             ),
         }
         for key, value in qwen_kwargs.items():
+            if key in model_init_params:
+                model_kwargs[key] = value
+        motion_latent_kwargs = {
+            "motion_expert_config": getattr(self.args, "motion_expert_config", None),
+            "motion_expert_checkpoint": getattr(self.args, "motion_expert_checkpoint", None),
+            "motion_solver_steps": getattr(self.args, "motion_solver_steps", 10),
+            "motion_steps_to_run": getattr(self.args, "motion_steps_to_run", 1),
+            "motion_finetune": getattr(self.args, "motion_finetune", False),
+            "motion_scene_fusion": getattr(self.args, "motion_scene_fusion", True),
+            "motion_action_fusion": getattr(self.args, "motion_action_fusion", False),
+        }
+        for key, value in motion_latent_kwargs.items():
             if key in model_init_params:
                 model_kwargs[key] = value
         return model_class(**model_kwargs)
@@ -436,6 +473,27 @@ class Model:
             prev = nxt
         return np.stack(abs_actions, axis=0)
 
+    def _absolute_to_relative_env(self, actions, anchor):
+        # actions: (T, 2, 8), anchor: (2, 8), both in RoboTwin wxyz convention
+        rel_actions = []
+        prev = anchor.copy()
+        for step in actions:
+            delta = step.copy()
+            delta[:, :3] = step[:, :3] - prev[:, :3]
+            delta[:, 3:7] = _normalise_quaternion(
+                _multiply_quaternion_wxyz(
+                    step[:, 3:7],
+                    _invert_quaternion_wxyz(prev[:, 3:7]),
+                )
+            )
+            rel_actions.append(delta)
+            prev = step
+        return np.stack(rel_actions, axis=0)
+
+    def _current_anchor_in_env_format(self, obs_dict):
+        anchor = obs_dict["proprio"][0, -1].detach().cpu().numpy()[None]
+        return self._convert_model_actions_to_env(anchor)[0]
+
     @torch.no_grad()
     def step(self, obs_dict, instruction):
         batch_size = obs_dict["rgb"].shape[0]
@@ -465,10 +523,13 @@ class Model:
         ).view(batch_size, self.args.prediction_len, 2, action_dim)
 
         trajectory = trajectory[0].detach().cpu().numpy()  # (T, 2, 8)
-        if bool(self.args.relative_action):
+        if self.args.policy_action_mode == "relative":
             anchor = obs_dict["proprio"][0, -1].detach().cpu().numpy()
             trajectory = self._relative_to_absolute(trajectory, anchor)
         trajectory = self._convert_model_actions_to_env(trajectory)
+        if self.args.robotwin_action_type == "delta_ee":
+            anchor = self._current_anchor_in_env_format(obs_dict)
+            trajectory = self._absolute_to_relative_env(trajectory, anchor)
         return trajectory.reshape(self.args.prediction_len, -1)
 
     def get_action(self, instruction):
@@ -506,9 +567,18 @@ def build_eval_args(user_args):
         "num_vis_instr_attn_layers": 2,
         "num_shared_attn_layers": 16,
         "relative_action": False,
+        "policy_action_mode": "absolute",
+        "robotwin_action_type": "ee",
         "rotation_format": "quat_wxyz",
         "denoise_timesteps": 10,
         "denoise_model": "rectified_flow",
+        "motion_expert_config": None,
+        "motion_expert_checkpoint": None,
+        "motion_solver_steps": 10,
+        "motion_steps_to_run": 1,
+        "motion_finetune": False,
+        "motion_scene_fusion": True,
+        "motion_action_fusion": False,
         "vision_lora_rank": 0,
         "vision_lora_alpha": 32,
         "vision_lora_dropout": 0.05,
@@ -525,11 +595,23 @@ def build_eval_args(user_args):
     }
     cfg = defaults.copy()
     cfg.update(user_args)
+    if "policy_action_mode" not in user_args and bool(cfg["relative_action"]):
+        cfg["policy_action_mode"] = "relative"
     if not cfg["checkpoint"]:
         raise ValueError("deploy_policy.yml must provide `checkpoint` for analogical_manipulation.")
     if cfg["rotation_format"] not in {"quat_wxyz", "quat_xyzw"}:
         raise ValueError(
             "RoboTwin online evaluation currently supports only quaternion action spaces "
             f"(`quat_wxyz` or `quat_xyzw`), got {cfg['rotation_format']!r}."
+        )
+    if cfg["policy_action_mode"] not in {"absolute", "relative"}:
+        raise ValueError(
+            "policy_action_mode must be either `absolute` or `relative`, "
+            f"got {cfg['policy_action_mode']!r}."
+        )
+    if cfg["robotwin_action_type"] not in {"ee", "delta_ee"}:
+        raise ValueError(
+            "robotwin_action_type must be either `ee` or `delta_ee`, "
+            f"got {cfg['robotwin_action_type']!r}."
         )
     return SimpleNamespace(**cfg)

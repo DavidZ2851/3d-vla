@@ -95,6 +95,14 @@ def parse_arguments():
         # Training-only conditioning dropout for grounding-conditioned policies.
         # Samples dropped here are trained exactly like inference: no grounding token.
         ('grounding_dropout_prob', float, 0.0),
+        # Motion Expert latent conditioning.
+        ('motion_expert_config', str_none, None),
+        ('motion_expert_checkpoint', str_none, None),
+        ('motion_solver_steps', int, 10),
+        ('motion_steps_to_run', int, 1),
+        ('motion_finetune', str2bool, True),
+        ('motion_scene_fusion', str2bool, True),
+        ('motion_action_fusion', str2bool, True),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])

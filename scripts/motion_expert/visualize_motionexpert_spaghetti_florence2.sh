@@ -7,7 +7,7 @@ set -euo pipefail
 
 REPO_ROOT=/data/user_data/ziyinx/analogical_manipulation_clean
 CONFIG_PATH=${CONFIG_PATH:-$REPO_ROOT/motion_expert/configs/calvin_florence2_viz.yaml}
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/calvin_florence2/checkpoint_step_16000.pt}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/calvin_florence2/checkpoint_step_18000.pt}
 
 export WANDB_MODE=${WANDB_MODE:-disabled}
 export FLORENCE2_MODEL_PATH=${FLORENCE2_MODEL_PATH:-microsoft/Florence-2-large}
