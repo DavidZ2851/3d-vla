@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=eval_libero_object
+#SBATCH --job-name=eval_libero_10
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
+#SBATCH --time=4:00:00
 #SBATCH --partition=preempt
 #SBATCH --output=/data/user_data/ziyinx/logs/%x_%j.out
 #SBATCH --error=/data/user_data/ziyinx/logs/%x_%j.err
@@ -12,7 +12,7 @@ libero_root=/data/user_data/ziyinx/LIBERO
 
 # Task/eval arguments
 # Runs all LIBERO suites sequentially.
-suites=(libero_object)
+suites=(libero_10)
 task_order_index=0
 task_id=0
 all_tasks=true
@@ -20,7 +20,7 @@ num_eval=50
 max_steps=600
 img_h=224
 img_w=224
-seed=0
+seed=2
 libero_controller=OSC_POSE
 libero_tcp_target_mode=absolute
 libero_target_pos_tol=0.001
@@ -29,7 +29,7 @@ libero_target_max_steps=250
 
 # Output
 exp=LIBERO
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/libero/flower_actor_3d-Libero-C1024-B16-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-job7856005/60000.pth
+checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/libero/flower_actor_3d-Libero-C1024-B16-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-job7856005/80000.pth
 save_video=true
 video_fps=20
 video_env_index=0

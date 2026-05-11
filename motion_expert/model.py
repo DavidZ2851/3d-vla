@@ -1,4 +1,5 @@
 import math
+import os
 import warnings
 from typing import Optional, Sequence, Tuple
 
@@ -8,7 +9,11 @@ from timm.models.vision_transformer import RmsNorm
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from modeling.utils.flash_attention import FlashMultiheadAttention
+from modeling.utils.flash_attention import (
+    FlashMultiheadAttention,
+    deterministic_flash_attn,
+    sdpa_kernel_context,
+)
 from .config import MotionExpertConfig
 from .geometry import center_query_world_xyz, validate_query_uv_grid
 
@@ -247,6 +252,9 @@ class SerializedLocalAttentionLayer(nn.Module):
         self.order_index = int(order_index)
         self.shift_windows = bool(shift_windows)
         self.scale = self.head_dim ** -0.5
+        self.use_flash_varlen = (
+            os.environ.get("MOTION_EXPERT_USE_FLASH_ATTN_VARLEN", "0") == "1"
+        )
 
         self.norm1 = nn.LayerNorm(dim)
         self.coord_proj = nn.Linear(3, dim, bias=False)
@@ -323,25 +331,43 @@ class SerializedLocalAttentionLayer(nn.Module):
             max_seqlen=self.patch_size,
             dropout_p=self.dropout.p if self.training else 0.0,
             softmax_scale=self.scale,
+            deterministic=deterministic_flash_attn(),
         )
         return out.to(dtype=qkv.dtype)
 
-    def _sdpa_attention(self, qkv: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    def _sdpa_attention(
+        self,
+        qkv: torch.Tensor,
+        batch_size: int,
+        num_points: int,
+    ) -> torch.Tensor:
         _warn_flash_attn_fallback()
-        outputs = []
-        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
-            q, k, v = qkv[start:end].unbind(dim=1)
-            q = q.permute(1, 0, 2).unsqueeze(0)
-            k = k.permute(1, 0, 2).unsqueeze(0)
-            v = v.permute(1, 0, 2).unsqueeze(0)
-            out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                dropout_p=self.dropout.p if self.training else 0.0,
-            )
-            outputs.append(out.squeeze(0).permute(1, 0, 2))
-        return torch.cat(outputs, dim=0)
+        qkv_windows = qkv.reshape(batch_size, num_points, 3, self.num_heads, self.head_dim)
+        output = torch.empty(
+            batch_size,
+            num_points,
+            self.num_heads,
+            self.head_dim,
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        offset = 0
+        for length in self._window_lengths(num_points):
+            end = offset + int(length)
+            q, k, v = qkv_windows[:, offset:end].unbind(dim=2)
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+            with sdpa_kernel_context():
+                window_out = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                )
+            output[:, offset:end] = window_out.permute(0, 2, 1, 3)
+            offset = end
+        return output.reshape(batch_size * num_points, self.num_heads, self.head_dim)
 
     def forward(
         self,
@@ -354,12 +380,16 @@ class SerializedLocalAttentionLayer(nn.Module):
         batch_size, num_points, _ = x.shape
         x_norm = self.norm1(x)
         qkv, inverse = self._ordered_qkv(x_norm, xyz)
-        cu_seqlens = self._cu_seqlens(batch_size, num_points, x.device)
 
-        if flash_attn_varlen_qkvpacked_func is not None and qkv.device.type == "cuda":
+        if (
+            self.use_flash_varlen
+            and flash_attn_varlen_qkvpacked_func is not None
+            and qkv.device.type == "cuda"
+        ):
+            cu_seqlens = self._cu_seqlens(batch_size, num_points, x.device)
             out_ordered = self._flash_attention(qkv, cu_seqlens)
         else:
-            out_ordered = self._sdpa_attention(qkv, cu_seqlens)
+            out_ordered = self._sdpa_attention(qkv, batch_size, num_points)
 
         out_ordered = out_ordered.reshape(batch_size, num_points, self.dim)
         out = torch.gather(

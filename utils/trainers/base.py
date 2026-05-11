@@ -781,7 +781,7 @@ class BaseTrainTester:
         # Main checkpoint:
         # - before 35k iters (inclusive): keep writing last.pth
         # - from 35k iters: write <iter>.pth
-        ckpt_name = f"{current_iter}.pth" if current_iter > 30000 else "last.pth"
+        ckpt_name = f"{current_iter}.pth" if current_iter > 50000 else "last.pth"
         torch.save({
             "weight": model_state,
             "ema_weight": ema_state,

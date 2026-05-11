@@ -1,4 +1,6 @@
+import os
 import warnings
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -20,8 +22,39 @@ _FLASH_ATTN_FALLBACK_WARNED = set()
 _FLASH_ATTN_BACKEND_LOGGED = set()
 
 
+def force_sdpa_attention() -> bool:
+    return (
+        os.environ.get("FLOWERVLA_FORCE_SDPA_ATTENTION", "0") == "1"
+        or os.environ.get("MOTION_EXPERT_FORCE_SDPA_ATTENTION", "0") == "1"
+    )
+
+
+def disable_varlen_flash_attn() -> bool:
+    return (
+        os.environ.get("FLOWERVLA_DISABLE_VARLEN_FLASH_ATTN", "0") == "1"
+        or os.environ.get("MOTION_EXPERT_DISABLE_VARLEN_FLASH_ATTN", "0") == "1"
+    )
+
+
+def deterministic_flash_attn() -> bool:
+    return (
+        os.environ.get("FLOWERVLA_FLASH_ATTN_DETERMINISTIC", "0") == "1"
+        or os.environ.get("MOTION_EXPERT_FLASH_ATTN_DETERMINISTIC", "0") == "1"
+    )
+
+
 def flash_attn_available() -> bool:
-    return flash_attn_func is not None
+    return flash_attn_func is not None and not force_sdpa_attention()
+
+
+def sdpa_kernel_context():
+    if not force_sdpa_attention() or not torch.cuda.is_available():
+        return nullcontext()
+    return torch.backends.cuda.sdp_kernel(
+        enable_flash=False,
+        enable_math=True,
+        enable_mem_efficient=False,
+    )
 
 
 def prepare_flash_attn_dtype(tensor: torch.Tensor) -> torch.Tensor:
@@ -86,14 +119,15 @@ def scaled_dot_product_attention_bshd(
             device=q.device,
         )
         attn_mask = attn_mask.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
-    out = F.scaled_dot_product_attention(
-        q_sdpa,
-        k_sdpa,
-        v_sdpa,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=is_causal,
-    )
+    with sdpa_kernel_context():
+        out = F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+        )
     return out.transpose(1, 2)
 
 
@@ -108,8 +142,13 @@ def flash_attention_bshd(
     softmax_scale: Optional[float] = None,
     fallback_name: str = "attention",
 ) -> torch.Tensor:
-    if flash_attn_func is None or q.device.type != "cuda":
-        reason = "flash_attn not installed" if flash_attn_func is None else f"device={q.device.type}"
+    if force_sdpa_attention() or flash_attn_func is None or q.device.type != "cuda":
+        if force_sdpa_attention():
+            reason = "forced by env"
+        elif flash_attn_func is None:
+            reason = "flash_attn not installed"
+        else:
+            reason = f"device={q.device.type}"
         log_flash_attn_backend(fallback_name, "sdpa-fallback", reason)
         warn_flash_attn_fallback(fallback_name)
         return scaled_dot_product_attention_bshd(
@@ -138,8 +177,13 @@ def flash_attention_bshd(
         )
         return out.to(dtype=original_dtype)
 
-    if flash_attn_varlen_func is None:
-        log_flash_attn_backend(fallback_name, "sdpa-fallback", "flash_attn_varlen_func unavailable")
+    if disable_varlen_flash_attn() or flash_attn_varlen_func is None:
+        reason = (
+            "varlen flash disabled by env"
+            if disable_varlen_flash_attn()
+            else "flash_attn_varlen_func unavailable"
+        )
+        log_flash_attn_backend(fallback_name, "sdpa-fallback", reason)
         warn_flash_attn_fallback(fallback_name)
         return scaled_dot_product_attention_bshd(
             q,
@@ -187,6 +231,7 @@ def flash_attention_bshd(
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         causal=is_causal,
+        deterministic=deterministic_flash_attn(),
     )
     return out.reshape(batch_size, query_len, num_heads, head_dim).to(dtype=original_dtype)
 
