@@ -30,10 +30,18 @@ class BaseDataset(Dataset):
         # Load all annotations lazily
         self.annos = read_zarr_with_cache(root, mem_gb=mem_limit)
         # Sanity check
-        if 'action' in self.annos:
-            len_ = len(self.annos['action'])
-        else:
-            len_ = len(self.annos['abs_action'])
+        # Different datasets may store one of: action / abs_action / rel_action.
+        ref_key = None
+        for candidate in ("action", "abs_action", "rel_action"):
+            if candidate in self.annos:
+                ref_key = candidate
+                break
+        if ref_key is None:
+            keys = list(self.annos.keys())
+            if not keys:
+                raise ValueError("Empty zarr annotations: no dataset keys found.")
+            ref_key = keys[0]
+        len_ = len(self.annos[ref_key])
         for key in self.annos:
             assert len(self.annos[key]) == len_, f'length mismatch in {key}'
         print(f"Found {len_} samples")

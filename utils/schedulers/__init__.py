@@ -19,7 +19,13 @@ def fetch_scheduler(type_, optimizer, train_iters):
             milestones=[hold_steps]
         )
     elif type_ == "tristage_flower":
-        scheduler = TriStageLRScheduler(optimizer)
+        base_lrs = [group.get("lr", 0.0) for group in optimizer.param_groups]
+        peak_lr = max(base_lrs) if base_lrs else 0.0
+        scheduler = TriStageLRScheduler(
+            optimizer,
+            total_steps=train_iters,
+            lr=peak_lr,
+        )
     else:
         raise NotImplementedError
 

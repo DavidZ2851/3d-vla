@@ -1300,6 +1300,10 @@ class QwenPiLLMActor3D(BaseDenoiseActor):
         )
 
         gt_openess = gt_trajectory[..., -1:]
+        if self._continuous_openness:
+            gt_openess = self.normalize_openness(gt_openess)
+        else:
+            gt_openess = (gt_openess > 0).to(gt_openess.dtype)
         gt_pose = gt_trajectory[..., :-1]
         gt_pose = self.normalize_pos(gt_pose)
         _, traj_len, nhand, _ = gt_pose.shape
@@ -1331,12 +1335,22 @@ class QwenPiLLMActor3D(BaseDenoiseActor):
             rot_loss = self._masked_mean(
                 (pred[..., 3:-1] - denoise_target[..., 3:]).pow(2), valid_mask
             )
-            openness_loss = self._masked_mean(
-                F.binary_cross_entropy_with_logits(
-                    pred[..., -1:], gt_openess, reduction="none"
-                ),
-                valid_mask,
-            )
+            if self._continuous_openness:
+                openness_loss = self._masked_mean(
+                    F.smooth_l1_loss(
+                        torch.tanh(pred[..., -1:]),
+                        gt_openess,
+                        reduction="none",
+                    ),
+                    valid_mask,
+                )
+            else:
+                openness_loss = self._masked_mean(
+                    F.binary_cross_entropy_with_logits(
+                        pred[..., -1:], gt_openess, reduction="none"
+                    ),
+                    valid_mask,
+                )
             total_loss = total_loss + (30.0 * pos_loss + 10.0 * rot_loss + openness_loss)
 
         return total_loss / self._lv2_batch_size

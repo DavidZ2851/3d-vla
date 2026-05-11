@@ -1,10 +1,10 @@
 import inspect
 import numpy as np, torch
+from scipy.spatial.transform import Rotation as R
 from modeling.encoder.text import fetch_tokenizers
 from modeling.policy import fetch_model_class
 from utils.data_preprocessors import fetch_data_preprocessor
 from utils.depth2cloud import fetch_depth2cloud
-from utils.pytorch3d_transforms import quaternion_to_axis_angle
 import robosuite.utils.transform_utils as T
 from online_evaluation_libero.utils_with_libero import (
     convert_depth_batch_to_meters,
@@ -13,9 +13,15 @@ from online_evaluation_libero.utils_with_libero import (
 )
 
 class Model:
+    gripper_open_threshold = 0.02
+    osc_action_scale = np.asarray(
+        [0.05, 0.05, 0.05, 0.5, 0.5, 0.5], dtype=np.float32
+    )
+
     def __init__(self, args):
         self.args = args
         self.policy = self.get_policy()
+        self._configure_binary_gripper()
         self.tokenizer = fetch_tokenizers(self.args.backbone)
         self.preprocessor = fetch_data_preprocessor("libero")(
             keypose_only=False,
@@ -71,6 +77,7 @@ class Model:
         # The policy expects proprio shaped like (B, nhist, 1, proprio_dim) where the nhist dimension corresponds to real timesteps [t-nhist+1, ..., t].
         self._proprio_history = []
         self._last_vec_env_id = None
+        self._current_tcp = None
 
     def load_pretrained_weights(self, weight_dict=None):
         if weight_dict is None:
@@ -85,6 +92,31 @@ class Model:
                 stripped[k] = v
         # Keep strict=False for compatibility across model variants.
         self.policy.load_state_dict(stripped, strict=False)
+        self._configure_binary_gripper()
+
+    def _configure_binary_gripper(self):
+        module = self.policy.module if hasattr(self.policy, "module") else self.policy
+        module._continuous_openness = False
+        module._signed_binary_openness_output = True
+
+    @staticmethod
+    def _signed_gripper_command(gripper):
+        """Convert model outputs to robosuite binary gripper commands.
+
+        Original PandaGripper convention is `-1` for open and `+1` for close.
+        """
+        gripper = np.asarray(gripper, dtype=np.float32)
+        if gripper.size and np.nanmin(gripper) >= 0.0 and np.nanmax(gripper) <= 1.0:
+            return np.where(gripper >= 0.5, 1.0, -1.0).astype(np.float32)
+        return np.where(gripper >= 0.0, 1.0, -1.0).astype(np.float32)
+
+    @classmethod
+    def _tcp_target_gripper_command(cls, gripper):
+        return cls._signed_gripper_command(gripper)
+
+    @classmethod
+    def _robosuite_gripper_command(cls, gripper):
+        return cls._signed_gripper_command(gripper)
 
     def _build_eval_grounding_kwargs(self, batch_size, device):
         """Mirror training-time dropped-grounding behavior at online eval."""
@@ -101,18 +133,24 @@ class Model:
 
     def _extract_proprio(self, obs_list):
         proprio_list = []  # (B, proprio_dim), one per parallel env
+        tcp_states = []
         for obs in obs_list:
             eef_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float32)
-            
-            # NOTE: if use quat proprio
-            # quat_xyzw = np.asarray(obs["robot0_eef_quat"], dtype=np.float32)
-            # quat_wxyz = quat_xyzw[[3, 0, 1, 2]]
-            axis_angle = T.quat2axisangle(obs["robot0_eef_quat"])
-
+            quat_xyzw = np.asarray(obs["robot0_eef_quat"], dtype=np.float32)
             openness = np.abs(np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32)[0])
-            proprio = np.concatenate([eef_pos, axis_angle, [openness]], axis=0)
+            binary_openness = float(openness > self.gripper_open_threshold)
+            tcp_states.append(np.concatenate([eef_pos, quat_xyzw, [openness]], axis=0))
+
+            if self.args.rotation_format == "euler":
+                rot = R.from_quat(quat_xyzw).as_euler("xyz").astype(np.float32)
+            elif self.args.rotation_format == "axisangle":
+                rot = T.quat2axisangle(quat_xyzw).astype(np.float32)
+            else:
+                rot = quat_xyzw.astype(np.float32)
+            proprio = np.concatenate([eef_pos, rot, [binary_openness]], axis=0)
             proprio_list.append(proprio)
 
+        self._current_tcp = np.asarray(tcp_states, dtype=np.float32)
         proprio_current = np.asarray(proprio_list, dtype=np.float32)  # (B, proprio_dim)
         # Maintain a rolling history across environment steps so the policy sees real
         # proprio at [t-2, t-1, t] (for num_history=3), instead of repeating the current proprio across history slots.
@@ -147,6 +185,12 @@ class Model:
         intrinsics = intrinsics_cache
         proprio = self._extract_proprio(obs_list)
 
+        if rgb_batch.shape[-2:] != (224, 224) or depth_batch.shape[-2:] != (224, 224):
+            raise ValueError(
+                "LIBERO online evaluation expects 224x224 RGBD from agentview and wrist, "
+                f"got rgb={rgb_batch.shape[-2:]}, depth={depth_batch.shape[-2:]}."
+            )
+
         rgbs = torch.from_numpy(rgb_batch)
         depths = torch.from_numpy(depth_batch)
         extrinsics = torch.from_numpy(extrinsics)
@@ -161,7 +205,7 @@ class Model:
     @torch.no_grad()
     def step(self, obs_dict, instruction):
         batch_size = obs_dict["rgb"].shape[0]
-        action_dim = 7 if self.args.rotation_format in ("axisangle", "euler") else 13
+        action_dim = 7 if self.args.rotation_format in ("axisangle", "euler") else 8
         traj_mask = torch.full(
             (batch_size, self.args.prediction_len, 1),
             False,
@@ -198,9 +242,99 @@ class Model:
             **grounding_kwargs,
         ).view(batch_size, self.args.prediction_len, 1, action_dim)
 
-        # Use first step action for online control.
-        actions = trajectory[:, 0, 0, :].detach().cpu().numpy()
-        return actions
+        # Return the whole predicted chunk so the eval loop can execute it sequentially.
+        actions = trajectory[:, :, 0, :].detach().cpu().numpy()
+        if self.args.relative_action:
+            if self.args.libero_controller == "OSC_POSE":
+                return self._relative_action_chunk_to_osc(actions)
+            if self.args.libero_controller == "TCP_TARGET_POSE":
+                return self._relative_action_chunk_to_tcp_target(actions)
+            raise ValueError(
+                f"Unsupported LIBERO controller for relative_action=True: "
+                f"{self.args.libero_controller!r}"
+            )
+        return self._postprocess_absolute_gripper_chunk(actions)
+
+    def _postprocess_absolute_gripper_chunk(self, actions: np.ndarray) -> np.ndarray:
+        out = actions.copy()
+        if self.args.libero_controller == "TCP_TARGET_POSE":
+            out[..., -1:] = self._tcp_target_gripper_command(out[..., -1:])
+        else:
+            out[..., -1:] = self._robosuite_gripper_command(out[..., -1:])
+        return out.astype(np.float32)
+
+    def _relative_action_chunk_to_tcp_target(self, rel_actions: np.ndarray) -> np.ndarray:
+        if rel_actions.ndim != 3:
+            raise ValueError(f"Expected rel_actions shaped (B, T, D), got {rel_actions.shape}")
+
+        batch_size, pred_len, _ = rel_actions.shape
+        flat_rel_actions = rel_actions.reshape(batch_size * pred_len, -1)
+
+        delta_pos = flat_rel_actions[:, :3]
+        gripper_command = self._tcp_target_gripper_command(flat_rel_actions[:, -1:])
+
+        if self.args.rotation_format == "euler":
+            rel_quat = R.from_euler("xyz", flat_rel_actions[:, 3:6]).as_quat().astype(np.float32)
+        elif self.args.rotation_format == "axisangle":
+            rel_quat = np.stack([T.axisangle2quat(x) for x in flat_rel_actions[:, 3:6]], axis=0).astype(np.float32)
+        else:
+            rel_quat = flat_rel_actions[:, 3:7].astype(np.float32)
+
+        rel_quat_norm = np.linalg.norm(rel_quat, axis=1, keepdims=True)
+        rel_quat = rel_quat / np.maximum(rel_quat_norm, 1e-6)
+        rel_quat[rel_quat[:, 3] < 0] *= -1.0
+
+        target_mode = getattr(self.args, "libero_tcp_target_mode", "absolute")
+        if target_mode == "relative":
+            out = np.concatenate([delta_pos, rel_quat, gripper_command], axis=1).astype(np.float32)
+            return out.reshape(batch_size, pred_len, -1)
+        if target_mode != "absolute":
+            raise ValueError(f"Unknown TCP_TARGET_POSE target_mode={target_mode!r}")
+        if self._current_tcp is None:
+            raise RuntimeError("Missing current TCP state; call preprocess before step.")
+
+        current_pos = self._current_tcp[:, :3]
+        current_quat = self._current_tcp[:, 3:7]
+        delta_pos = rel_actions[..., :3]
+
+        # Execute the chunk from one reference state, matching CALVIN's chunked rollout logic.
+        target_pos = current_pos[:, None, :] + np.cumsum(delta_pos, axis=1)
+
+        target_quat = np.zeros((batch_size, pred_len, 4), dtype=np.float32)
+        current_rot = R.from_quat(current_quat)
+        for step_idx in range(pred_len):
+            step_rel_quat = rel_quat[step_idx::pred_len]
+            step_target = (R.from_quat(step_rel_quat) * current_rot).as_quat().astype(np.float32)
+            step_target = step_target / np.maximum(
+                np.linalg.norm(step_target, axis=1, keepdims=True),
+                1e-6,
+            )
+            step_target[step_target[:, 3] < 0] *= -1.0
+            target_quat[:, step_idx, :] = step_target
+            current_rot = R.from_quat(step_target)
+
+        out = np.concatenate(
+            [target_pos, target_quat, gripper_command.reshape(batch_size, pred_len, 1)],
+            axis=-1,
+        ).astype(np.float32)
+        return out
+
+    def _relative_action_chunk_to_osc(self, rel_actions: np.ndarray) -> np.ndarray:
+        if self.args.rotation_format != "axisangle":
+            raise ValueError(
+                "LIBERO relative OSC_POSE evaluation expects axisangle rotation_format "
+                f"for unnormalized OSC deltas, got {self.args.rotation_format!r}."
+            )
+        osc = np.zeros_like(rel_actions, dtype=np.float32)
+        osc[..., :6] = np.clip(
+            rel_actions[..., :6] / self.osc_action_scale[None, None, :],
+            -1.0,
+            1.0,
+        )
+        osc[..., 6] = self._robosuite_gripper_command(rel_actions[..., 6:7]).reshape(
+            rel_actions.shape[0], rel_actions.shape[1]
+        )
+        return osc
 
 
 def create_model(args):

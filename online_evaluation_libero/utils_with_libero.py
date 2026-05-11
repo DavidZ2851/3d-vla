@@ -31,12 +31,22 @@ def load_init_states(task) -> torch.Tensor:
     init_states_path = build_task_init_states_path(task)
     return torch.load(init_states_path)
 
-def create_vectorized_env(task, img_h: int, img_w: int, num_envs: int):
+def create_vectorized_env(
+    task,
+    img_h: int,
+    img_w: int,
+    num_envs: int,
+    controller: str = "OSC_POSE",
+    controller_config_updates: Dict | None = None,
+):
     env_args = {
         "bddl_file_name": build_task_bddl_path(task),
         "camera_heights": img_h,
         "camera_widths": img_w,
+        "camera_names": list(CAMERA_NAMES),
         "camera_depths": True,
+        "controller": controller,
+        "controller_config_updates": controller_config_updates or {},
     }
     return DummyVectorEnv([lambda: OffScreenRenderEnv(**env_args) for _ in range(num_envs)])
 
@@ -101,12 +111,30 @@ def extract_rgb_depth(obs_list: Sequence[Dict]) -> Tuple[np.ndarray, np.ndarray]
     rgb_batch = []
     depth_batch = []
     for obs in obs_list:
-        rgbs = [obs[k].transpose(2, 0, 1) for k in RGB_KEYS]  # (ncam, 3, h, w)
+        missing_rgb = [key for key in RGB_KEYS if key not in obs]
+        missing_depth = [key for key in DEPTH_KEYS if key not in obs]
+        if missing_rgb or missing_depth:
+            raise KeyError(
+                f"Missing LIBERO RGBD keys. rgb={missing_rgb}, depth={missing_depth}"
+            )
+        rgbs = np.stack([obs[k].transpose(2, 0, 1) for k in RGB_KEYS], axis=0)  # (ncam, 3, h, w)
         rgbs = np.ascontiguousarray(rgbs[:, :, ::-1, :])  # flip upside down
-        depths = [obs[k] for k in DEPTH_KEYS]  # (ncam, h, w)
+        depth_frames = []
+        for key in DEPTH_KEYS:
+            depth = np.asarray(obs[key])
+            # Some LIBERO / robosuite setups expose depth as (H, W, 1).
+            if depth.ndim == 3 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            depth_frames.append(depth)
+        depths = np.stack(depth_frames, axis=0)  # (ncam, h, w)
         depths = np.ascontiguousarray(depths[:, ::-1, :])  # flip upside down
-        rgb_batch.append(np.stack(rgbs, axis=0))
-        depth_batch.append(np.stack(depths, axis=0))
+        if rgbs.shape[-2:] != (224, 224) or depths.shape[-2:] != (224, 224):
+            raise ValueError(
+                "LIBERO online evaluation expects 224x224 RGBD for agentview and wrist, "
+                f"got rgb={rgbs.shape[-2:]}, depth={depths.shape[-2:]}."
+            )
+        rgb_batch.append(rgbs)
+        depth_batch.append(depths)
     return np.stack(rgb_batch, axis=0), np.stack(depth_batch, axis=0)
 
 def convert_depth_batch_to_meters(env, depth_batch: np.ndarray) -> np.ndarray:
@@ -120,6 +148,8 @@ def convert_depth_batch_to_meters(env, depth_batch: np.ndarray) -> np.ndarray:
     return np.stack(meter_depth, axis=0)
 
 def save_results(output_file: str, payload: Dict):
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    out_dir = os.path.dirname(output_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)

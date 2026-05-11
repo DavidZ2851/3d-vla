@@ -62,3 +62,37 @@ def to_relative_action(actions, anchor_action, qform='xyzw'):
     gripper = actions[..., -1:]
 
     return torch.cat([rel_pos, rel_orn, gripper], -1)  # (..., N, 8)
+
+
+def matrix_to_euler_xyz(matrix: torch.Tensor):
+    """Convert rotation matrices to XYZ Euler angles in radians."""
+    m00 = matrix[..., 0, 0]
+    m10 = matrix[..., 1, 0]
+    m11 = matrix[..., 1, 1]
+    m12 = matrix[..., 1, 2]
+    m20 = matrix[..., 2, 0]
+    m21 = matrix[..., 2, 1]
+    m22 = matrix[..., 2, 2]
+
+    sy = torch.sqrt(m00 * m00 + m10 * m10)
+    singular = sy < 1e-6
+
+    x = torch.atan2(m21, m22)
+    y = torch.atan2(-m20, sy)
+    z = torch.atan2(m10, m00)
+
+    x_s = torch.atan2(-m12, m11)
+    y_s = torch.atan2(-m20, sy)
+    z_s = torch.zeros_like(z)
+
+    x = torch.where(singular, x_s, x)
+    y = torch.where(singular, y_s, y)
+    z = torch.where(singular, z_s, z)
+    return torch.stack([x, y, z], dim=-1)
+
+
+def quat_wxyz_to_euler_xyz(quat: torch.Tensor):
+    """Convert wxyz quaternions to canonical XYZ Euler angles in radians."""
+    quat = quat / quat.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-10)
+    matrix = pytorch3d_transforms.quaternion_to_matrix(quat)
+    return matrix_to_euler_xyz(matrix)

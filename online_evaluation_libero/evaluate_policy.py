@@ -1,5 +1,5 @@
 """Online evaluation script for LIBERO."""
-import argparse, random, sys, numpy as np, torch
+import argparse, math, random, sys, numpy as np, torch
 from pathlib import Path
 
 # Ensure local package imports resolve to this repository.
@@ -10,6 +10,9 @@ if str(REPO_ROOT) not in sys.path:
 from utils.common_utils import round_floats, str2bool, str_none
 
 
+LIBERO_RGBD_SIZE = 224
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser("Evaluate policy on LIBERO simulator")
     arguments = [
@@ -17,26 +20,36 @@ def parse_arguments():
         ("libero_root", str, "/data/user_data/ziyinx/LIBERO"),
         ("seed", int, 0),
         # Task arguments
-        ("benchmark", str, "libero_10"),
+        ("benchmark", str, "libero_spatial"),
         ("task_order_index", int, 0),
         ("task_id", int, -1),
         ("all_tasks", str2bool, False),
         ("num_eval", int, 20),
         ("max_steps", int, 600),
-        ("img_h", int, 128),
-        ("img_w", int, 128),
+        ("img_h", int, LIBERO_RGBD_SIZE),
+        ("img_w", int, LIBERO_RGBD_SIZE),
         ("use_mp", str2bool, False),
         # Logging arguments
         ("output_file", Path, Path("online_evaluation_libero/eval.json")),
-        ("save_video", str2bool, False),  # placeholder for compatibility
+        ("save_video", str2bool, False),
+        ("video_dir", str, "eval_logs/libero_videos"),
+        ("video_fps", int, 20),
+        ("video_env_index", int, 0),
         # Model checkpoint
         ("checkpoint", str_none, None),
+        # Fake trajectory sanity-check mode
+        ("use_circle_policy", str2bool, False),
+        ("circle_radius", float, 0.03),
+        ("circle_omega", float, 0.20),
+        ("circle_z_bias", float, 0.0),
+        ("circle_keep_openness", str2bool, True),
+        ("circle_fixed_openness", float, 0.02),
         # Model arguments
         ("model_type", str, "qwen_flower_actor_3d"),
         ("prediction_len", int, 10),
         ("num_history", int, 1),
         ("pre_tokenize", str2bool, True),
-        ("custom_img_size", int, 128),
+        ("custom_img_size", int, LIBERO_RGBD_SIZE),
         ("backbone", str, "qwen3vl"),
         ("num_finetune_vision_layers", int, 0),
         ("vision_lora_rank", int, 0),
@@ -58,12 +71,134 @@ def parse_arguments():
         ("gradient_checkpointing", str2bool, False),
         ("relative_action", str2bool, True),
         ("rotation_format", str, "axisangle"),
+        ("libero_controller", str, "OSC_POSE"),
+        ("libero_tcp_target_mode", str, "absolute"),
+        ("libero_target_pos_tol", float, 0.001),
+        ("libero_target_ori_tol", float, 0.01),
+        ("libero_target_max_steps", int, 250),
         ("denoise_timesteps", int, 5),
         ("denoise_model", str, "rectified_flow"),
     ]
     for name, typ, default in arguments:
         parser.add_argument(f"--{name}", type=typ, default=default)
     return parser.parse_args()
+
+
+class CircleTrajectoryPolicy:
+    """Fixed controller that moves TCP in a circle around rollout-start pose."""
+
+    gripper_open_threshold = 0.02
+
+    def __init__(self, args):
+        self.radius = float(args.circle_radius)
+        self.omega = float(args.circle_omega)
+        self.z_bias = float(args.circle_z_bias)
+        self.keep_openness = bool(args.circle_keep_openness)
+        self.fixed_openness = float(args.circle_fixed_openness)
+        self.step_idx = 0
+        self.anchor_pos = None
+        self.anchor_quat = None
+        self.anchor_open = None
+
+    def reset(self):
+        self.step_idx = 0
+        self.anchor_pos = None
+        self.anchor_quat = None
+        self.anchor_open = None
+
+    def _init_anchor(self, obs_list):
+        poses = []
+        quats = []
+        opens = []
+        for obs in obs_list:
+            poses.append(np.asarray(obs["robot0_eef_pos"], dtype=np.float32))
+            quats.append(np.asarray(obs["robot0_eef_quat"], dtype=np.float32))
+            opens.append(abs(float(np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32)[0])))
+        self.anchor_pos = np.stack(poses, axis=0)
+        self.anchor_quat = np.stack(quats, axis=0)
+        self.anchor_open = np.asarray(opens, dtype=np.float32)
+
+    def step(self, obs_list):
+        if self.anchor_pos is None:
+            self._init_anchor(obs_list)
+        theta = self.step_idx * self.omega
+        dx = self.radius * np.cos(theta)
+        dy = self.radius * np.sin(theta)
+        dz = self.z_bias
+
+        target_pos = self.anchor_pos.copy()
+        target_pos[:, 0] += dx
+        target_pos[:, 1] += dy
+        target_pos[:, 2] += dz
+
+        if self.keep_openness:
+            gripper_command = np.where(
+                self.anchor_open[:, None] > self.gripper_open_threshold,
+                -1.0,
+                1.0,
+            ).astype(np.float32)
+        else:
+            gripper_command = np.full(
+                (self.anchor_pos.shape[0], 1),
+                -1.0 if self.fixed_openness > self.gripper_open_threshold else 1.0,
+                dtype=np.float32,
+            )
+
+        self.step_idx += 1
+        return np.concatenate([target_pos, self.anchor_quat, gripper_command], axis=1).astype(np.float32)
+
+
+def _validate_image_setup(args):
+    expected_hw = (LIBERO_RGBD_SIZE, LIBERO_RGBD_SIZE)
+    actual_hw = (int(args.img_h), int(args.img_w))
+    if actual_hw != expected_hw:
+        raise ValueError(
+            "LIBERO online evaluation expects 224x224 RGBD for agentview and wrist, "
+            f"got img_h/img_w={actual_hw}."
+        )
+    if int(args.custom_img_size) != LIBERO_RGBD_SIZE:
+        raise ValueError(
+            "LIBERO online evaluation expects custom_img_size=224 to match the "
+            f"224x224 RGBD inputs, got {args.custom_img_size}."
+        )
+
+
+def _validate_control_setup(args):
+    if args.relative_action and args.rotation_format != "axisangle":
+        raise ValueError(
+            "LIBERO relative_action=True expects rotation_format=axisangle "
+            f"for the unnormalized OSC delta rel_action, got {args.rotation_format!r}."
+        )
+
+
+def _record_video_if_needed(frames, args, task_id, task_name):
+    if not args.save_video or len(frames) == 0:
+        return None
+    try:
+        import cv2
+    except ImportError as exc:
+        print(f"[warn] save_video=True but OpenCV not available: {exc}")
+        return None
+
+    safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(task_name))
+    out_dir = Path(args.video_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"task{task_id}_{safe_name}.mp4"
+
+    h, w, _ = frames[0].shape
+    writer = cv2.VideoWriter(
+        str(out_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(args.video_fps),
+        (w, h),
+    )
+    if not writer.isOpened():
+        print(f"[warn] Failed to open video writer: {out_path}")
+        return None
+    for frame in frames:
+        writer.write(frame[:, :, ::-1])  # RGB -> BGR
+    writer.release()
+    return str(out_path)
 
 
 def _prepare_libero_imports(args):
@@ -74,7 +209,7 @@ def _prepare_libero_imports(args):
 
 
 @torch.no_grad()
-def evaluate_one_task(args, model, task):
+def evaluate_one_task(args, model, task, task_id):
     from online_evaluation_libero.utils_with_libero import (
         create_vectorized_env,
         get_static_camera_matrices,
@@ -82,7 +217,23 @@ def evaluate_one_task(args, model, task):
     )
 
     env_num = args.num_eval
-    env = create_vectorized_env(task, args.img_h, args.img_w, env_num)
+    controller_updates = None
+    if args.libero_controller == "TCP_TARGET_POSE":
+        controller_updates = {
+            "target_mode": args.libero_tcp_target_mode,
+            "target_pos_tol": args.libero_target_pos_tol,
+            "target_ori_tol": args.libero_target_ori_tol,
+            "target_max_steps": args.libero_target_max_steps,
+            "absolute_gripper_openness": False,
+        }
+    env = create_vectorized_env(
+        task,
+        args.img_h,
+        args.img_w,
+        env_num,
+        controller=args.libero_controller,
+        controller_config_updates=controller_updates,
+    )
     env.seed(args.seed)
 
     init_states = load_init_states(task)
@@ -93,8 +244,9 @@ def evaluate_one_task(args, model, task):
     obs = env.set_init_state(init_states_batch)
 
     # Physics settling warmup.
-    for _ in range(5):
-        obs, _, _, _ = env.step(np.zeros((env_num, 7), dtype=np.float32))
+    action_dim = env.workers[0].env.env.action_dim
+    for _ in range(30):
+        obs, _, _, _ = env.step(np.zeros((env_num, action_dim), dtype=np.float32))
 
     # Cache static matrices once per rollout.
     intrinsics_cache, agent_extrinsics_cache = get_static_camera_matrices(
@@ -103,33 +255,64 @@ def evaluate_one_task(args, model, task):
 
     dones = [False] * env_num
     instruction = task.language
+    circle_policy = CircleTrajectoryPolicy(args) if args.use_circle_policy else None
+    if circle_policy is not None:
+        if args.libero_controller != "TCP_TARGET_POSE":
+            raise ValueError("Circle policy requires --libero_controller TCP_TARGET_POSE")
+        circle_policy.reset()
+    video_frames = []
+    video_env_idx = max(0, min(int(args.video_env_index), env_num - 1))
+    if args.save_video:
+        frame = np.asarray(obs[video_env_idx]["agentview_image"])[::-1]
+        wrist = np.asarray(obs[video_env_idx]["robot0_eye_in_hand_image"])[::-1]
+        video_frames.append(np.concatenate([frame, wrist], axis=1))
 
-    for _ in range(args.max_steps):
-        model_input = model.preprocess(
-            obs, env, intrinsics_cache, agent_extrinsics_cache
-        )
-        actions = model.step(model_input, instruction).astype(np.float32)
-        obs, _, done, _ = env.step(actions)
+    max_policy_queries = int(math.ceil(float(args.max_steps) / float(args.prediction_len)))
+    env_steps_taken = 0
+    for _ in range(max_policy_queries):
+        if circle_policy is not None:
+            action_chunk = circle_policy.step(obs)[:, None, :]
+        else:
+            model_input = model.preprocess(
+                obs, env, intrinsics_cache, agent_extrinsics_cache
+            )
+            action_chunk = model.step(model_input, instruction).astype(np.float32)
 
-        for k in range(env_num):
-            dones[k] = dones[k] or bool(done[k])
-        if all(dones):
+        for act_ind in range(action_chunk.shape[1]):
+            if env_steps_taken >= args.max_steps:
+                break
+            obs, _, done, _ = env.step(action_chunk[:, act_ind, :])
+            env_steps_taken += 1
+
+            for k in range(env_num):
+                dones[k] = dones[k] or bool(done[k])
+            if all(dones):
+                break
+
+            if args.save_video:
+                frame = np.asarray(obs[video_env_idx]["agentview_image"])[::-1]
+                wrist = np.asarray(obs[video_env_idx]["robot0_eye_in_hand_image"])[::-1]
+                video_frames.append(np.concatenate([frame, wrist], axis=1))
+
+        if env_steps_taken >= args.max_steps or all(dones):
             break
 
     success_rate = float(np.mean(np.array(dones, dtype=np.float32)))
+    video_path = _record_video_if_needed(video_frames, args, task_id=task_id, task_name=task.name)
     env.close()
-    return success_rate
+    return success_rate, video_path
 
 
 @torch.no_grad()
 def main(args):
     _prepare_libero_imports(args)
+    _validate_image_setup(args)
+    _validate_control_setup(args)
 
-    from online_evaluation_libero.model_wrapper import create_model
     from online_evaluation_libero.utils_with_libero import build_benchmark, save_results
 
-    if args.checkpoint is None:
-        raise ValueError("--checkpoint is required")
+    if (not args.use_circle_policy) and args.checkpoint is None:
+        raise ValueError("--checkpoint is required unless --use_circle_policy true")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -137,7 +320,10 @@ def main(args):
     torch.cuda.manual_seed_all(args.seed)
 
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_model(args)
+    model = None
+    if not args.use_circle_policy:
+        from online_evaluation_libero.model_wrapper import create_model
+        model = create_model(args)
 
     benchmark = build_benchmark(args.benchmark, args.task_order_index)
     task_ids = (
@@ -158,12 +344,15 @@ def main(args):
     for task_id in task_ids:
         task = benchmark.get_task(task_id)
         print(f"[eval] task_id={task_id} name={task.name} lang='{task.language}'")
-        success_rate = evaluate_one_task(args, model, task)
+        success_rate, video_path = evaluate_one_task(args, model, task, task_id=task_id)
         results["results"][str(task_id)] = {
             "task_name": task.name,
             "language": task.language,
             "success_rate": success_rate,
         }
+        if video_path is not None:
+            results["results"][str(task_id)]["video_path"] = video_path
+            print(f"[eval] task_id={task_id} video={video_path}")
         print(f"[eval] task_id={task_id} success_rate={success_rate:.4f}")
 
     if results["results"]:

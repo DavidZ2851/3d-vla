@@ -3,7 +3,11 @@ import torch
 
 
 class RoboTwinDepth2Cloud:
-    """Unproject RoboTwin depth maps using per-camera OpenCV intrinsics/extrinsics."""
+    """Unproject RoboTwin depth maps using OpenCV intrinsics/extrinsics.
+
+    Online evaluation receives head/left/right camera images at 224x224, so
+    the simulator-provided per-camera intrinsics are used directly.
+    """
 
     def __init__(self):
         self._uv_cache = {}

@@ -1,17 +1,15 @@
-from ast import Return
 from .base import BaseDataset
 import torch
-from torch.nn import functional as F
-from utils.pytorch3d_transforms import *
-from scipy.spatial.transform import Rotation as R
+from utils.pytorch3d_transforms import quaternion_to_axis_angle
 
 class LIBERODataset(BaseDataset):
     """LIBERO dataset for single-arm manipulation."""
     cameras = ("agent", "wrist")
     train_copies = 1
-    quat_format = 'axisangle'
+    quat_format = 'xyzw'
     camera_inds = None
     max_samples = None
+    gripper_open_threshold = 0.02
 
     def __init__( 
         self,
@@ -19,9 +17,11 @@ class LIBERODataset(BaseDataset):
         instructions,
         copies=None,
         relative_action=False,
+        rotation_format="axisangle",
         mem_limit=8,
         actions_only=False,
         chunk_size=8,
+        max_samples=None,
     ):
         super().__init__(
             root=root,
@@ -32,17 +32,52 @@ class LIBERODataset(BaseDataset):
             actions_only=actions_only,
             chunk_size=chunk_size
         )
-        if self._relative_action:
-            self.quat_format = 'axisangle'
-        else:
-            self.quat_format = 'rotmatrix'
+        self.max_samples = max_samples
+        if self._relative_action and rotation_format != "axisangle":
+            raise ValueError(
+                "LIBERO relative_action=True returns OSC delta xyz + axisangle + openness; "
+                f"got rotation_format={rotation_format!r}."
+            )
         if self.max_samples is not None:
-            total_samples = len(self.annos['abs_action']) // self.chunk_size
+            total_samples = self._total_samples() // self.chunk_size
             if self.max_samples < total_samples:
                 print(f"Limiting dataset to first {self.max_samples} datapoints (out of {total_samples} total)")
             else:
                 print(f"max_samples ({self.max_samples}) >= total samples ({total_samples}), using all datapoints")
                 self.max_samples = None
+
+    @staticmethod
+    def _quat_xyzw_to_axisangle_xyz(pose):
+        """Convert pose [..., xyz + quat_xyzw + tail] to [..., xyz + axisangle + tail]."""
+        pos = pose[..., :3]
+        quat_xyzw = pose[..., 3:7]
+        tail = pose[..., 7:]
+        quat_wxyz = quat_xyzw[..., [3, 0, 1, 2]]
+        axisangle = quaternion_to_axis_angle(quat_wxyz)
+        return torch.cat([pos, axisangle, tail], dim=-1)
+
+    @classmethod
+    def _binarize_gripper_width(cls, pose):
+        """Convert continuous Franka gripper opening width to binary open state."""
+        out = pose.clone()
+        out[..., -1:] = (out[..., -1:] > cls.gripper_open_threshold).to(out.dtype)
+        return out
+
+    @staticmethod
+    def _binarize_gripper_action(action):
+        """Keep rel_action gripper commands as signed binary values (-1 / +1)."""
+        out = action.clone()
+        out[..., -1:] = torch.where(
+            out[..., -1:] > 0,
+            torch.ones_like(out[..., -1:]),
+            -torch.ones_like(out[..., -1:]),
+        )
+        return out
+
+    def _total_samples(self):
+        if self._relative_action and 'rel_action' in self.annos:
+            return len(self.annos['rel_action'])
+        return len(self.annos['abs_action'])
 
     def _get_task(self, idx):
         return ['libero'] * self.chunk_size
@@ -60,24 +95,30 @@ class LIBERODataset(BaseDataset):
     
     def _get_proprioception(self, idx):
         """
-        Use relative action: raw_proprioception is (N, 3, NHand=1, xyz+axisAngle+openness=7).
-        Use absolute action: proprioception is (N, 3, NHand=1, xyz+3x3rotMatrix+openness=13).
+        Relative mode returns xyz + axisangle + binary openness.
+        Stored zarr proprioception is xyz + quat_xyzw + openness.
         """
-        if self._relative_action and 'raw_proprioception' in self.annos:
-            return self._get_attr_by_idx(idx, 'raw_proprioception', False)
-        return self._get_attr_by_idx(idx, 'proprioception', False)
+        proprio = self._get_attr_by_idx(idx, 'proprioception', False)
+        if self._relative_action:
+            proprio = self._quat_xyzw_to_axisangle_xyz(proprio)
+        return self._binarize_gripper_width(proprio)
 
     def _get_action(self, idx):
         """
-        Use relative action: control_action is (N, 3, NHand=1, xyz+axisAngle+openness=7).
-        Use absolute action: abs_action is (N, T=10, NHand=1, xyz+3x3rotMatrix+openness=13).
+        Relative mode returns the stored unnormalized OSC delta action:
+        xyz delta + axisangle delta + signed binary gripper action.
         """
-        if self._relative_action and 'control_action' in self.annos:
-            return self._get_attr_by_idx(idx, 'control_action', False)
-        return self._get_attr_by_idx(idx, 'abs_action', False)
+        if self._relative_action:
+            if 'rel_action' not in self.annos:
+                raise KeyError("LIBERO relative_action=True requires zarr key 'rel_action'")
+            action = self._get_attr_by_idx(idx, 'rel_action', False)
+            return self._binarize_gripper_action(action)
+        else:
+            action = self._get_attr_by_idx(idx, 'abs_action', False)
+        return self._binarize_gripper_width(action)
 
     def __len__(self):
-        total_samples = len(self.annos['abs_action']) // self.chunk_size
+        total_samples = self._total_samples() // self.chunk_size
         if self.max_samples is not None:
             return self.copies * min(self.max_samples, total_samples)
         return self.copies * total_samples
@@ -86,7 +127,7 @@ class LIBERODataset(BaseDataset):
         return None
 
     def __getitem__(self, idx):
-        total_samples = len(self.annos['abs_action']) // self.chunk_size
+        total_samples = self._total_samples() // self.chunk_size
         effective_size = min(self.max_samples, total_samples) if self.max_samples is not None else total_samples
         idx = idx % effective_size
         idx = idx * self.chunk_size
@@ -104,4 +145,3 @@ class LIBERODataset(BaseDataset):
             "extrinsics": self._get_attr_by_idx(idx, 'extrinsics', True),
             "intrinsics": self._get_attr_by_idx(idx, 'intrinsics', True)
         }
-

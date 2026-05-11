@@ -2,6 +2,7 @@ from .calvin import CALVINTrainTester
 from .peract import PeractTrainTester
 from .rlbench import RLBenchTrainTester
 from .libero import LiberoTrainTester
+from .robotwin2 import RoboTwinTrainTester
 
 def fetch_train_tester(dataset_name):
     dataset_name = dataset_name.lower()
@@ -17,4 +18,6 @@ def fetch_train_tester(dataset_name):
         return RLBenchTrainTester
     if 'libero' in dataset_name:
         return LiberoTrainTester
+    if 'robotwin2' in dataset_name:
+        return RoboTwinTrainTester
     return None

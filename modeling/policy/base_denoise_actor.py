@@ -40,6 +40,9 @@ class DenoiseActor(nn.Module):
         self._relative = relative
         self._lv2_batch_size = lv2_batch_size
         self._nhand = nhand  # NOTE: only depends on args.bimanual, True->2, False->1
+        self._continuous_openness = False
+        self._normalized_action_clamp = None
+        self._signed_binary_openness_output = False
 
         # Vision-language encoder, runs only once
         self.encoder = None  # Implement this!
@@ -79,6 +82,10 @@ class DenoiseActor(nn.Module):
                 requires_grad=False
             )
         self.nrm_dim = int(self.workspace_normalizer.size(-1))
+        self.openness_normalizer = nn.Parameter(
+            torch.tensor([0.0, 1.0], dtype=torch.float32),
+            requires_grad=False
+        )
 
     def encode_inputs(
         self,
@@ -233,8 +240,20 @@ class DenoiseActor(nn.Module):
         ).unflatten(1, (traj_len, nhand))
         # unnormalize position
         trajectory = self.unnormalize_pos(trajectory)
-        # Convert gripper status to probaility
-        trajectory[..., -1] = trajectory[..., -1].sigmoid()
+        if self._continuous_openness:
+            trajectory[..., -1:] = self.unnormalize_openness(
+                torch.tanh(trajectory[..., -1:])
+            )
+        else:
+            prob_close = trajectory[..., -1].sigmoid()
+            if self._signed_binary_openness_output:
+                trajectory[..., -1] = torch.where(
+                    prob_close >= 0.5,
+                    torch.ones_like(prob_close),
+                    -torch.ones_like(prob_close),
+                )
+            else:
+                trajectory[..., -1] = prob_close
         # trajectory = trajectory * valid_mask  # NOTE NOTE: ensure padded hand output zeros
 
         return trajectory
@@ -264,6 +283,10 @@ class DenoiseActor(nn.Module):
 
         # Process gt_trajectory
         gt_openess = gt_trajectory[..., -1:]
+        if self._continuous_openness:
+            gt_openess = self.normalize_openness(gt_openess)
+        else:
+            gt_openess = (gt_openess > 0).to(gt_openess.dtype)
         gt_trajectory = gt_trajectory[..., :-1]
         # Normalize all pos
         gt_trajectory = self.normalize_pos(gt_trajectory)
@@ -314,7 +337,14 @@ class DenoiseActor(nn.Module):
                 )
                 pos_loss = F.l1_loss(pos, denoise_target[..., :3], reduction='mean')
                 rot_loss = F.l1_loss(rot, denoise_target[..., 3:], reduction='mean')
-                openness_loss = F.binary_cross_entropy_with_logits(openess, gt_openess)
+                if self._continuous_openness:
+                    openness_loss = F.smooth_l1_loss(
+                        torch.tanh(openess),
+                        gt_openess,
+                        reduction='mean'
+                    )
+                else:
+                    openness_loss = F.binary_cross_entropy_with_logits(openess, gt_openess)
                 
                 # NOTE NOTE: for action space alignment
                 # valid_mask_bool = valid_mask.bool()
@@ -347,6 +377,9 @@ class DenoiseActor(nn.Module):
             (signal[..., :self.nrm_dim] - _min) / diff * 2.0
             - 1.0
         )
+        if self._normalized_action_clamp is not None:
+            clamp = float(self._normalized_action_clamp)
+            out[..., :self.nrm_dim] = out[..., :self.nrm_dim].clamp(-clamp, clamp)
         return out
 
     def unnormalize_pos(self, signal):
@@ -360,6 +393,27 @@ class DenoiseActor(nn.Module):
             + _min
         )
         return out
+
+    def normalize_openness(self, signal):
+        _min = self.openness_normalizer[0]
+        _max = self.openness_normalizer[1]
+        diff = (_max - _min).clamp_min(1e-6)
+        out = (signal - _min) / diff * 2.0 - 1.0
+        if self._normalized_action_clamp is not None:
+            clamp = float(self._normalized_action_clamp)
+            out = out.clamp(-clamp, clamp)
+        return out
+
+    def unnormalize_openness(self, signal):
+        _min = self.openness_normalizer[0]
+        _max = self.openness_normalizer[1]
+        diff = (_max - _min).clamp_min(1e-6)
+        return (signal + 1.0) / 2.0 * diff + _min
+
+    @staticmethod
+    def _identity_rot6d_like(rot6d):
+        identity = rot6d.new_tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+        return identity.view(*([1] * (rot6d.ndim - 1)), 6)
 
     def convert_rot(self, signal):
         """Convert external rotation representation to rot6d for diffusion.
@@ -402,6 +456,8 @@ class DenoiseActor(nn.Module):
             rot = rot.reshape(B, L, 6)
         else:
             rot = get_ortho6d_from_rotation_matrix(rot)
+        if self._relative:
+            rot = rot - self._identity_rot6d_like(rot)
         signal = torch.cat([signal[..., :3], rot], dim=-1)
         if res is not None:
             signal = torch.cat((signal, res), -1)
@@ -440,11 +496,15 @@ class DenoiseActor(nn.Module):
         if len(signal.shape) == 3:
             B, L, _ = signal.shape
             rot = signal[..., 3:9].reshape(B * L, 6)
+            if self._relative:
+                rot = rot + self._identity_rot6d_like(rot)
             mat = compute_rotation_matrix_from_ortho6d(rot)
             quat = matrix_to_quaternion(mat)
             quat = quat.reshape(B, L, 4)
         else:
             rot = signal[..., 3:9]
+            if self._relative:
+                rot = rot + self._identity_rot6d_like(rot)
             mat = compute_rotation_matrix_from_ortho6d(rot)
             quat = matrix_to_quaternion(mat)
         if self._rotation_format == 'quat_xyzw':

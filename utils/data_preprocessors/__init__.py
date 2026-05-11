@@ -4,6 +4,7 @@ from .calvin import CALVINDataPreprocessor
 from .peract import PeractDataPreprocessor
 from .rlbench import RLBenchDataPreprocessor
 from .libero import LiberoDataPreprocessor
+from .robotwin2 import RoboTwinDataPreprocessor
 
 
 def fetch_data_preprocessor(dataset_name):
@@ -19,5 +20,7 @@ def fetch_data_preprocessor(dataset_name):
     if 'geniesim' in dataset_name:
         return partial(RLBenchDataPreprocessor, orig_imsize=(400, 640))
     if 'libero' in dataset_name:
-        return partial(LiberoDataPreprocessor, orig_imsize=128)
+        return partial(LiberoDataPreprocessor, orig_imsize=224)
+    if 'robotwin2' in dataset_name:
+        return partial(RoboTwinDataPreprocessor, orig_imsize=224)
     return None

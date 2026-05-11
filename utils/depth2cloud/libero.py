@@ -3,10 +3,9 @@ import torch
 
 
 class LiberoDepth2Cloud:
-    def __init__(self, shape):
-        self.uniforms = torch.from_numpy(
-            self._create_uniform_pixel_coords_image(shape)
-        ).permute(2, 0, 1).cuda(non_blocking=True)  # (3, H, W)
+    def __init__(self, shape=None):
+        self.default_shape = tuple(shape) if shape is not None else None
+        self._uniforms_cache = {}
 
     @staticmethod
     def _create_uniform_pixel_coords_image(resolution):
@@ -15,6 +14,15 @@ class LiberoDepth2Cloud:
         v = np.tile(np.arange(h), (w, 1)).T
         ones = np.ones_like(u)
         return np.stack((u, v, ones), axis=-1)  # (H, W, 3)
+
+    def _get_uniforms(self, h, w, device):
+        key = (h, w, device.type, device.index)
+        if key not in self._uniforms_cache:
+            uniforms = torch.from_numpy(
+                self._create_uniform_pixel_coords_image((h, w))
+            ).permute(2, 0, 1).to(device=device, dtype=torch.float32)
+            self._uniforms_cache[key] = uniforms
+        return self._uniforms_cache[key]
 
     @staticmethod
     def _get_cam_proj_mat_inv_b(extrinsics, intrinsics):
@@ -42,7 +50,7 @@ class LiberoDepth2Cloud:
         # depth is (B, H, W), extrinsics (B, 4, 4), intrinsics (B, 3, 3)
         # output is (B, 3, H, W)
         b, h, w = depth.shape
-        uv1 = self.uniforms[None]  # (1, 3, H, W)
+        uv1 = self._get_uniforms(h, w, depth.device)[None]  # (1, 3, H, W)
         pc = uv1 * depth[:, None]  # (B, 3, H, W)
         pc = torch.cat([pc, torch.ones_like(pc[:, :1])], dim=1)  # (B, 4, H, W)
         pc = pc.reshape(b, 4, -1)  # (B, 4, HW)

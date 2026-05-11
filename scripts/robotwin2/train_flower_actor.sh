@@ -1,89 +1,75 @@
 #!/bin/bash
-#SBATCH --job-name=libero_mibot
+#SBATCH --job-name=rw2_euler
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=500G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=200G
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40S|A100_40GB"
+#SBATCH --constraint="L40S|A100_80GB"
 
 export WANDB_MODE=online   # or "offline" / "disabled"
 export WANDB_API_KEY=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
 
-# ---- VLM Model path ----
-export QWEN3VL_MODEL_PATH=/home/ziyinx/Xiaomi-Robotics-0-Pretrain
-
-# ---- Data paths (edit as needed) ----
 DATA_PATH=/data/user_data/ziyinx/datasets
-train_data_dir=$DATA_PATH/zarr_datasets/libero_zarr/train_rechunked8.zarr
-eval_data_dir=/data/group_data/katefgroup/VLA/zarr_datasets/libero_zarr/val_rechunked8.zarr
-train_instructions=instructions/libero/instructions.json
-val_instructions=instructions/libero/val_instructions.json
+train_data_dir=$DATA_PATH/zarr_datasets/robotwin2_zarr/train_rechunked8.zarr
+eval_data_dir=/data/group_data/katefgroup/datasets/ziyinx/robotwin2_zarr/val_rechunked8.zarr
+train_instructions=instructions/robotwin2/instructions_full.json
+val_instructions=instructions/robotwin2/instructions_full.json
 
-# ---- Dataset / loader ----
-dataset=Libero
-num_workers=8
-memory_limit=8
-B=64
-B_val=64
+dataset=RoboTwin2
+num_workers=4
+memory_limit=6
+B=8
+B_val=8
 chunk_size=8
-lv2_batch_size=1
 
-# ---- Training ----
-val_freq=2000
+# Training/testing arguments, change these for HPT
+val_freq=5000
 eval_only=false
-lr=1e-4
+lr=2e-5
 lr_scheduler=tristage_flower
-backbone_lr=1e-6
-num_finetune_vision_layers=0
-vision_lora_rank=16
-vision_lora_alpha=32
-vision_lora_dropout=0.05
-vision_lora_num_layers=6
-vision_lora_target_modules=attn.qkv,attn.proj
-llm_lora_rank=16
-llm_lora_alpha=32
-llm_lora_dropout=0.05
-llm_lora_num_layers=4
-llm_lora_target_modules=self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj
-vision_lora_lr_scale=0.15
-llm_lora_lr_scale=0.05
-merger_lr_scale=0.4
-wd=1e-10
+backbone_lr=2e-5
+num_finetune_vision_layers=0  # unused by Florence2, kept for CLI parity with mibot script
+vision_lr_scale=0.2
+projector_lr_scale=0.4
+wd=0.05
 train_iters=200000
 use_compile=false
 use_ema=false
+grounding_dropout_prob=0.6
 
-# ---- Model ----
-model_type=qwen_flower_actor_3d
-bimanual=false
+model_type=flower_actor_3d
+bimanual=true
 keypose_only=false
 pre_tokenize=true
-custom_img_size=128
+custom_img_size=224
 
-backbone=qwen3vl
-finetune_backbone=false
+backbone=florence2
+finetune_backbone=true
 finetune_text_encoder=false
 fps_subsampling_factor=1
 
 C=1024
 num_attn_heads=16
-num_vis_instr_attn_layers=3  # unused by Qwen3VL, only applied to CLIP.
+num_vis_instr_attn_layers=3  # unused by Florence2, only applied to CLIP.
 num_history=1
 num_shared_attn_layers=16
 
 workspace_normalizer_buffer=0.0
-rotation_format=axisangle
+# Choose RobotWin2 rotation target:
+#   quat_wxyz: keep wxyz labels; model converts quat -> rot6d internally.
+#   euler:     convert wxyz labels -> XYZ Euler before prediction.
+rotation_format=${ROTATION_FORMAT:-euler}
 relative_action=true
 denoise_timesteps=5
 denoise_model=rectified_flow
 
-main_dir=libero
-run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-visLoraR${vision_lora_rank}-visL${vision_lora_num_layers}-llmLoraR${llm_lora_rank}-llmL${llm_lora_num_layers}-job${SLURM_JOBID}
+main_dir=robotwin2
+run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-finetuned_$finetune_backbone-job${SLURM_JOBID}
 # train from scratch:
 checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
 finetune=false
@@ -105,7 +91,6 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --memory_limit $memory_limit \
     --batch_size $B \
     --batch_size_val $B_val \
-    --lv2_batch_size $lv2_batch_size \
     --chunk_size $chunk_size \
     --exp_log_dir $main_dir \
     --run_log_dir ${run_log_dir} \
@@ -140,16 +125,6 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --denoise_model $denoise_model \
     --finetune $finetune \
     --num_finetune_vision_layers $num_finetune_vision_layers \
-    --vision_lora_rank $vision_lora_rank \
-    --vision_lora_alpha $vision_lora_alpha \
-    --vision_lora_dropout $vision_lora_dropout \
-    --vision_lora_num_layers $vision_lora_num_layers \
-    --vision_lora_target_modules $vision_lora_target_modules \
-    --llm_lora_rank $llm_lora_rank \
-    --llm_lora_alpha $llm_lora_alpha \
-    --llm_lora_dropout $llm_lora_dropout \
-    --llm_lora_num_layers $llm_lora_num_layers \
-    --llm_lora_target_modules $llm_lora_target_modules \
-    --vision_lora_lr_scale $vision_lora_lr_scale \
-    --llm_lora_lr_scale $llm_lora_lr_scale \
-    --merger_lr_scale $merger_lr_scale
+    --vision_lr_scale $vision_lr_scale \
+    --projector_lr_scale $projector_lr_scale \
+    --grounding_dropout_prob $grounding_dropout_prob

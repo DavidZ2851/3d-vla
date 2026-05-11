@@ -7,7 +7,12 @@ from .base import DataPreprocessor
 
 class LiberoDataPreprocessor(DataPreprocessor):
     def __init__(self, keypose_only=False, num_history=3,
-                 orig_imsize=128, custom_imsize=None, depth2cloud=None):
+                 orig_imsize=224, custom_imsize=None, depth2cloud=None):
+        if custom_imsize not in (None, orig_imsize):
+            raise ValueError(
+                f"LIBERO zarr stores RGB/depth/intrinsics at {orig_imsize}x{orig_imsize}. "
+                f"Use custom_img_size={orig_imsize} or None, got {custom_imsize}."
+            )
         super().__init__(
             keypose_only=keypose_only,
             num_history=num_history,
@@ -16,16 +21,10 @@ class LiberoDataPreprocessor(DataPreprocessor):
         )
         self.aug = K.AugmentationSequential(
             K.RandomAffine(
-                degrees=0,
-                translate=0.0,
-                scale=(0.75, 1.25),
-                padding_mode="reflection",
-                p=0.8
-            ),
-            K.RandomResizedCrop(
-                size=(orig_imsize, orig_imsize),
-                scale=(0.95, 1.05),
-                p=0.1
+                degrees=0.0,
+                translate=(10 / orig_imsize, 10 / orig_imsize),
+                padding_mode="border",
+                p=1.0,
             )
         ).cuda()
 
@@ -47,9 +46,9 @@ class LiberoDataPreprocessor(DataPreprocessor):
         """
         # Get point cloud from depth
         pcds = self.depth2cloud(
-            depth.cuda(non_blocking=True).to(torch.bfloat16),
-            extrinsics.cuda(non_blocking=True).to(torch.bfloat16),
-            intrinsics.cuda(non_blocking=True).to(torch.bfloat16)
+            depth.cuda(non_blocking=True).float(),
+            extrinsics.cuda(non_blocking=True).float(),
+            intrinsics.cuda(non_blocking=True).float()
         )
 
         # Agent (cam 0): optional augmentation. Wrist (cam 1): no augmentation.

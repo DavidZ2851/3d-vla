@@ -384,34 +384,42 @@ class Model:
     @torch.no_grad()
     def preprocess(self, observation):
         camera_obs = self._get_camera_dict(observation)
-        rgb = np.stack(
-            [
-                np.asarray(camera_obs[name]["rgb"], dtype=np.uint8).transpose(2, 0, 1)
-                for name in self.CAMERA_NAMES
-            ],
-            axis=0,
-        )
-        depth = np.stack(
-            [
-                np.asarray(camera_obs[name]["depth"], dtype=np.float32)
-                for name in self.CAMERA_NAMES
-            ],
-            axis=0,
-        )
         intrinsics = self._get_intrinsics(camera_obs)
         extrinsics = self._get_extrinsics(camera_obs)
         proprio = self._extract_proprio(observation)
 
-        rgb_tensor = torch.from_numpy(rgb[None])
-        depth_tensor = torch.from_numpy(depth[None])
-        extrinsics_tensor = torch.from_numpy(extrinsics[None])
-        intrinsics_tensor = torch.from_numpy(intrinsics[None])
+        rgb_arrays = []
+        depth_arrays = []
+        for name in self.CAMERA_NAMES:
+            rgb = np.asarray(camera_obs[name]["rgb"], dtype=np.uint8).transpose(2, 0, 1)
+            depth = np.asarray(camera_obs[name]["depth"], dtype=np.float32)
+            if rgb.shape[-2:] != depth.shape[-2:]:
+                raise ValueError(
+                    f"Online RoboTwin camera `{name}` has mismatched RGB/depth "
+                    f"shapes: rgb={rgb.shape[-2:]}, depth={depth.shape[-2:]}."
+                )
+            rgb_arrays.append(rgb)
+            depth_arrays.append(depth)
+
+        image_shapes = {rgb.shape[-2:] for rgb in rgb_arrays}
+        if len(image_shapes) != 1:
+            raise ValueError(
+                "Online RoboTwin evaluation expects head/left/right cameras at "
+                f"the same resolution, got {sorted(image_shapes)}."
+            )
+
+        rgbs_np = np.stack(rgb_arrays, axis=0)[None]
+        depths_np = np.stack(depth_arrays, axis=0)[None]
+        rgbs_t = torch.from_numpy(rgbs_np)
+        depths_t = torch.from_numpy(depths_np)
+        extrinsics_t = torch.from_numpy(extrinsics[None])
+        intrinsics_t = torch.from_numpy(intrinsics[None])
 
         rgbs, pcds = self.preprocessor.process_obs(
-            rgb_tensor,
-            depth_tensor,
-            extrinsics_tensor,
-            intrinsics_tensor,
+            rgbs_t,
+            depths_t,
+            extrinsics_t,
+            intrinsics_t,
         )
         proprio = self.preprocessor.process_proprio(proprio)
         return {"rgb": rgbs, "pcd": pcds, "proprio": proprio}
@@ -469,6 +477,7 @@ class Model:
                 step[:, 3:7],
                 prev[:, 3:7],
             )
+            nxt[:, -1] = prev[:, -1] + step[:, -1]
             abs_actions.append(nxt)
             prev = nxt
         return np.stack(abs_actions, axis=0)
@@ -486,6 +495,7 @@ class Model:
                     _invert_quaternion_wxyz(prev[:, 3:7]),
                 )
             )
+            delta[:, -1] = step[:, -1] - prev[:, -1]
             rel_actions.append(delta)
             prev = step
         return np.stack(rel_actions, axis=0)

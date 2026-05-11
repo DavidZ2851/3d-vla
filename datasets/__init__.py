@@ -12,6 +12,7 @@ from .rlbench import (
 )
 from .geniesim3 import GenieSim3Dataset
 from .libero import LIBERODataset
+from .robotwin2 import RoboTwin2Dataset
 
 def fetch_dataset_class(dataset_name):
     """Fetch the dataset class based on the dataset name."""
@@ -32,6 +33,7 @@ def fetch_dataset_class(dataset_name):
         "GenieSim3": GenieSim3Dataset,
         "GenieSim3.0": GenieSim3Dataset,
         "Libero": LIBERODataset,
+        "RoboTwin2": RoboTwin2Dataset,
     }
     
     if dataset_name not in dataset_classes:

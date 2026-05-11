@@ -54,12 +54,20 @@ class BaseTrainTester:
     def get_datasets(self):
         """Initialize datasets."""
         # Initialize datasets with arguments
+        dataset_params = inspect.signature(self.dataset_cls.__init__).parameters
+        train_kwargs = {}
+        val_kwargs = {}
+        if "rotation_format" in dataset_params:
+            train_kwargs["rotation_format"] = self.args.rotation_format
+            val_kwargs["rotation_format"] = self.args.rotation_format
+
         train_dataset = self.dataset_cls(
             root=self.args.train_data_dir,
             instructions=self.args.train_instructions,
             relative_action=self.args.relative_action,
             mem_limit=self.args.memory_limit,
-            chunk_size=self.args.chunk_size
+            chunk_size=self.args.chunk_size,
+            **train_kwargs
         )
         val_dataset = self.dataset_cls(
             root=self.args.eval_data_dir,
@@ -68,7 +76,8 @@ class BaseTrainTester:
             relative_action=self.args.relative_action,
             mem_limit=0.1,
             chunk_size=self.args.chunk_size,
-            max_samples=1000
+            max_samples=1000,
+            **val_kwargs
         )
         return train_dataset, val_dataset
 
@@ -190,6 +199,11 @@ class BaseTrainTester:
         print("Computing workspace normalizer...")
 
         # Initialize datasets with arguments
+        dataset_params = inspect.signature(self.dataset_cls.__init__).parameters
+        dataset_kwargs = {}
+        if "rotation_format" in dataset_params:
+            dataset_kwargs["rotation_format"] = self.args.rotation_format
+
         train_dataset = self.dataset_cls(
             root=self.args.train_data_dir,
             instructions=self.args.train_instructions,
@@ -197,7 +211,8 @@ class BaseTrainTester:
             relative_action=self.args.relative_action,
             mem_limit=0.1,
             actions_only=True,
-            chunk_size=self.args.chunk_size
+            chunk_size=self.args.chunk_size,
+            **dataset_kwargs
         )
 
         data_loader = DataLoader(
@@ -376,7 +391,7 @@ class BaseTrainTester:
                     val_iters=10,
                     split='train'
                 )
-                if (step_id + 1) % 10000 == 0:  # frequently evaluate on val and save ckpt
+                if (step_id + 1) % 5000 == 0:  # frequently evaluate on val and save ckpt
                     print("Test evaluation.......")
                     new_loss = self.evaluate_nsteps(
                         ema_model.module if self.args.use_ema else model.module,
@@ -764,9 +779,9 @@ class BaseTrainTester:
             best_loss = new_loss
 
         # Main checkpoint:
-        # - before 60k iters (inclusive): keep writing last.pth
-        # - from 60k iters: write <iter>.pth
-        ckpt_name = f"{current_iter}.pth" if current_iter > 50000 else "last.pth"
+        # - before 35k iters (inclusive): keep writing last.pth
+        # - from 35k iters: write <iter>.pth
+        ckpt_name = f"{current_iter}.pth" if current_iter > 30000 else "last.pth"
         torch.save({
             "weight": model_state,
             "ema_weight": ema_state,
