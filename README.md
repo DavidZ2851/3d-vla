@@ -5,7 +5,7 @@
 > conda activate 3dfavla
 > pip install torch torchvision torchaudio
 > pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
-> pip install einops tqdm transformers==4.40.2 zarr diffusers kornia tensorboard open_clip_torch scipy hydra-core matplotlib wandb psutil
+> pip install einops tqdm transformers==4.40.2 zarr diffusers kornia tensorboard open_clip_torch scipy hydra-core matplotlib wandb psutil pyarrow
 > MAX_JOBS=8 pip install "flash-attn==2.5.8" --no-build-isolation
 > pip install git+https://github.com/openai/CLIP.git
 ```
