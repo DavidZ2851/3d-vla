@@ -8,26 +8,18 @@ from .flower_actor import (
     FlowerActor3D,
     FlowerActor3DGroundingCond,
     FlowerActor3DMotionLatent,
-    FlowerActor2D,
+    FlowerActor3DMotionLatentUVD,
+    FlowerActor3DMotionLatentJoint,
+    FlowerActor3DMotionPartialLatent,
+    FlowerActor3DMotionEncoderLatent,
+    FlowerActor3DMotionTraj,
+    FlowerActor3DMotionCleanLatent,
+    FlowerActor3DMotion2D,
+    FlowerActor2DFA,
+    FlowerActor2DJoint,
+    FlowerActor2DMotion2D,
+    FlowerActor2DCLIP,
 )
-from .flower_actor_qwen import QwenFlowerActor3D
-from .flower_actor_qwen_stagewise import QwenFlowerActor3DStagewise
-from .flower_actor_qwen_grounding import (
-    QwenFlowerActor3DGroundingCond,
-    QwenFlowerActor3DGroundingCondLLMVisual,
-    QwenFlowerActor3DGroundingCondQwen3D,
-    QwenFlowerActor3DGroundingPred,
-)
-try:
-    from .qwen_pi_llm_actor_3d import QwenPi0LLMActor3D, QwenPi05LLMActor3D
-    _QWEN_PI_IMPORT_ERROR = None
-except ModuleNotFoundError as exc:
-    QwenPi0LLMActor3D = None
-    QwenPi05LLMActor3D = None
-    _QWEN_PI_IMPORT_ERROR = exc
-from .qwen_dualexpert_3dfa_actor import QwenDualExpert3DFAActor
-# from .old_diffuser_actor import DiffuserActor
-
 
 def fetch_model_class(model_type):
     if model_type == 'denoise3d':  # standard 3DFA
@@ -48,38 +40,26 @@ def fetch_model_class(model_type):
         return FlowerActor3DGroundingCond
     if model_type == 'flower_actor_3d_motion_latent':
         return FlowerActor3DMotionLatent
-    if model_type == 'flower_actor_2d':
-        return FlowerActor2D
-    if model_type == 'qwen_flower_actor_3d':
-        return QwenFlowerActor3D
-    if model_type == 'qwen_flower_actor_3d_stagewise':
-        return QwenFlowerActor3DStagewise
-    if model_type == 'qwen_flower_actor_3d_grounding_cond':
-        return QwenFlowerActor3DGroundingCond
-    if model_type == 'qwen_flower_actor_3d_grounding_cond_llm_visual':
-        return QwenFlowerActor3DGroundingCondLLMVisual
-    if model_type == 'qwen_flower_actor_3d_grounding_cond_qwen3d':
-        return QwenFlowerActor3DGroundingCondQwen3D
-    if model_type == 'qwen_flower_actor_3d_grounding_pred':
-        return QwenFlowerActor3DGroundingPred
-    if model_type == 'qwen_pi0_llm_actor_3d':
-        if QwenPi0LLMActor3D is None:
-            raise ImportError(
-                "qwen_pi0_llm_actor_3d requires optional Qwen3-VL dependencies "
-                "(e.g. `transformers.models.qwen3_vl`) that are unavailable in "
-                "this environment."
-            ) from _QWEN_PI_IMPORT_ERROR
-        return QwenPi0LLMActor3D
-    if model_type == 'qwen_pi05_llm_actor_3d':
-        if QwenPi05LLMActor3D is None:
-            raise ImportError(
-                "qwen_pi05_llm_actor_3d requires optional Qwen3-VL dependencies "
-                "(e.g. `transformers.models.qwen3_vl`) that are unavailable in "
-                "this environment."
-            ) from _QWEN_PI_IMPORT_ERROR
-        return QwenPi05LLMActor3D
-    if model_type == 'qwen_dualexpert_3dfa_actor':
-        return QwenDualExpert3DFAActor
-    # if model_type == '3dda':
-    #     return DiffuserActor
+    if model_type == 'flower_actor_3d_motion_latent_uvd':  # UVD (u,v,depth) motion expert
+        return FlowerActor3DMotionLatentUVD
+    if model_type == 'flower_actor_3d_motion_latent_joint':  # joint-angle decoder on the 3D CoT
+        return FlowerActor3DMotionLatentJoint
+    if model_type == 'flower_actor_3d_motion_partial_latent':  # partially-denoised motion latent ablation
+        return FlowerActor3DMotionPartialLatent
+    if model_type == 'flower_actor_3d_motion_encoder_latent':  # encoder-only motion latent ablation
+        return FlowerActor3DMotionEncoderLatent
+    if model_type == 'flower_actor_3d_motion_traj':  # one-step denoise -> explicit trajectory
+        return FlowerActor3DMotionTraj
+    if model_type == 'flower_actor_3d_motion_clean_latent':  # one-step denoise -> clean-traj latent
+        return FlowerActor3DMotionCleanLatent
+    if model_type == 'flower_actor_3d_motion_2d':
+        return FlowerActor3DMotion2D
+    if model_type == 'flower_actor_2d':  # 2D ablation of flower_actor_3d (2dfavla)
+        return FlowerActor2DFA
+    if model_type == 'flower_actor_2d_joint':  # 2D visual-language joint-action baseline
+        return FlowerActor2DJoint
+    if model_type == 'flower_actor_2d_motion_2d':
+        return FlowerActor2DMotion2D
+    if model_type == 'flower_actor_2d_clip':  # legacy CLIP-only 2D actor
+        return FlowerActor2DCLIP
     return None

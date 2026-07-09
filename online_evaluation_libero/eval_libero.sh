@@ -1,13 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=eval_libero_10
+#SBATCH --job-name=test
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1
 #SBATCH --time=4:00:00
-#SBATCH --partition=preempt
+#SBATCH --partition=general
 #SBATCH --output=/data/user_data/ziyinx/logs/%x_%j.out
 #SBATCH --error=/data/user_data/ziyinx/logs/%x_%j.err
-#SBATCH --constraint="L40S|L40|A100_80GB"
+#SBATCH --constraint="L40S|A100_80GB"
+#SBATCH --exclude=babel-m5-32
 
+REPO_ROOT=/data/user_data/ziyinx/analogical_manipulation_clean
 libero_root=/data/user_data/ziyinx/LIBERO
 
 # Task/eval arguments
@@ -20,7 +22,7 @@ num_eval=50
 max_steps=600
 img_h=224
 img_w=224
-seed=2
+seed=0
 libero_controller=OSC_POSE
 libero_tcp_target_mode=absolute
 libero_target_pos_tol=0.001
@@ -29,7 +31,7 @@ libero_target_max_steps=250
 
 # Output
 exp=LIBERO
-checkpoint=/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/libero/flower_actor_3d-Libero-C1024-B16-lr5e-5-tristage_flower-H1-rectified_flow-florence2-finetuned_true-job7856005/80000.pth
+checkpoint=${CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/libero/3dfavla_motion_subset/95k.pth}
 save_video=true
 video_fps=20
 video_env_index=0
@@ -43,7 +45,7 @@ circle_keep_openness=true
 circle_fixed_openness=0.02
 
 # Model arguments (keep aligned with training)
-model_type=flower_actor_3d
+model_type=flower_actor_3d_motion_latent
 prediction_len=10
 num_history=1
 pre_tokenize=true
@@ -61,7 +63,7 @@ llm_lora_dropout=0.05
 llm_lora_num_layers=0
 llm_lora_target_modules=self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj,mlp.gate_proj,mlp.up_proj,mlp.down_proj
 fps_subsampling_factor=1
-embedding_dim=1024
+embedding_dim=912
 num_attn_heads=16
 num_vis_instr_attn_layers=3
 num_shared_attn_layers=16
@@ -71,6 +73,15 @@ relative_action=true
 rotation_format=axisangle
 denoise_timesteps=5
 denoise_model=rectified_flow
+
+# Motion-latent arguments
+motion_expert_config=${MOTION_EXPERT_CONFIG:-$REPO_ROOT/motion_expert/configs/libero_florence2.yaml}
+motion_expert_checkpoint=${MOTION_EXPERT_CHECKPOINT:-$REPO_ROOT/train_logs/motion_expert/libero_florence2/B32_18k.pt}
+motion_solver_steps=10
+motion_steps_to_run=1
+motion_finetune=false
+motion_scene_fusion=true
+motion_action_fusion=false
 
 ngpus=1
 
@@ -135,5 +146,12 @@ for benchmark in "${suites[@]}"; do
         --libero_target_ori_tol "$libero_target_ori_tol" \
         --libero_target_max_steps "$libero_target_max_steps" \
         --denoise_timesteps "$denoise_timesteps" \
-        --denoise_model "$denoise_model"
+        --denoise_model "$denoise_model" \
+        --motion_expert_config "$motion_expert_config" \
+        --motion_expert_checkpoint "$motion_expert_checkpoint" \
+        --motion_solver_steps "$motion_solver_steps" \
+        --motion_steps_to_run "$motion_steps_to_run" \
+        --motion_finetune "$motion_finetune" \
+        --motion_scene_fusion "$motion_scene_fusion" \
+        --motion_action_fusion "$motion_action_fusion"
 done

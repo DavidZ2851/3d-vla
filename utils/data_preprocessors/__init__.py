@@ -5,6 +5,7 @@ from .peract import PeractDataPreprocessor
 from .rlbench import RLBenchDataPreprocessor
 from .libero import LiberoDataPreprocessor
 from .robotwin2 import RoboTwinDataPreprocessor
+from .aloha import AlohaDataPreprocessor
 
 
 def fetch_data_preprocessor(dataset_name):
@@ -23,4 +24,6 @@ def fetch_data_preprocessor(dataset_name):
         return partial(LiberoDataPreprocessor, orig_imsize=224)
     if 'robotwin2' in dataset_name:
         return partial(RoboTwinDataPreprocessor, orig_imsize=224)
+    if 'aloha' in dataset_name:
+        return partial(AlohaDataPreprocessor, orig_imsize=(224, 398))
     return None

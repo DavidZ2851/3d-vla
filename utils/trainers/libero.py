@@ -60,8 +60,10 @@ class LiberoTrainTester(BaseTrainTester):
         self._copy_openness_normalizer(model)
         return model
 
-    def load_checkpoint(self, model, ema_model, optimizer):
-        result = super().load_checkpoint(model, ema_model, optimizer)
+    def load_checkpoint(self, model, ema_model, optimizer, lr_scheduler=None, scaler=None):
+        result = super().load_checkpoint(
+            model, ema_model, optimizer, lr_scheduler, scaler
+        )
         self._copy_openness_normalizer(model)
         self._copy_openness_normalizer(ema_model)
         return result

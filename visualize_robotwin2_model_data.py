@@ -122,17 +122,9 @@ def resolve_existing_zarr_path(candidates: list[str], tag: str) -> str:
 
 
 def relative_to_absolute(action: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
-    """Mirror utils.trainers.base.relative_to_absolute for quat_wxyz."""
-    pos = proprio[..., :3] + action[..., :3].cumsum(1)
-    rel_orn = action[..., 3:7]
-    curr_orn = proprio[..., 3:7]
-    abs_orns = []
-    for t in range(rel_orn.shape[1]):
-        q_rel = rel_orn[:, t:t + 1]
-        next_orn = pytorch3d_transforms.quaternion_multiply(q_rel, curr_orn)
-        abs_orns.append(next_orn)
-        curr_orn = next_orn
-    orn = torch.cat(abs_orns, dim=1)
+    """Convert robotwin2_to_zarr.py rel_action to absolute TCP targets."""
+    pos = proprio[..., :3] + action[..., :3]
+    orn = torch.nn.functional.normalize(action[..., 3:7], dim=-1, eps=1e-6)
     return torch.cat([pos, orn, action[..., -1:]], dim=-1)
 
 

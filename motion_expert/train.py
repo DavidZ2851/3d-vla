@@ -282,6 +282,76 @@ def _barrier_if_distributed(distributed: bool) -> None:
         dist.barrier(device_ids=[torch.cuda.current_device()])
 
 
+def _load_or_compute_motion_normalization_stats(
+    stats_path: Path,
+    train_cfg: dict,
+    data_cfg: dict,
+    *,
+    is_main_process: bool,
+    distributed: bool,
+) -> Dict[str, object]:
+    if stats_path.exists():
+        return load_calvin_normalization_stats(stats_path)
+
+    if is_main_process:
+        num_bins = int(train_cfg.get("normalization_num_bins", 131072))
+        source_root_cfg = train_cfg.get("normalization_source_root")
+        if source_root_cfg is not None:
+            stats = compute_calvin_normalization_stats(
+                source_root=Path(source_root_cfg),
+                num_bins=num_bins,
+            )
+        else:
+            stats = compute_calvin_zarr_normalization_stats(
+                [data_cfg["train_zarr"]],
+                mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
+                chunk_size=int(train_cfg.get("normalization_chunk_size", 512)),
+                max_samples=train_cfg.get("normalization_max_samples"),
+            )
+        save_calvin_normalization_stats(stats, stats_path)
+
+    _barrier_if_distributed(distributed)
+    if not stats_path.exists():
+        raise FileNotFoundError(
+            f"Normalization stats were not created by the main process: {stats_path}"
+        )
+    return load_calvin_normalization_stats(stats_path)
+
+
+def _load_or_compute_query_xyz_stats(
+    stats_path: Path,
+    train_dataset: MotionExpertZarrDataset,
+    data_cfg: dict,
+    *,
+    is_main_process: bool,
+    distributed: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if stats_path.exists():
+        stats = torch.load(stats_path, map_location="cpu")
+        return stats["center"], stats["scale"]
+
+    if is_main_process:
+        if "query_world_xyz" in train_dataset.annos:
+            query_center, query_scale = compute_query_xyz_statistics(
+                [data_cfg["train_zarr"]],
+                mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
+            )
+        else:
+            query_center, query_scale = compute_query_xyz_statistics_from_dataset(
+                train_dataset
+            )
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"center": query_center, "scale": query_scale}, stats_path)
+
+    _barrier_if_distributed(distributed)
+    if not stats_path.exists():
+        raise FileNotFoundError(
+            f"Query XYZ stats were not created by the main process: {stats_path}"
+        )
+    stats = torch.load(stats_path, map_location="cpu")
+    return stats["center"], stats["scale"]
+
+
 def _build_spaghetti_viz_kwargs(
     train_cfg: dict,
     *,
@@ -457,23 +527,13 @@ def main():
                 default_stats_path,
             )
         )
-        num_bins = int(train_cfg.get("normalization_num_bins", 131072))
-        if stats_path.exists():
-            stats = load_calvin_normalization_stats(stats_path)
-        else:
-            source_root_cfg = train_cfg.get("normalization_source_root")
-            if source_root_cfg is not None:
-                stats = compute_calvin_normalization_stats(
-                    source_root=Path(source_root_cfg),
-                    num_bins=num_bins,
-                )
-            else:
-                stats = compute_calvin_zarr_normalization_stats(
-                    [data_cfg["train_zarr"]],
-                    mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
-                    chunk_size=int(train_cfg.get("normalization_chunk_size", 512)),
-                )
-            save_calvin_normalization_stats(stats, stats_path)
+        stats = _load_or_compute_motion_normalization_stats(
+            stats_path,
+            train_cfg,
+            data_cfg,
+            is_main_process=is_main_process,
+            distributed=distributed,
+        )
         query_center, query_scale, traj_center, traj_scale = extract_calvin_normalization_tensors(stats)
         pipeline.set_calvin_normalization_statistics(
             torch.from_numpy(query_center),
@@ -488,22 +548,13 @@ def main():
                 Path(train_cfg["output_dir"]) / "query_xyz_stats.pt",
             )
         )
-        if stats_path.exists():
-            stats = torch.load(stats_path, map_location="cpu")
-            query_center = stats["center"]
-            query_scale = stats["scale"]
-        else:
-            if "query_world_xyz" in train_dataset.annos:
-                query_center, query_scale = compute_query_xyz_statistics(
-                    [data_cfg["train_zarr"]],
-                    mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
-                )
-            else:
-                query_center, query_scale = compute_query_xyz_statistics_from_dataset(
-                    train_dataset
-                )
-            stats_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"center": query_center, "scale": query_scale}, stats_path)
+        query_center, query_scale = _load_or_compute_query_xyz_stats(
+            stats_path,
+            train_dataset,
+            data_cfg,
+            is_main_process=is_main_process,
+            distributed=distributed,
+        )
         pipeline.set_query_xyz_statistics(query_center, query_scale)
 
     trainer = MotionExpertTrainer(
@@ -551,7 +602,10 @@ def main():
         if is_main_process and val_loader is None:
             raise ValueError("Validation-only mode requires `data.val_zarr`.")
         if is_main_process:
-            val_loss = trainer.evaluate_loss()
+            val_loss_batches = int(train_cfg.get("val_loss_batches", 0))
+            val_loss = trainer.evaluate_loss(
+                max_batches=val_loss_batches if val_loss_batches >= 0 else None,
+            )
             val_viz_kwargs = _build_spaghetti_viz_kwargs(
                 train_cfg,
                 output_dir=train_cfg["output_dir"],

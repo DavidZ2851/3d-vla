@@ -1,0 +1,144 @@
+{
+  "task": "lift the pink block from the sliding cabinet",
+  "subtask": "lift_pink_block_slider",
+  "checkpoint_motion": "/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/3dfavla_motion/last.pth",
+  "checkpoint_baseline": "/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/3dfavla/last.pth",
+  "steps": [
+    {
+      "step": 0,
+      "motion": {
+        "mean": 0.09930405020713806,
+        "max": 0.14038681983947754,
+        "p95": 0.13101950585842131,
+        "top5pct_mass_frac": 0.06754720133692252
+      },
+      "baseline": {
+        "mean": 0.11170507967472076,
+        "max": 0.18453475832939148,
+        "p95": 0.17897771820425987,
+        "top5pct_mass_frac": 0.08072261113070033
+      },
+      "shape_cosine_motion_baseline": 0.8554997205937839,
+      "top10pct_overlap_motion_baseline": 0.02564102564102564
+    },
+    {
+      "step": 1,
+      "motion": {
+        "mean": 0.1019982397556305,
+        "max": 0.14026081562042236,
+        "p95": 0.12402364090085029,
+        "top5pct_mass_frac": 0.06327289403233131
+      },
+      "baseline": {
+        "mean": 0.11927343159914017,
+        "max": 0.18854497373104095,
+        "p95": 0.17675001993775366,
+        "top5pct_mass_frac": 0.07581988947013256
+      },
+      "shape_cosine_motion_baseline": 0.8708724954950258,
+      "top10pct_overlap_motion_baseline": 0.10256410256410256
+    },
+    {
+      "step": 2,
+      "motion": {
+        "mean": 0.07911232858896255,
+        "max": 0.12101487815380096,
+        "p95": 0.1066645100712776,
+        "top5pct_mass_frac": 0.07005909593884635
+      },
+      "baseline": {
+        "mean": 0.10408331453800201,
+        "max": 0.17228364944458008,
+        "p95": 0.1496633008122444,
+        "top5pct_mass_frac": 0.07613926827062771
+      },
+      "shape_cosine_motion_baseline": 0.6604273161267528,
+      "top10pct_overlap_motion_baseline": 0.0
+    },
+    {
+      "step": 3,
+      "motion": {
+        "mean": 0.05662579461932182,
+        "max": 0.09779343008995056,
+        "p95": 0.08110023476183413,
+        "top5pct_mass_frac": 0.0743369828659073
+      },
+      "baseline": {
+        "mean": 0.06576325744390488,
+        "max": 0.11445460468530655,
+        "p95": 0.09716779366135597,
+        "top5pct_mass_frac": 0.08058509294720365
+      },
+      "shape_cosine_motion_baseline": 0.828528149207892,
+      "top10pct_overlap_motion_baseline": 0.0
+    },
+    {
+      "step": 4,
+      "motion": {
+        "mean": 0.054382339119911194,
+        "max": 0.09498433768749237,
+        "p95": 0.08221099637448787,
+        "top5pct_mass_frac": 0.07756452770898166
+      },
+      "baseline": {
+        "mean": 0.056009504944086075,
+        "max": 0.09850038588047028,
+        "p95": 0.08763541728258133,
+        "top5pct_mass_frac": 0.08204427949737365
+      },
+      "shape_cosine_motion_baseline": 0.9207578892568338,
+      "top10pct_overlap_motion_baseline": 0.08974358974358974
+    },
+    {
+      "step": 5,
+      "motion": {
+        "mean": 0.07730504125356674,
+        "max": 0.13328658044338226,
+        "p95": 0.11089224368333815,
+        "top5pct_mass_frac": 0.07725639626260909
+      },
+      "baseline": {
+        "mean": 0.07465841621160507,
+        "max": 0.1400187909603119,
+        "p95": 0.10994523502886296,
+        "top5pct_mass_frac": 0.07682569395809336
+      },
+      "shape_cosine_motion_baseline": 0.8283225098541378,
+      "top10pct_overlap_motion_baseline": 0.1794871794871795
+    },
+    {
+      "step": 6,
+      "motion": {
+        "mean": 0.07471694052219391,
+        "max": 0.13003109395503998,
+        "p95": 0.10720328539609905,
+        "top5pct_mass_frac": 0.07570909099917694
+      },
+      "baseline": {
+        "mean": 0.07412262260913849,
+        "max": 0.1394065022468567,
+        "p95": 0.11480253115296363,
+        "top5pct_mass_frac": 0.08217676469274525
+      },
+      "shape_cosine_motion_baseline": 0.7503862009864801,
+      "top10pct_overlap_motion_baseline": 0.19230769230769232
+    },
+    {
+      "step": 7,
+      "motion": {
+        "mean": 0.03626926988363266,
+        "max": 0.058775290846824646,
+        "p95": 0.051479298248887057,
+        "top5pct_mass_frac": 0.07540182954550455
+      },
+      "baseline": {
+        "mean": 0.06968335807323456,
+        "max": 0.12974147498607635,
+        "p95": 0.11389939114451406,
+        "top5pct_mass_frac": 0.0858096415930033
+      },
+      "shape_cosine_motion_baseline": 0.8903887396202453,
+      "top10pct_overlap_motion_baseline": 0.4230769230769231
+    }
+  ]
+}

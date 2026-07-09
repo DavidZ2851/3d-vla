@@ -78,14 +78,11 @@ def gather_neighbors(x: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tenso
     batch_size, num_points = x.shape[:2]
     trailing_shape = x.shape[2:]
     k = neighbor_idx.shape[-1]
-    x_flat = x.reshape(batch_size, num_points, -1)
-    gather_idx = neighbor_idx.unsqueeze(-1).expand(-1, -1, -1, x_flat.shape[-1])
-    gathered = torch.gather(
-        x_flat[:, None, :, :].expand(-1, num_points, -1, -1),
-        dim=2,
-        index=gather_idx,
-    )
-    return gathered.reshape(batch_size, num_points, k, *trailing_shape)
+    # Flat indexing avoids O(N^2) tensor expansion; same result, much less memory.
+    offsets = torch.arange(batch_size, device=x.device).view(-1, 1, 1) * num_points
+    flat_idx = (neighbor_idx + offsets).reshape(-1)
+    x_flat = x.reshape(batch_size * num_points, *trailing_shape)
+    return x_flat[flat_idx].reshape(batch_size, num_points, k, *trailing_shape)
 
 
 def _normalize_xyz_for_serialization(xyz: torch.Tensor) -> torch.Tensor:
@@ -632,8 +629,6 @@ class MotionExpertModel(nn.Module):
         max_conditioning_tokens: Optional[int] = None,
     ):
         super().__init__()
-        if config.future_steps != 15:
-            raise ValueError("Sparse MotionExpert is locked to future_steps=15.")
         if str(config.decoder_type).lower() != "sparse_factorized":
             raise ValueError("Sparse MotionExpert only supports decoder_type='sparse_factorized'.")
 
@@ -1035,6 +1030,49 @@ class MotionExpertModel(nn.Module):
             "neighbor_idx": neighbor_idx,
         }
 
+    def extract_encoder_latent(
+        self,
+        query_uv: torch.Tensor,
+        query_world_xyz: torch.Tensor,
+        visual_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor] = None,
+        visual_grid: Optional[torch.Tensor] = None,
+        query_depth: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Encoder-only latent: the SparsePointEncoder output (``point_context``).
+
+        Unlike the ``extract_*_latent`` / ``extract_*_denoise`` methods -- which all
+        run the flow *decoder* and read its per-future-step hidden -- this performs a
+        single forward through only the input tokenizer + ``point_encoder`` and never
+        touches ``flow_decoder``. There is therefore no diffusion noise, no ODE
+        integration, and no future-step axis.
+
+        Returns:
+          - ``motion_encoder_latent`` (B, P, hidden_dim): one latent per query point,
+          - ``motion_pos``           (B, P, 3): world xyz of the query points.
+        """
+        motion_pos = torch.nan_to_num(
+            query_world_xyz.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        query_world_xyz = center_query_world_xyz(query_world_xyz)
+        point_context, _neighbor_idx, _cond_tokens, _cond_key_padding_mask = self.build_point_context(
+            query_uv=query_uv,
+            query_world_xyz=query_world_xyz,
+            visual_tokens=visual_tokens,
+            text_tokens=text_tokens,
+            text_attention_mask=text_attention_mask,
+            visual_grid=visual_grid,
+            query_depth=query_depth,
+        )
+        return {
+            "motion_encoder_latent": point_context,
+            "motion_pos": motion_pos,
+        }
+
     def extract_one_ode_step_latent(
         self,
         query_uv: torch.Tensor,
@@ -1088,6 +1126,179 @@ class MotionExpertModel(nn.Module):
         _, motion_hidden = self.flow_decoder(
             x_tau=x,
             tau=tau,
+            point_context=point_context,
+            xyz=query_world_xyz,
+            neighbor_idx=neighbor_idx,
+            cond_tokens=cond_tokens,
+            cond_key_padding_mask=cond_key_padding_mask,
+            return_hidden=True,
+        )
+        return {
+            "motion_hidden": motion_hidden,
+            "motion_pos": motion_pos,
+        }
+
+    def extract_one_step_denoise(
+        self,
+        query_uv: torch.Tensor,
+        query_world_xyz: torch.Tensor,
+        visual_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor] = None,
+        visual_grid: Optional[torch.Tensor] = None,
+        query_depth: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+        return_clean_latent: bool = True,
+        return_clean_trajectory: bool = True,
+    ) -> dict:
+        """Single Euler step from noise (tau=0) to the clean trajectory (tau=1).
+
+        Unlike ``extract_one_ode_step_latent`` -- which reads the decoder hidden at
+        the *noise* point and never integrates -- this performs one flow step
+        ``x_clean = x_noise + v(x_noise, tau=0) * dt`` with ``dt = 1`` to obtain the
+        predicted clean trajectory, then optionally re-evaluates the decoder *at that
+        clean trajectory* (tau=1) to read the latent that corresponds to it.
+
+        Returns a dict that may contain:
+          - ``future_delta``       (B, P, future_steps, 3) world-frame unnormalized
+                                   future displacements (the explicit trajectory),
+          - ``future_delta_norm``  (B, P, future_steps, 3) normalized clean sample,
+          - ``motion_hidden``      (B, P, future_steps, dim) decoder hidden at the
+                                   clean trajectory (tau=1),
+          - ``motion_pos``         (B, P, 3) world xyz of the query points.
+        """
+        motion_pos = torch.nan_to_num(
+            query_world_xyz.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        query_world_xyz = center_query_world_xyz(query_world_xyz)
+        point_context, neighbor_idx, cond_tokens, cond_key_padding_mask = self.build_point_context(
+            query_uv=query_uv,
+            query_world_xyz=query_world_xyz,
+            visual_tokens=visual_tokens,
+            text_tokens=text_tokens,
+            text_attention_mask=text_attention_mask,
+            visual_grid=visual_grid,
+            query_depth=query_depth,
+        )
+        batch_size, num_points, _ = query_world_xyz.shape
+        x_noise = torch.randn(
+            batch_size,
+            num_points,
+            self.config.future_steps,
+            3,
+            device=query_world_xyz.device,
+            dtype=point_context.dtype,
+            generator=generator,
+        )
+        tau0 = torch.zeros(batch_size, device=query_world_xyz.device, dtype=x_noise.dtype)
+        velocity = self.flow_decoder(
+            x_tau=x_noise,
+            tau=tau0,
+            point_context=point_context,
+            xyz=query_world_xyz,
+            neighbor_idx=neighbor_idx,
+            cond_tokens=cond_tokens,
+            cond_key_padding_mask=cond_key_padding_mask,
+        )
+        # Single Euler step (dt = 1) noise -> clean.
+        x_clean = x_noise + velocity
+        x_clean = torch.clamp(x_clean, -NORMALIZED_CLAMP_ABS, NORMALIZED_CLAMP_ABS)
+
+        out = {"motion_pos": motion_pos, "future_delta_norm": x_clean}
+        if return_clean_trajectory:
+            out["future_delta"] = self.unnormalize_future_delta(x_clean)
+        if return_clean_latent:
+            tau1 = torch.ones(batch_size, device=query_world_xyz.device, dtype=x_clean.dtype)
+            _, motion_hidden = self.flow_decoder(
+                x_tau=x_clean,
+                tau=tau1,
+                point_context=point_context,
+                xyz=query_world_xyz,
+                neighbor_idx=neighbor_idx,
+                cond_tokens=cond_tokens,
+                cond_key_padding_mask=cond_key_padding_mask,
+                return_hidden=True,
+            )
+            out["motion_hidden"] = motion_hidden
+        return out
+
+    def extract_partial_denoise_latent(
+        self,
+        query_uv: torch.Tensor,
+        query_world_xyz: torch.Tensor,
+        visual_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor] = None,
+        visual_grid: Optional[torch.Tensor] = None,
+        query_depth: Optional[torch.Tensor] = None,
+        solver_steps: int = 10,
+        steps_to_run: int = 1,
+        generator: Optional[torch.Generator] = None,
+    ) -> dict:
+        """Run ``steps_to_run`` Euler steps of a ``solver_steps``-step noise->clean
+        schedule, then read the decoder hidden at the *partially-denoised*
+        trajectory (tau = steps_to_run / solver_steps).
+
+        This interpolates between the two existing extractions:
+          - ``steps_to_run == 0``           == read hidden at the pure noise point
+                                               (``extract_one_ode_step_latent``),
+          - ``solver_steps == steps_to_run == 1`` == one full step to clean
+                                               (``extract_one_step_denoise``).
+        The ablation of interest is ``solver_steps=10, steps_to_run=1`` (one step
+        out of ten, dt=0.1). Noise is random (``generator`` unset) to match the
+        baseline motion latent -- only the read point changes.
+        """
+        motion_pos = torch.nan_to_num(
+            query_world_xyz.float(), nan=0.0, posinf=0.0, neginf=0.0,
+        )
+        query_world_xyz = center_query_world_xyz(query_world_xyz)
+        point_context, neighbor_idx, cond_tokens, cond_key_padding_mask = self.build_point_context(
+            query_uv=query_uv,
+            query_world_xyz=query_world_xyz,
+            visual_tokens=visual_tokens,
+            text_tokens=text_tokens,
+            text_attention_mask=text_attention_mask,
+            visual_grid=visual_grid,
+            query_depth=query_depth,
+        )
+        batch_size, num_points, _ = query_world_xyz.shape
+        x = torch.randn(
+            batch_size,
+            num_points,
+            self.config.future_steps,
+            3,
+            device=query_world_xyz.device,
+            dtype=point_context.dtype,
+            generator=generator,
+        )
+        solver_steps = max(1, int(solver_steps))
+        steps_to_run = max(0, min(int(steps_to_run), solver_steps))
+        dt = 1.0 / float(solver_steps)
+        for step_idx in range(steps_to_run):
+            tau = torch.full(
+                (batch_size,), step_idx * dt,
+                device=query_world_xyz.device, dtype=x.dtype,
+            )
+            velocity = self.flow_decoder(
+                x_tau=x,
+                tau=tau,
+                point_context=point_context,
+                xyz=query_world_xyz,
+                neighbor_idx=neighbor_idx,
+                cond_tokens=cond_tokens,
+                cond_key_padding_mask=cond_key_padding_mask,
+            )
+            x = x + velocity * dt
+        tau_read = torch.full(
+            (batch_size,), steps_to_run * dt,
+            device=query_world_xyz.device, dtype=x.dtype,
+        )
+        _, motion_hidden = self.flow_decoder(
+            x_tau=x,
+            tau=tau_read,
             point_context=point_context,
             xyz=query_world_xyz,
             neighbor_idx=neighbor_idx,

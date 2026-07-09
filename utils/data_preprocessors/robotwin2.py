@@ -32,6 +32,20 @@ class RoboTwinDataPreprocessor(DataPreprocessor):
         # the first proprio is the current state
         proprio = proprio[:, -1*max(self.num_history, 1):]
         return proprio
+
+    def process_joint_proprio(self, joint_proprio):
+        """Joint proprio shape: (B, history, nhand=2, n_joint+1).
+
+        RoboTwin2 stores joint proprio with history offsets [-16, 0], so the
+        CURRENT state is the LAST index (matching ``process_proprio``). The base
+        class takes the first ``num_history`` frames, which would pick the oldest
+        (t-16) frame -- wrong for RoboTwin2 -- so override to take the most recent.
+        """
+        joint_proprio = joint_proprio.cuda(non_blocking=True).float()
+        nhist_ = joint_proprio.size(1)
+        assert nhist_ >= self.num_history, "not enough joint proprio timesteps"
+        joint_proprio = joint_proprio[:, -1 * max(self.num_history, 1):]
+        return joint_proprio
     
     def process_obs(self, rgb_front, rgb_left, rgb_right,
                     depth_front, depth_left, depth_right, 
@@ -41,14 +55,42 @@ class RoboTwinDataPreprocessor(DataPreprocessor):
         RGBs of shape (B, ncam=1, 3, h_i, w_i),
         depths of shape (B, ncam=1, h_i, w_i).
         """
-        # Get point cloud from depth
+        front_hw = (rgb_front.size(-2), rgb_front.size(-1))
+
+        rgb_front = rgb_front.cuda(non_blocking=True)
+        rgb_left = rgb_left.cuda(non_blocking=True)
+        rgb_right = rgb_right.cuda(non_blocking=True)
+        depth_front = depth_front.cuda(non_blocking=True).float()
+        depth_left = depth_left.cuda(non_blocking=True).float()
+        depth_right = depth_right.cuda(non_blocking=True).float()
+        extrinsics_front = extrinsics_front.cuda(non_blocking=True).float()
+        extrinsics_left = extrinsics_left.cuda(non_blocking=True).float()
+        extrinsics_right = extrinsics_right.cuda(non_blocking=True).float()
+
+        # Merged RoboTwin2 stores wrist RGB/depth at 80x80. Restore them to the
+        # front-camera grid before deprojection so fixed 224 intrinsics produce
+        # a pcd aligned with the resized wrist RGB/depth tensors.
+        if tuple(rgb_left.shape[-2:]) != front_hw:
+            rgb_left = F.interpolate(
+                rgb_left[:, 0].float(), front_hw, mode='bilinear', antialias=False
+            )[:, None]
+        if tuple(rgb_right.shape[-2:]) != front_hw:
+            rgb_right = F.interpolate(
+                rgb_right[:, 0].float(), front_hw, mode='bilinear', antialias=False
+            )[:, None]
+        if tuple(depth_left.shape[-2:]) != front_hw:
+            depth_left = F.interpolate(depth_left, front_hw, mode='nearest')
+        if tuple(depth_right.shape[-2:]) != front_hw:
+            depth_right = F.interpolate(depth_right, front_hw, mode='nearest')
+
+        # Get point cloud from depth after any wrist restoration.
         pcd_front, pcd_left, pcd_right = self.depth2cloud(
-            depth_front.cuda(non_blocking=True).float()[:, 0],  # one camera
-            depth_left.cuda(non_blocking=True).float()[:, 0],
-            depth_right.cuda(non_blocking=True).float()[:, 0],
-            extrinsics_front.cuda(non_blocking=True).float(), 
-            extrinsics_left.cuda(non_blocking=True).float(),
-            extrinsics_right.cuda(non_blocking=True).float()
+            depth_front[:, 0],  # one camera
+            depth_left[:, 0],
+            depth_right[:, 0],
+            extrinsics_front,
+            extrinsics_left,
+            extrinsics_right,
         )
         pcd_front = pcd_front[:, None]
         pcd_left = pcd_left[:, None]
@@ -59,7 +101,7 @@ class RoboTwinDataPreprocessor(DataPreprocessor):
             b, nc, _, h, w = rgb_front.shape
             # Augment in half precision
             obs = torch.cat((
-                rgb_front.cuda(non_blocking=True).half() / 255,
+                rgb_front.half() / 255,
                 pcd_front.half()
             ), 2)  # (B, ncam, 6, H, W)
             obs = obs.reshape(-1, 6, h, w)
@@ -69,7 +111,7 @@ class RoboTwinDataPreprocessor(DataPreprocessor):
             pcd_front = obs[:, 3:].reshape(b, nc, 3, h, w).float()
         else:
             # Simply convert to full precision
-            rgb_front = rgb_front.cuda(non_blocking=True).float() / 255
+            rgb_front = rgb_front.float() / 255
         if self.custom_imsize is not None and self.custom_imsize != rgb_front.size(-1):
             rgb_front = F.interpolate(
                 rgb_front[:, 0], (self.custom_imsize, self.custom_imsize),
@@ -80,28 +122,33 @@ class RoboTwinDataPreprocessor(DataPreprocessor):
                 mode='nearest'
             )[:, None]
 
-        # Handle wrist cameras at native 80x80 pcd first, then resize for encoder batching.
+        # Handle wrist cameras. At this point RGB/depth/pcd are already on the
+        # front-camera grid; only custom_imsize may require another resize.
         target_hw = (rgb_front.size(-2), rgb_front.size(-1))
-        rgb_left = rgb_left.cuda(non_blocking=True).float() / 255
-        rgb_left = F.interpolate(
-            rgb_left[:, 0], target_hw,
-            mode='bilinear', antialias=True
-        )[:, None]
+        rgb_left = rgb_left.float() / 255
+        if tuple(rgb_left.shape[-2:]) != target_hw:
+            rgb_left = F.interpolate(
+                rgb_left[:, 0], target_hw,
+                mode='bilinear', antialias=True
+            )[:, None]
         pcd_left = pcd_left.float()
-        pcd_left = F.interpolate(
-            pcd_left[:, 0], target_hw,
-            mode='nearest'
-        )[:, None]
-        rgb_right = rgb_right.cuda(non_blocking=True).float() / 255
-        rgb_right = F.interpolate(
-            rgb_right[:, 0], target_hw,
-            mode='bilinear', antialias=True
-        )[:, None]
+        if tuple(pcd_left.shape[-2:]) != target_hw:
+            pcd_left = F.interpolate(
+                pcd_left[:, 0], target_hw,
+                mode='nearest'
+            )[:, None]
+        rgb_right = rgb_right.float() / 255
+        if tuple(rgb_right.shape[-2:]) != target_hw:
+            rgb_right = F.interpolate(
+                rgb_right[:, 0], target_hw,
+                mode='bilinear', antialias=True
+            )[:, None]
         pcd_right = pcd_right.float()
-        pcd_right = F.interpolate(
-            pcd_right[:, 0], target_hw,
-            mode='nearest'
-        )[:, None]
+        if tuple(pcd_right.shape[-2:]) != target_hw:
+            pcd_right = F.interpolate(
+                pcd_right[:, 0], target_hw,
+                mode='nearest'
+            )[:, None]
 
         # Concatenate
         rgbs = torch.cat((rgb_front, rgb_left, rgb_right), 1)

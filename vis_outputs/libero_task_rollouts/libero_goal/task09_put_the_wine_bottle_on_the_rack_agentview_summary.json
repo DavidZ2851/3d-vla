@@ -1,0 +1,65 @@
+{
+  "benchmark": "libero_goal",
+  "task_order_index": 0,
+  "task_id": 9,
+  "task_name": "put_the_wine_bottle_on_the_rack",
+  "instruction": "put the wine bottle on the rack",
+  "init_state_index": 0,
+  "success": true,
+  "num_steps": 126,
+  "camera": "agentview",
+  "image_vertically_flipped": true,
+  "num_rgb_frames": 127,
+  "num_depth_frames": 127,
+  "fps": 20,
+  "img_h": 224,
+  "img_w": 224,
+  "rgb_video": "vis_outputs/libero_task_rollouts/libero_goal/task09_put_the_wine_bottle_on_the_rack_agentview_rgb.mp4",
+  "depth_video": "vis_outputs/libero_task_rollouts/libero_goal/task09_put_the_wine_bottle_on_the_rack_agentview_depth.mp4",
+  "raw_depth_npz": "vis_outputs/libero_task_rollouts/libero_goal/task09_put_the_wine_bottle_on_the_rack_agentview_depth_raw.npz",
+  "agentview_intrinsics": [
+    [
+      270.39190673828125,
+      0.0,
+      112.0
+    ],
+    [
+      0.0,
+      270.39190673828125,
+      112.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "agentview_extrinsics_c2w": [
+    [
+      -7.26818427665421e-08,
+      0.628266453742981,
+      -0.7779982686042786,
+      0.6586131453514099
+    ],
+    [
+      1.0,
+      -7.26818427665421e-08,
+      -1.5211526260827668e-07,
+      0.0
+    ],
+    [
+      -1.5211526260827668e-07,
+      -0.7779982686042786,
+      -0.628266453742981,
+      1.6103500127792358
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "depth_min": 0.7066376805305481,
+  "depth_max": 3.040117025375366
+}

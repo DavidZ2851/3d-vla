@@ -33,6 +33,43 @@ def _strip_module_prefix(state_dict):
     return model_weights
 
 
+# Backward-compat for CALVIN checkpoints saved before the "libero 3dfavla" change.
+# Newer code wraps these motion-expert submodules in torch.compile, which adds a
+# "_orig_mod." prefix to their state_dict keys; older CALVIN checkpoints lack it.
+_COMPILE_WRAPPED_ROOTS = (
+    "motion_expert.point_encoder.",
+    "motion_expert.flow_decoder.",
+)
+
+# Params/buffers added after some CALVIN checkpoints were saved that are NOT read at
+# inference under the default config (openness_normalizer is only used when
+# _continuous_openness=True). A missing entry is therefore safe -> keep default init.
+_BACKCOMPAT_OPTIONAL_KEYS = {"openness_normalizer"}
+
+
+def _reconcile_compile_prefix(state_dict, model_keys):
+    """Map checkpoint keys onto the live model's keys, inserting or removing the
+    torch.compile "_orig_mod." prefix on wrapped submodules as needed. No-op when
+    the checkpoint keys already match the model."""
+    reconciled = {}
+    for key, value in state_dict.items():
+        new_key = key
+        if key not in model_keys:
+            for root in _COMPILE_WRAPPED_ROOTS:
+                if key.startswith(root) and "_orig_mod." not in key:
+                    candidate = root + "_orig_mod." + key[len(root):]
+                    if candidate in model_keys:
+                        new_key = candidate
+                        break
+            else:
+                if "._orig_mod." in key:
+                    candidate = key.replace("._orig_mod.", ".")
+                    if candidate in model_keys:
+                        new_key = candidate
+        reconciled[new_key] = value
+    return reconciled
+
+
 def _get_checkpoint_lora_summary(state_dict):
     lora_keys = [
         key for key in state_dict
@@ -146,6 +183,17 @@ class Model:
         self.args = args
         # Default for evaluate_policy.rollout (absolute TCP after any _to_abs in step())
         self.calvin_action_exec = "cartesian_abs"
+        # The joint-angle decoder emits absolute joint targets executed in
+        # POSITION_CONTROL (no IK); see evaluate_policy.rollout's joint_abs branch.
+        self._is_joint_model = args.model_type in (
+            "flower_actor_3d_motion_latent_joint",
+            "flower_actor_2d_joint",  # 2D visual-language joint-action baseline
+        )
+        if self._is_joint_model:
+            self.calvin_action_exec = "joint_abs"
+        # Anchor (current arm-joint angles, radians) for reconstructing absolute
+        # joint targets from the model's anchor-relative deltas. Set in preprocess.
+        self._joint_anchor = None
         self.policy = self.get_policy()
         self.preprocessor = fetch_data_preprocessor('calvin')(
             keypose_only=False,
@@ -206,6 +254,16 @@ class Model:
         for key, value in motion_latent_kwargs.items():
             if key in model_init_params:
                 model_kwargs[key] = value
+        joint_kwargs = {
+            "joint_action_dim": getattr(self.args, "joint_action_dim", 7),
+            "joint_proprio_dim": getattr(self.args, "joint_proprio_dim", 8),
+            "joint_num_layers": getattr(self.args, "joint_num_layers", 4),
+            "joint_embedding_dim": getattr(self.args, "joint_embedding_dim", 0) or None,
+            "joint_num_attn_heads": getattr(self.args, "joint_num_attn_heads", 0) or None,
+        }
+        for key, value in joint_kwargs.items():
+            if key in model_init_params:
+                model_kwargs[key] = value
         return model_class(**model_kwargs)
 
     def reset(self):
@@ -216,10 +274,25 @@ class Model:
 
     def load_pretrained_weights(self):
         ckpt = torch.load(self.args.checkpoint, map_location="cpu")
-        state_dict = _extract_state_dict(ckpt)
-        model_weights = _strip_module_prefix(state_dict)
+        model_weights = _strip_module_prefix(_extract_state_dict(ckpt))
+        model_keys = set(self.policy.state_dict().keys())
+        model_weights = _reconcile_compile_prefix(model_weights, model_keys)
         print(f'Loading weights from {self.args.checkpoint}')
-        self.policy.load_state_dict(model_weights, strict=True)
+        missing, unexpected = self.policy.load_state_dict(model_weights, strict=False)
+        # Anything missing beyond the known-safe optional keys, or any unexpected
+        # key, is a real mismatch and must still fail loudly (preserves strictness).
+        real_missing = [k for k in missing if k not in _BACKCOMPAT_OPTIONAL_KEYS]
+        if real_missing or unexpected:
+            raise RuntimeError(
+                "Checkpoint/model mismatch after key reconciliation for "
+                f"{self.args.checkpoint}:\n"
+                f"  missing: {real_missing}\n"
+                f"  unexpected: {list(unexpected)}"
+            )
+        tolerated = sorted(k for k in missing if k in _BACKCOMPAT_OPTIONAL_KEYS)
+        if tolerated:
+            print(f"[calvin load] keeping default init for absent keys "
+                  f"(unused under this config): {tolerated}")
 
     def _build_eval_grounding_kwargs(self, batch_size, device):
         """Mirror training-time dropped-grounding behavior at online eval."""
@@ -249,6 +322,20 @@ class Model:
         # fake_proprio[..., -1] = 0.5
         # proprio = torch.cat([real_proprio, fake_proprio], 2)  # (B=1, nhist=1, nhand=2, 7)
         
+        # Joint-space proprio for the joint-angle decoder: 7 arm joints (radians,
+        # robot_obs[7:14]) + binary gripper, mirroring proprioception_joint in the
+        # zarr pipeline. Also cache the current arm joints as the anchor used to
+        # turn anchor-relative joint deltas back into absolute targets.
+        joint_proprio = None
+        if self._is_joint_model:
+            self._joint_anchor = obs['robot_obs'][7:14].astype(np.float64).copy()
+            joint_proprio = self.preprocessor.process_joint_proprio(
+                torch.from_numpy(np.concatenate([
+                    obs['robot_obs'][7:14],
+                    (obs['robot_obs'][[-1]] + 1) / 2
+                ], -1))[None, None, None].float()
+            )  # (B=1, nhist=1, nhand=1, 8)
+
         # rgbs, pcds are (B=1, ncam=2, 3, H, W)
         rgbs, pcds = self.preprocessor.process_obs(
             torch.from_numpy(obs["rgb_obs"]["rgb_static"].transpose(2, 0, 1)[None, None]),
@@ -258,7 +345,10 @@ class Model:
             torch.from_numpy(np.linalg.inv(np.array(env.cameras[1].view_matrix).reshape((4, 4)).T)[None]),
             augment=False
         )
-        return {'rgb': rgbs, 'pcd': pcds, 'proprio': proprio}
+        out = {'rgb': rgbs, 'pcd': pcds, 'proprio': proprio}
+        if joint_proprio is not None:
+            out['joint_proprio'] = joint_proprio
+        return out
 
     @torch.no_grad()
     def step(self, obs, instruction):
@@ -275,6 +365,9 @@ class Model:
             action: predicted action
         """
         device = self.args.device
+
+        if self._is_joint_model:
+            return self._step_joint(obs, instruction)
 
         # Process inputs
         trajectory_mask = torch.full((1, self.args.pred_len, 1), False, device=device)  
@@ -326,6 +419,63 @@ class Model:
         assert proprio.shape[-1] == 7 and len(proprio.shape) == 3
         abs_pos_orn = proprio[..., :6] + np.cumsum(action[..., :6], -2)
         return np.concatenate([abs_pos_orn, action[..., 6:]], -1)
+
+    # Panda arm joint limits (calvin_env/conf/robot/panda.yaml). Predicted
+    # absolute targets are clamped to these before being sent to the env.
+    _PANDA_JOINT_LOWER = np.array(
+        [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
+    )
+    _PANDA_JOINT_UPPER = np.array(
+        [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
+    )
+
+    @torch.no_grad()
+    def _step_joint(self, obs, instruction):
+        """Joint-angle decoder rollout step.
+
+        Returns (1, T, 8): 7 absolute arm-joint targets (radians) + gripper in
+        {-1, 1}. The model predicts anchor-relative joint deltas (same single
+        chunk-start anchor for the whole horizon, NOT incremental), so absolute
+        targets are anchor + delta (no cumsum), then clamped to the Panda limits.
+        """
+        device = self.args.device
+        pred_len = self.args.pred_len
+        trajectory_mask = torch.full((1, pred_len, 1), False, device=device)
+
+        instr_mask = None
+        if not self.args.pre_tokenize:
+            instr = [instruction]
+        else:
+            tok_out = self.tokenizer([instruction])
+            if isinstance(tok_out, torch.Tensor):
+                instr = tok_out.cuda(non_blocking=True)
+            else:
+                instr = tok_out.input_ids.cuda(non_blocking=True)
+                instr_mask = tok_out.attention_mask.cuda(non_blocking=True)
+
+        joints = self.policy(
+            None,
+            trajectory_mask,
+            obs['rgb'],
+            None,
+            obs['pcd'],
+            instr,
+            obs['proprio'],  # EEF proprio for the detached EEF chain-of-thought
+            run_inference=True,
+            instr_mask=instr_mask,
+            joint_proprio=obs['joint_proprio'],
+        ).view(1, pred_len, 1, 8)
+        joints = joints.data.float().cpu().numpy()[:, :, 0, :]  # (1, T, 8)
+
+        arm_delta = joints[..., :7]
+        gripper = joints[..., 7:]  # sigmoid probability in [0, 1]
+        # Anchor-relative -> absolute joint targets (single anchor, no cumsum).
+        abs_arm = self._joint_anchor[None, None, :] + arm_delta
+        abs_arm = np.clip(
+            abs_arm, self._PANDA_JOINT_LOWER, self._PANDA_JOINT_UPPER
+        )
+        gripper = 2 * (gripper >= 0.5).astype(int) - 1  # {-1, 1}
+        return np.concatenate([abs_arm, gripper], -1)  # (1, T, 8)
 
 
 def create_model(args):

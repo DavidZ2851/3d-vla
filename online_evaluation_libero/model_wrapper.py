@@ -68,6 +68,18 @@ class Model:
         for key, value in qwen_kwargs.items():
             if key in model_init_params:
                 model_kwargs[key] = value
+        motion_latent_kwargs = {
+            "motion_expert_config": getattr(self.args, "motion_expert_config", None),
+            "motion_expert_checkpoint": getattr(self.args, "motion_expert_checkpoint", None),
+            "motion_solver_steps": getattr(self.args, "motion_solver_steps", 10),
+            "motion_steps_to_run": getattr(self.args, "motion_steps_to_run", 1),
+            "motion_finetune": getattr(self.args, "motion_finetune", False),
+            "motion_scene_fusion": getattr(self.args, "motion_scene_fusion", True),
+            "motion_action_fusion": getattr(self.args, "motion_action_fusion", False),
+        }
+        for key, value in motion_latent_kwargs.items():
+            if key in model_init_params:
+                model_kwargs[key] = value
         return model_class(**model_kwargs)
 
     def reset(self):

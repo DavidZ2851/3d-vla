@@ -5,9 +5,10 @@ import torch
 class RoboTwinDepth2Cloud:
     """Unproject RoboTwin2 depth maps using fixed 224 intrinsics.
 
-    RoboTwin2 rechunked zarr stores front depth at 224x224 and wrist depth at
-    80x80, while intrinsics are calibrated for 224x224. Intrinsics are scaled
-    to each native depth resolution before unprojection.
+    RoboTwin2 camera intrinsics are calibrated for 224x224. The training
+    preprocessor restores 80x80 wrist depth to the front-camera grid before
+    deprojection; this class also rescales intrinsics when called on any other
+    resolution.
     """
     BASE_INTRINSICS_224 = np.array(
         [

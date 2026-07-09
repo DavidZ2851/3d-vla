@@ -29,11 +29,22 @@ from .. import pytorch3d_transforms as pytorch3d_transforms
 class BaseTrainTester:
     """Train/test a trajectory optimization algorithm."""
 
+    # How often (in steps) to run val evaluation + save a checkpoint.
+    # Must be a multiple of args.val_freq (the eval gate runs on val_freq).
+    val_eval_save_freq = 5000
+
     def __init__(self, args, dataset_cls, model_cls):
         """Initialize."""
         self.args = args
         self.dataset_cls = dataset_cls
         self.model_cls = model_cls
+
+        # Optional override for the val-eval + checkpoint-save cadence. Defaults to
+        # the class value (5000). Overfit/debug runs set this small (e.g. 250) so a
+        # short run still emits a checkpoint; must be a multiple of args.val_freq.
+        _ckpt_save_freq = os.environ.get("CKPT_SAVE_FREQ", "").strip()
+        if _ckpt_save_freq:
+            self.val_eval_save_freq = int(_ckpt_save_freq)
 
         self.preprocessor = fetch_data_preprocessor(self.args.dataset)(
             self.args.keypose_only,
@@ -132,6 +143,43 @@ class BaseTrainTester:
             val_loader = None
         return train_loader, val_loader, train_sampler
 
+    def _install_nan_probe(self, model):
+        """Register forward hooks that pinpoint the first module emitting NaN/Inf."""
+        import torch as _torch
+
+        state = {"reported": False}
+
+        def _any_nonfinite(obj):
+            if _torch.is_tensor(obj):
+                if obj.is_floating_point() and obj.numel() > 0:
+                    return not _torch.isfinite(obj).all().item()
+                return False
+            if isinstance(obj, (list, tuple)):
+                return any(_any_nonfinite(o) for o in obj)
+            if isinstance(obj, dict):
+                return any(_any_nonfinite(o) for o in obj.values())
+            return False
+
+        def _make_hook(name, module_cls):
+            def hook(_mod, inputs, output):
+                if state["reported"]:
+                    return
+                if _any_nonfinite(output) and not _any_nonfinite(inputs):
+                    state["reported"] = True
+                    print(
+                        f"[NAN_PROBE] First non-finite OUTPUT (finite inputs) at "
+                        f"module='{name}' type={module_cls}",
+                        flush=True,
+                    )
+            return hook
+
+        n = 0
+        for name, module in model.named_modules():
+            if len(list(module.children())) == 0:  # leaf modules only
+                module.register_forward_hook(_make_hook(name, type(module).__name__))
+                n += 1
+        print(f"[NAN_PROBE] installed on {n} leaf modules", flush=True)
+
     def get_model(self):
         """Initialize the model."""
         # Initialize model with arguments
@@ -176,11 +224,27 @@ class BaseTrainTester:
             "motion_finetune": getattr(self.args, "motion_finetune", True),
             "motion_scene_fusion": getattr(self.args, "motion_scene_fusion", True),
             "motion_action_fusion": getattr(self.args, "motion_action_fusion", True),
+            "proprio_nhand": getattr(self.args, "proprio_nhand", None),
+            "joint_action_dim": getattr(self.args, "joint_action_dim", 7),
+            "joint_proprio_dim": getattr(self.args, "joint_proprio_dim", 8),
+            "gripper_dim": getattr(self.args, "gripper_dim", 1),
+            "joint_num_layers": getattr(self.args, "joint_num_layers", 4),
+            "joint_embedding_dim": getattr(self.args, "joint_embedding_dim", 0) or None,
+            "joint_num_attn_heads": getattr(self.args, "joint_num_attn_heads", 0) or None,
+            "joint_loss_weight": getattr(self.args, "joint_loss_weight", 1.0),
+            "joint_action_weight": getattr(self.args, "joint_action_weight", 30.0),
+            "num_camera_ids": getattr(self.args, "num_camera_ids", 2),
         }
         for key, value in optional_kwargs.items():
             if key in model_init_params:
                 model_kwargs[key] = value
         _model = self.model_cls(**model_kwargs)
+
+        # Optional, env-gated NaN localization probe (RW2_NAN_PROBE=1). Reports the
+        # first leaf module whose output is non-finite while its inputs are finite,
+        # i.e. the module that PRODUCED the NaN/Inf. Harmless when the env is unset.
+        if os.environ.get("RW2_NAN_PROBE", "0") == "1":
+            self._install_nan_probe(_model)
 
         # Print basic modules' parameters
         if dist.get_rank() == 0:
@@ -288,7 +352,8 @@ class BaseTrainTester:
         # Get model
         model = self.get_model()
         self.tokenizer = fetch_tokenizers(self.args.backbone)
-        if self.args.finetune or not os.path.exists(self.args.checkpoint):  # NOTE: for finetune we need normalization for current dataset
+        if self.args.finetune or not self.args.checkpoint or not os.path.exists(self.args.checkpoint):
+            # For finetune or scratch training, compute normalization from the current dataset.
             normalizer = self.get_workspace_normalizer()  # calculate workspace normalizer from loaded dataset
             model.workspace_normalizer.copy_(normalizer)
             dist.barrier(device_ids=[torch.cuda.current_device()])
@@ -308,11 +373,14 @@ class BaseTrainTester:
             model = model.cuda()
         # make sure to compile before DDP!
         if self.args.use_compile:
-            model.compute_loss = torch.compile(model.compute_loss, fullgraph=True)
+            model.compute_loss = torch.compile(model.compute_loss)
         model = DistributedDataParallel(
             model,
             device_ids=[self.args.local_rank],
             broadcast_buffers=False,
+            gradient_as_bucket_view=(
+                os.environ.get("DDP_GRADIENT_AS_BUCKET_VIEW", "1") != "0"
+            ),
             # Some policy variants have conditionally active branches (e.g.,
             # optional grounding inputs), so parameters may be unused on a
             # given step. Keep this configurable and default to True.
@@ -324,9 +392,11 @@ class BaseTrainTester:
         self.ema = EMA()
 
         # Check for a checkpoint
-        start_iter, best_loss = 0, None
+        start_iter, best_loss, scheduler_loaded = 0, None, False
         if self.args.checkpoint:
-            start_iter, best_loss = self.load_checkpoint(model, ema_model, optimizer)
+            start_iter, best_loss, scheduler_loaded = self.load_checkpoint(
+                model, ema_model, optimizer, lr_scheduler, scaler
+            )
             if self.args.finetune:  # if finetune, we must use workspace normalizer for current dataset and copy to model
                 model.module.workspace_normalizer.copy_(normalizer)
                 if self.args.use_ema:
@@ -347,8 +417,9 @@ class BaseTrainTester:
             return ema_model if self.args.use_ema else model
 
         # Step the lr scheduler to the current step
-        for _ in range(start_iter):
-            lr_scheduler.step()
+        if not scheduler_loaded:
+            for _ in range(start_iter):
+                lr_scheduler.step()
 
         # Step the sampler to the currect "epoch"
         samples_per_epoch = len(train_loader)
@@ -391,7 +462,7 @@ class BaseTrainTester:
                     val_iters=10,
                     split='train'
                 )
-                if (step_id + 1) % 5000 == 0:  # frequently evaluate on val and save ckpt
+                if (step_id + 1) % self.val_eval_save_freq == 0:  # frequently evaluate on val and save ckpt
                     print("Test evaluation.......")
                     new_loss = self.evaluate_nsteps(
                         ema_model.module if self.args.use_ema else model.module,
@@ -400,7 +471,7 @@ class BaseTrainTester:
                     )
                     # save model
                     best_loss = self.save_checkpoint(
-                        model, ema_model, optimizer, step_id,
+                        model, ema_model, optimizer, lr_scheduler, scaler, step_id,
                         new_loss, best_loss
                     )
                 model.train()
@@ -725,13 +796,18 @@ class BaseTrainTester:
 
         return values[f'{split}-losses/mean/traj_pos_acc_001']  # NOTE: was negative, seems wrong
 
-    def load_checkpoint(self, model, ema_model, optimizer):
+    def load_checkpoint(self, model, ema_model, optimizer, lr_scheduler=None, scaler=None):
         """Load from checkpoint."""
         print("=> trying checkpoint '{}'".format(self.args.checkpoint))
         if not os.path.exists(self.args.checkpoint):
-            print('Warning: checkpoint was not found, starting from scratch')
-            print('The main process will compute workspace bounds')
-            return 0, None
+            if getattr(self.args, "require_checkpoint", False):
+                raise FileNotFoundError(
+                    "Required resume checkpoint was not found: "
+                    f"{self.args.checkpoint}"
+                )
+            print("Warning: checkpoint was not found, starting from scratch")
+            print("The main process will compute workspace bounds")
+            return 0, None, False
 
         model_dict = torch.load(
             self.args.checkpoint,
@@ -752,6 +828,7 @@ class BaseTrainTester:
         if model_dict.get("ema_weight") is not None:
             if ema_model is not None:
                 ema_model.load_state_dict(model_dict["ema_weight"], strict=True)
+        scheduler_loaded = False
         if self.args.finetune:  # NOTE: for finetune we only load weights but reset iter and best_loss
             print("=> [FINETUNE MODE] Resetting iter, optimizer, and best_loss.")
             start_iter = 0
@@ -761,15 +838,29 @@ class BaseTrainTester:
             best_loss = model_dict.get("best_loss", None)
             if 'optimizer' in model_dict and not self.args.eval_only:
                 optimizer.load_state_dict(model_dict["optimizer"])
+            scheduler_loaded = False
+            if (
+                lr_scheduler is not None
+                and model_dict.get("lr_scheduler") is not None
+                and not self.args.eval_only
+            ):
+                lr_scheduler.load_state_dict(model_dict["lr_scheduler"])
+                scheduler_loaded = True
+            if (
+                scaler is not None
+                and model_dict.get("scaler") is not None
+                and not self.args.eval_only
+            ):
+                scaler.load_state_dict(model_dict["scaler"])
 
         print("=> loaded successfully '{}' (step {})".format(
             self.args.checkpoint, model_dict.get("iter", 0)
         ))
         del model_dict
         torch.cuda.empty_cache()
-        return start_iter, best_loss
+        return start_iter, best_loss, scheduler_loaded
 
-    def save_checkpoint(self, model, ema_model, optimizer,
+    def save_checkpoint(self, model, ema_model, optimizer, lr_scheduler, scaler,
                         step_id, new_loss, best_loss):
         """Save checkpoint if requested."""
         model_state = model.state_dict()
@@ -781,11 +872,13 @@ class BaseTrainTester:
         # Main checkpoint:
         # - before 35k iters (inclusive): keep writing last.pth
         # - from 35k iters: write <iter>.pth
-        ckpt_name = f"{current_iter}.pth" if current_iter > 50000 else "last.pth"
+        ckpt_name = f"{current_iter}.pth" if current_iter > 200000 else "last.pth"
         torch.save({
             "weight": model_state,
             "ema_weight": ema_state,
             "optimizer": optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "iter": current_iter,
             "best_loss": best_loss
         }, self.args.log_dir / ckpt_name)

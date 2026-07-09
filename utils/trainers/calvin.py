@@ -3,6 +3,7 @@ import gc
 import numpy as np
 import torch
 from torch import nn
+import torch.distributed as dist
 from tqdm import tqdm
 import hydra
 from omegaconf import OmegaConf
@@ -208,3 +209,91 @@ def evaluate_policy(model, env, task_config_file, ann_config_file):
         results.append(result)
 
     return sum(results) / len(results)
+
+
+class CALVINJointTrainer(CALVINTrainTester):
+    """Trainer for the joint-action model (`flower_actor_3d_motion_latent_joint`).
+
+    Reuses the CALVIN EEF pipeline (rgb/depth/pcd, EEF action = rel_action for the
+    EEF chain-of-thought supervision, euler workspace normalizer) and additionally
+    threads the joint targets/state through to the model and loads the per-joint
+    normalizer. Offline joint metrics only -- online env rollout needs joint
+    position control and is a separate milestone.
+
+    Dataset names: `CalvinJoint` / `CalvinJoint10th`.
+    """
+
+    @torch.no_grad()
+    def get_joint_normalizer(self):
+        # Symmetric per-joint [min, max] for the anchor-relative arm-joint deltas
+        # (7 joints). Set to p99.9 of |value| x1.15 margin, measured on the
+        # calvin_joint_zarr train split (see
+        # 3dfa-vla-data-processing/compute_calvin_joint_rel_action_stats.py), so
+        # ~99.9% of targets normalize into [-1, 1]. The model clamps normalized
+        # targets to [-joint_norm_clamp, joint_norm_clamp] (default 2.0), bounding
+        # the rare tail (one joint reaches ~2.14). Gripper (dim 7) is binary and
+        # not normalized.
+        hi = torch.tensor([0.466, 0.284, 0.373, 0.524, 0.329, 0.269, 0.706])
+        return torch.stack([-hi, hi])  # (2, 7)
+
+    def get_model(self):
+        model = super().get_model()
+        if hasattr(model, "joint_normalizer"):
+            model.joint_normalizer.copy_(
+                self.get_joint_normalizer().to(model.joint_normalizer.dtype)
+            )
+        return model
+
+    @torch.no_grad()
+    def prepare_batch(self, sample, augment=False):
+        out = super().prepare_batch(sample, augment=augment)
+        # Stash the joint targets/state for _run_model_forward (called immediately
+        # after prepare_batch inside the inherited _model_forward).
+        self._joint_batch = (
+            self.preprocessor.process_joint_action(sample["joint_action"]),
+            self.preprocessor.process_joint_proprio(sample["joint_proprio"]),
+        )
+        return out
+
+    def _run_model_forward(self, model, action, action_mask, rgbs, rgb2d, pcds,
+                           instr, prop, training, instr_mask=None, instr_lens=None,
+                           grounding_3d=None, grounding_keep_mask=None):
+        gt_joint, joint_proprio = self._joint_batch
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            return model(
+                action, action_mask, rgbs, rgb2d, pcds, instr, prop,
+                run_inference=not training,
+                instr_mask=instr_mask,
+                instr_lens=instr_lens,
+                gt_joint_trajectory=gt_joint,
+                joint_proprio=joint_proprio,
+            )
+
+    @torch.no_grad()
+    def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val',
+                        epoch=None):
+        """Offline joint metrics: arm-joint L1 and gripper accuracy on the joint
+        chunk. Overrides the EEF-action eval (which would shape-mismatch the joint
+        output) and skips the online env rollout (needs joint position control)."""
+        model.eval()
+        arm_l1_sum, grip_acc_sum, count = 0.0, 0.0, 0
+        for i, sample in enumerate(tqdm(loader)):
+            if i == val_iters:
+                break
+            pred = self._model_forward(model, sample, training=False)  # (B,H,nh,8)
+            gt = sample["joint_action"].cuda(non_blocking=True).float()
+            n_arm = pred.shape[-1] - 1
+            arm_l1_sum += (pred[..., :n_arm] - gt[..., :n_arm]).abs().mean().item()
+            grip_pred = (pred[..., -1] >= 0.5).float()
+            grip_acc_sum += (grip_pred == gt[..., -1]).float().mean().item()
+            count += 1
+        if count == 0:
+            return 0.0
+        arm_l1 = arm_l1_sum / count
+        grip_acc = grip_acc_sum / count
+        if (not dist.is_initialized() or dist.get_rank() == 0) and step_id > -1:
+            self.writer.add_scalar(f"{split}-joint/arm_l1", arm_l1, step_id)
+            self.writer.add_scalar(f"{split}-joint/gripper_acc", grip_acc, step_id)
+            print(f"Step {step_id}: {split} joint arm_l1={arm_l1:.4f} "
+                  f"gripper_acc={grip_acc:.4f}")
+        return arm_l1

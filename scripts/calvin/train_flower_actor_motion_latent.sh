@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=calvin_motion_scene_frozen
+#SBATCH --job-name=calvin_motion_scene
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -25,13 +25,13 @@ val_instructions=instructions/calvin/val_instructions.json
 dataset=CalvinContact10th
 num_workers=4
 memory_limit=6
-B=32  # NOTE: 8
-B_val=32  # NOTE: 8
+B=8
+B_val=8
 chunk_size=8
 
 val_freq=5000
 eval_only=false
-lr=5e-5  # NOTE: 2e-5
+lr=2e-5
 lr_scheduler=tristage_flower
 backbone_lr=2e-5
 num_finetune_vision_layers=0
@@ -49,11 +49,11 @@ pre_tokenize=true
 custom_img_size=224
 
 backbone=florence2
-finetune_backbone=false  # NOTE: true
+finetune_backbone=true
 finetune_text_encoder=false
 fps_subsampling_factor=1
 
-C=1024  # NOTE: 960
+C=960
 num_attn_heads=16
 num_vis_instr_attn_layers=3
 num_history=1
@@ -69,7 +69,7 @@ motion_expert_config=${MOTION_EXPERT_CONFIG:-$REPO_ROOT/motion_expert/configs/ca
 motion_expert_checkpoint=${MOTION_EXPERT_CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/calvin_florence2/checkpoint_step_18000.pt}
 motion_solver_steps=10
 motion_steps_to_run=1
-motion_finetune=false  # NOTE: true
+motion_finetune=true
 motion_scene_fusion=true
 motion_action_fusion=false
 

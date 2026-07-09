@@ -2,6 +2,7 @@ from .calvin import CALVINDepth2Cloud
 from .rlbench import RLBenchDepth2Cloud
 from .libero import LiberoDepth2Cloud
 from .robotwin2 import RoboTwinDepth2Cloud
+from .aloha import AlohaDepth2Cloud
 
 
 def fetch_depth2cloud(dataset_name):
@@ -20,4 +21,6 @@ def fetch_depth2cloud(dataset_name):
         return LiberoDepth2Cloud((224, 224))
     if 'robotwin2' in dataset_name:
         return RoboTwinDepth2Cloud((224, 224))
+    if 'aloha' in dataset_name:
+        return AlohaDepth2Cloud(source_hw=(720, 1280))
     return None

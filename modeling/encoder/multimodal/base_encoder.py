@@ -27,6 +27,7 @@ class Encoder(nn.Module):
         super().__init__()
         self.subsampling_factor = fps_subsampling_factor
         self._backbone_name = backbone
+        self.use_rgb2d_context = False
 
         # Instruction encoder
         self.text_encoder, _dim = fetch_text_encoders(backbone)
@@ -96,10 +97,14 @@ class Encoder(nn.Module):
         rgb3d_feats, rgb2d_feats, pcd, instr_feats = vl_enc_fn(
             rgb3d, rgb2d, pcd, instruction
         )
-        rgb2d_pos = None
-
         # Use the current end-effector position as language 'position'
         instr_pos = proprio[:, -1:, :3].repeat(1, instr_feats.size(1), 1)
+        rgb2d_pos = None
+        if rgb2d_feats is not None:
+            # 2D-only camera tokens do not have per-pixel depth. Anchor them at
+            # the current end-effector xyz so attention can use wrist RGB
+            # without pretending each pixel has metric 3D geometry.
+            rgb2d_pos = proprio[:, -1:, :3].repeat(1, rgb2d_feats.size(1), 1)
 
         # Encode proprioception
         proprio_feats = self.encode_proprio(proprio, rgb3d_feats, pcd)
@@ -163,32 +168,103 @@ class Encoder(nn.Module):
             - pcd: (B, Np, 3)
             - instr_feats: (B, L, F)
         """
-        rgb3d = self.normalize(rgb3d)
-        rgb3d_feats, instr_feats = self.backbone(rgb3d, text, output_hidden_states=True)
-        # rgb3d_feats = self.cond_linear(self.cond_norm(rgb3d_feats))
-        nc = rgb3d.shape[1]
-        #h_ = int(math.sqrt(rgb3d_feats.shape[2] // nc))  # NOTE: modify this to accept rectangular input
-        h_feat_rgb = math.ceil(rgb3d.shape[-2] / 32)
-        w_feat_rgb = math.ceil(rgb3d.shape[-1] / 32)
-        motion_visual_tokens = rgb3d_feats[:, -1]
-        self._last_motion_visual_grid = einops.rearrange(
-            motion_visual_tokens,
-            'b (nc h w) c -> b nc h w c',
-            nc=nc,
-            h=h_feat_rgb,
-            w=w_feat_rgb,
-        )
-        self._last_motion_visual_tokens = motion_visual_tokens
-        self._last_motion_text_tokens = instr_feats
-        instr_feats = self.cond_linear(self.cond_norm(instr_feats))
-        rgb3d_feats = self.vit_fpn({
-            'res5': einops.rearrange(rgb3d_feats[:, 3], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb),
-            'res4': einops.rearrange(rgb3d_feats[:, 2], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb),
-            'res3': einops.rearrange(rgb3d_feats[:, 1], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb),
-            'res2': einops.rearrange(rgb3d_feats[:, 0], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat_rgb, w=w_feat_rgb)
-        })
+        def _infer_grid_hw(num_tokens, height, width):
+            expected_h = max(1, math.ceil(height / 32))
+            expected_w = max(1, math.ceil(width / 32))
+            if expected_h * expected_w == num_tokens:
+                return expected_h, expected_w
+
+            aspect = width / float(height)
+            candidates = []
+            for feat_h in range(1, int(math.sqrt(num_tokens)) + 1):
+                if num_tokens % feat_h != 0:
+                    continue
+                feat_w = num_tokens // feat_h
+                candidates.append((feat_h, feat_w))
+                if feat_h != feat_w:
+                    candidates.append((feat_w, feat_h))
+            if not candidates:
+                raise ValueError(
+                    "Cannot infer visual feature grid from "
+                    f"{num_tokens} tokens for input {height}x{width}."
+                )
+            return min(
+                candidates,
+                key=lambda hw: abs(math.log((hw[1] / float(hw[0])) / aspect)),
+            )
+
+        def _resolve_grid_hw(rgb, feats, nc):
+            if feats.shape[2] % nc != 0:
+                raise ValueError(
+                    "Visual token count must be divisible by camera count: "
+                    f"{feats.shape[2]} tokens for {nc} cameras."
+                )
+            tokens_per_cam = feats.shape[2] // nc
+            grid_hw = getattr(self.backbone, "_last_feature_hw", None)
+            if (
+                grid_hw is not None
+                and grid_hw[0] * grid_hw[1] == tokens_per_cam
+            ):
+                return grid_hw
+            return _infer_grid_hw(tokens_per_cam, rgb.shape[-2], rgb.shape[-1])
+
+        def _encode_visual_grid(rgb, save_motion_cache=False):
+            rgb = self.normalize(rgb)
+            feats, text_feats = self.backbone(rgb, text, output_hidden_states=True)
+            nc = rgb.shape[1]
+            h_feat, w_feat = _resolve_grid_hw(rgb, feats, nc)
+            if save_motion_cache:
+                motion_visual_tokens = feats[:, -1]
+                self._last_motion_visual_grid = einops.rearrange(
+                    motion_visual_tokens,
+                    'b (nc h w) c -> b nc h w c',
+                    nc=nc,
+                    h=h_feat,
+                    w=w_feat,
+                )
+                self._last_motion_visual_tokens = motion_visual_tokens
+                self._last_motion_text_tokens = text_feats
+            feats = self.vit_fpn({
+                'res5': einops.rearrange(feats[:, 3], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat, w=w_feat),
+                'res4': einops.rearrange(feats[:, 2], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat, w=w_feat),
+                'res3': einops.rearrange(feats[:, 1], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat, w=w_feat),
+                'res2': einops.rearrange(feats[:, 0], 'b (nc h w) c -> (b nc) c h w', nc=nc, h=h_feat, w=w_feat)
+            })
+            return feats, text_feats
+
+        rgb3d_feats, instr_feats = _encode_visual_grid(rgb3d, save_motion_cache=True)
         h_feat_pcd, w_feat_pcd = rgb3d_feats.shape[-2:]
+        nc = rgb3d.shape[1]
+        # Patch grid for the 3D scene tokens, used to map per-patch quantities back
+        # to image space. Layout below is "(b nc) c h w -> b (nc h w) c", so camera
+        # `i` occupies tokens [i*h*w : (i+1)*h*w] in row-major (h, w) order.
+        self._last_rgb3d_grid = (int(nc), int(h_feat_pcd), int(w_feat_pcd))
         rgb3d_feats = einops.rearrange(rgb3d_feats, "(b nc) c h w -> b (nc h w) c", nc=nc)
+        instr_feats = self.cond_linear(self.cond_norm(instr_feats))
+
+        rgb2d_feats = None
+        if rgb2d is not None and self.use_rgb2d_context:
+            n2d = rgb2d.shape[1]
+            rgb2d_feats, _ = _encode_visual_grid(rgb2d, save_motion_cache=False)
+            _, _, h2d, w2d = rgb2d_feats.shape
+            rgb2d_feats = einops.rearrange(
+                rgb2d_feats,
+                "(b nc) c h w -> b nc c h w",
+                nc=n2d,
+            )
+            if hasattr(self, "camera_ids"):
+                rgb2d_feats = rgb2d_feats + self.camera_ids.weight[
+                    None, :n2d, :, None, None
+                ]
+            if hasattr(self, "pos_embed_2d"):
+                pos_2d = self.pos_embed_2d(
+                    torch.arange(0, h2d * w2d, device=rgb2d_feats.device)
+                ).reshape(h2d, w2d, -1)
+                pos_2d = einops.rearrange(pos_2d, "h w c -> c h w")
+                rgb2d_feats = rgb2d_feats + pos_2d[None, None]
+            rgb2d_feats = einops.rearrange(
+                rgb2d_feats, "b nc c h w -> b (nc h w) c"
+            )
 
         # Point cloud
         num_cameras = pcd.shape[1]
@@ -204,7 +280,7 @@ class Encoder(nn.Module):
             pcd,
             "(bt ncam) c h w -> bt (ncam h w) c", ncam=num_cameras
         )
-        return rgb3d_feats, None, pcd, instr_feats
+        return rgb3d_feats, rgb2d_feats, pcd, instr_feats
 
     def run_fps(self, features, pos):
         # features (B, Np, F)

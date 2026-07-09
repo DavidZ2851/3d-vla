@@ -1,0 +1,93 @@
+{
+  "task": "press the button to turn off the led light",
+  "subtask": "turn_off_led",
+  "checkpoint_motion": "/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/3dfavla_motion/last.pth",
+  "checkpoint_baseline": "/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/calvin/3dfavla/last.pth",
+  "steps": [
+    {
+      "step": 0,
+      "motion": {
+        "mean": 0.09699010103940964,
+        "max": 0.1330808401107788,
+        "p95": 0.12270894050598144,
+        "top5pct_mass_frac": 0.06565922442630114
+      },
+      "baseline": {
+        "mean": 0.0992547869682312,
+        "max": 0.15624676644802094,
+        "p95": 0.1433150827884674,
+        "top5pct_mass_frac": 0.07396998160521798
+      },
+      "shape_cosine_motion_baseline": 0.8049161002719771,
+      "top10pct_overlap_motion_baseline": 0.38461538461538464
+    },
+    {
+      "step": 1,
+      "motion": {
+        "mean": 0.09085705876350403,
+        "max": 0.12828613817691803,
+        "p95": 0.11242174617946148,
+        "top5pct_mass_frac": 0.06578726213962681
+      },
+      "baseline": {
+        "mean": 0.0944284051656723,
+        "max": 0.18069936335086823,
+        "p95": 0.15063426345586775,
+        "top5pct_mass_frac": 0.08590408825340987
+      },
+      "shape_cosine_motion_baseline": 0.7915088335685696,
+      "top10pct_overlap_motion_baseline": 0.1794871794871795
+    },
+    {
+      "step": 2,
+      "motion": {
+        "mean": 0.07091495394706726,
+        "max": 0.11060835421085358,
+        "p95": 0.09831254146993158,
+        "top5pct_mass_frac": 0.07184442969498203
+      },
+      "baseline": {
+        "mean": 0.09898625314235687,
+        "max": 0.14367638528347015,
+        "p95": 0.12768017277121543,
+        "top5pct_mass_frac": 0.0670997309946538
+      },
+      "shape_cosine_motion_baseline": 0.8712931617339038,
+      "top10pct_overlap_motion_baseline": 0.0
+    },
+    {
+      "step": 3,
+      "motion": {
+        "mean": 0.0708920806646347,
+        "max": 0.11950094252824783,
+        "p95": 0.09195015951991081,
+        "top5pct_mass_frac": 0.07144463815798155
+      },
+      "baseline": {
+        "mean": 0.0941547155380249,
+        "max": 0.1359756737947464,
+        "p95": 0.12160984277725219,
+        "top5pct_mass_frac": 0.06726045205990756
+      },
+      "shape_cosine_motion_baseline": 0.8762015255780052,
+      "top10pct_overlap_motion_baseline": 0.19230769230769232
+    },
+    {
+      "step": 4,
+      "motion": {
+        "mean": 0.06398051977157593,
+        "max": 0.10822686553001404,
+        "p95": 0.08979383893311023,
+        "top5pct_mass_frac": 0.07284658864160246
+      },
+      "baseline": {
+        "mean": 0.11984220147132874,
+        "max": 0.1660175621509552,
+        "p95": 0.15791085585951806,
+        "top5pct_mass_frac": 0.06712129612689971
+      },
+      "shape_cosine_motion_baseline": 0.9187757331957888,
+      "top10pct_overlap_motion_baseline": 0.5256410256410257
+    }
+  ]
+}

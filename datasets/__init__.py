@@ -1,4 +1,4 @@
-from .calvin import CALVINDataset, CALVINContactDataset
+from .calvin import CALVINDataset, CALVINContactDataset, CALVINJointDataset
 from .rlbench import (
     Peract2Dataset,
     Peract2SingleCamDataset,
@@ -12,7 +12,8 @@ from .rlbench import (
 )
 from .geniesim3 import GenieSim3Dataset
 from .libero import LIBERODataset
-from .robotwin2 import RoboTwin2Dataset
+from .robotwin2 import RoboTwin2Dataset, RoboTwin2JointDataset
+from .aloha import AlohaDataset, AlohaHeadRGBDDataset, AlohaJointDataset
 
 def fetch_dataset_class(dataset_name):
     """Fetch the dataset class based on the dataset name."""
@@ -28,12 +29,19 @@ def fetch_dataset_class(dataset_name):
         'Calvin10th': CALVINDataset,
         'CalvinContact': CALVINContactDataset,
         'CalvinContact10th': CALVINContactDataset,
+        'CalvinJoint': CALVINJointDataset,
+        'CalvinJoint10th': CALVINJointDataset,
         "Peract2TCSingle": SinglePeract2Dataset,
         "Peract2All": Peract2AllDataset,
         "GenieSim3": GenieSim3Dataset,
         "GenieSim3.0": GenieSim3Dataset,
         "Libero": LIBERODataset,
         "RoboTwin2": RoboTwin2Dataset,
+        "RoboTwin2Joint": RoboTwin2JointDataset,
+        "Aloha": AlohaDataset,
+        "AlohaHeadRGBD": AlohaHeadRGBDDataset,
+        "AlohaHeadOnly": AlohaHeadRGBDDataset,
+        "AlohaJoint": AlohaJointDataset,
     }
     
     if dataset_name not in dataset_classes:

@@ -14,11 +14,10 @@ from datasets.utils import quat_wxyz_to_euler_xyz
 
 
 DEFAULT_TRAIN_ZARR = Path(
-    "/data/user_data/ziyinx/datasets/zarr_datasets/robotwin2_zarr/train.zarr"
+    "/data/user_data/ziyinx/datasets/zarr_datasets/robotwin2_zarr_action15_stride2/train.zarr"
 )
 DEFAULT_VAL_ZARR = Path(
-    "/data/group_data/katefgroup/datasets/ziyinx/"
-    "robotwin2_zarr_rechunked_stride5/val_rechunked8.zarr"
+    "/data/user_data/ziyinx/datasets/zarr_datasets/robotwin2_zarr_action15_stride2/val.zarr"
 )
 HAND_NAMES = ("left", "right")
 EULER_NAMES = ("x", "y", "z")

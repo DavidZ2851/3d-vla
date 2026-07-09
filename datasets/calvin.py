@@ -151,3 +151,60 @@ class CALVINContactDataset(CALVINDataset):
             raw_idx = (idx % effective_size) * self.chunk_size
             sample['3d_contact_point'] = self._get_contact_point(raw_idx)
         return sample
+
+
+class CALVINJointDataset(CALVINDataset):
+    """CALVIN dataset for the joint-action model.
+
+    The joint zarr (``calvin_zarr_joint``) has NO ``action`` key -- only
+    ``rel_action`` (EE, for the EEF chain-of-thought supervision) and
+    ``rel_joint_action`` / ``proprioception_joint`` (the joint targets/state). So
+    we key length/indexing off ``rel_action`` and add ``joint_action`` +
+    ``joint_proprio`` to every sample. Everything else (rgb/depth/proprio/instr,
+    and ``action`` = rel_action via the parent's relative-action path) is
+    inherited. Requires ``relative_action=True``.
+
+    Dataset names: ``CalvinJoint`` / ``CalvinJoint10th``.
+    """
+
+    _LEN_KEY = 'rel_action'
+
+    def __len__(self):
+        total_samples = len(self.annos[self._LEN_KEY]) // self.chunk_size
+        if self.max_samples is not None:
+            return self.copies * min(self.max_samples, total_samples)
+        return self.copies * total_samples
+
+    def _effective_size(self):
+        total_samples = len(self.annos[self._LEN_KEY]) // self.chunk_size
+        return (
+            min(self.max_samples, total_samples)
+            if self.max_samples is not None
+            else total_samples
+        )
+
+    def _get_joint_action(self, idx):
+        # (chunk, ACTION_LEN, nhand=1, n_joint+1) anchor-relative joints + gripper
+        return self._get_attr_by_idx(idx, 'rel_joint_action', False)
+
+    def _get_joint_proprio(self, idx):
+        # (chunk, nhist=1, nhand=1, n_joint+1)
+        return self._get_attr_by_idx(idx, 'proprioception_joint', False)
+
+    def __getitem__(self, idx):
+        idx = (idx % self._effective_size()) * self.chunk_size
+        if self._actions_only:
+            return {"action": self._get_action(idx)}
+        return {
+            "task": self._get_task(idx),
+            "instr": self._get_instr(idx),
+            "rgb": self._get_attr_by_idx(idx, 'rgb_front'),
+            "depth": self._get_attr_by_idx(idx, 'depth_front'),
+            "rgb2d": self._get_attr_by_idx(idx, 'rgb_wrist'),
+            "wrist_depth": self._get_attr_by_idx(idx, 'depth_wrist'),
+            "extrinsics_wrist": self._get_attr_by_idx(idx, 'extrinsics_wrist'),
+            "proprioception": self._get_attr_by_idx(idx, 'proprioception'),
+            "action": self._get_action(idx),
+            "joint_action": self._get_joint_action(idx),
+            "joint_proprio": self._get_joint_proprio(idx),
+        }

@@ -9,7 +9,6 @@
 #SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --exclude=babel-x5-24
 
 set -euo pipefail
 

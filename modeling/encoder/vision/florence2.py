@@ -1,4 +1,5 @@
 import einops
+import math
 import torch
 from torch import nn
 
@@ -33,6 +34,99 @@ class Florence2(nn.Module):
         
         # Setup token dropout
         self.vlm_token_dropout = nn.Dropout(0.1)
+        self._last_feature_hw = None
+
+    @staticmethod
+    def _infer_feature_hw(num_tokens, height, width):
+        expected_h = max(1, math.ceil(height / 32))
+        expected_w = max(1, math.ceil(width / 32))
+        if expected_h * expected_w == num_tokens:
+            return expected_h, expected_w
+
+        aspect = width / float(height)
+        candidates = []
+        for feat_h in range(1, int(math.sqrt(num_tokens)) + 1):
+            if num_tokens % feat_h != 0:
+                continue
+            feat_w = num_tokens // feat_h
+            candidates.append((feat_h, feat_w))
+            if feat_h != feat_w:
+                candidates.append((feat_w, feat_h))
+
+        if not candidates:
+            raise ValueError(
+                "Cannot infer Florence2 rectangular feature grid from "
+                f"{num_tokens} tokens for input {height}x{width}."
+            )
+
+        return min(
+            candidates,
+            key=lambda hw: abs(math.log((hw[1] / float(hw[0])) / aspect)),
+        )
+
+    def _encode_image_allow_rectangular(self, pixel_values):
+        """Florence2 image encode with rectangular feature-map support."""
+        if len(pixel_values.shape) != 4:
+            raise ValueError(f"invalid image shape {pixel_values.shape}")
+
+        batch_size, _, height, width = pixel_values.shape
+        if height == width:
+            encoded = self.vlm._encode_image(pixel_values)
+            grid_tokens = encoded.shape[1] - 1
+            grid_side = int(math.sqrt(grid_tokens))
+            if grid_side * grid_side == grid_tokens:
+                self._last_feature_hw = (grid_side, grid_side)
+            else:
+                self._last_feature_hw = None
+            return encoded
+
+        temporal = 1
+        x = self.vlm.vision_tower.forward_features_unpool(pixel_values)
+        # Some Florence-2 remote-code builds return (features, input_size) here
+        # instead of just the features tensor; keep only the features.
+        if isinstance(x, (tuple, list)):
+            x = x[0]
+        x = x.view(batch_size * temporal, -1, x.shape[-1])
+        feat_h, feat_w = self._infer_feature_hw(x.shape[-2], height, width)
+        self._last_feature_hw = (feat_h, feat_w)
+
+        if self.vlm.image_pos_embed is not None:
+            x = x.view(batch_size * temporal, feat_h, feat_w, x.shape[-1])
+            pos_embed = self.vlm.image_pos_embed(x)
+            x = x + pos_embed
+            x = x.view(batch_size, temporal * feat_h * feat_w, x.shape[-1])
+        else:
+            x = x.view(batch_size, temporal * feat_h * feat_w, x.shape[-1])
+
+        if self.vlm.visual_temporal_embed is not None:
+            temporal_view = x.view(batch_size, temporal, -1, x.shape[-1])
+            visual_temporal_embed = self.vlm.visual_temporal_embed(
+                temporal_view[:, :, 0]
+            )
+            x = temporal_view + visual_temporal_embed.view(
+                1, temporal, 1, x.shape[-1]
+            )
+
+        x_feat_dict = {}
+        x_view = x.view(batch_size, temporal, -1, x.shape[-1])
+        x_feat_dict["spatial_avg_pool"] = x_view.mean(dim=2)
+        x_feat_dict["temporal_avg_pool"] = x_view.mean(dim=1)
+        x_feat_dict["last_frame"] = x_view[:, -1]
+
+        new_x = []
+        for image_feature_source in self.vlm.image_feature_source:
+            if image_feature_source not in x_feat_dict:
+                raise ValueError(
+                    "invalid image feature source: {}".format(
+                        image_feature_source
+                    )
+                )
+            new_x.append(x_feat_dict[image_feature_source])
+
+        x = torch.cat(new_x, dim=1)
+        x = x @ self.vlm.image_projection
+        x = self.vlm.image_proj_norm(x)
+        return x
 
     def forward(self, images, lang_tokens, output_hidden_states=False):
         """
@@ -42,7 +136,9 @@ class Florence2(nn.Module):
         B, ncam, C, H, W = images.shape
 
         # Extract visual features
-        im_feats = self.vlm._encode_image(images.reshape(-1, C, H, W))
+        im_feats = self._encode_image_allow_rectangular(
+            images.reshape(-1, C, H, W)
+        )
         im_feats = einops.rearrange(im_feats, "(B T) N F -> B (T N) (F)", B=B)
 
         # Get text embeddings once to reuse

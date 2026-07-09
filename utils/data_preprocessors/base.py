@@ -23,5 +23,22 @@ class DataPreprocessor:
         proprio = proprio[:, :max(self.num_history, 1)]
         return proprio
 
+    def process_joint_action(self, joint_action):
+        """Joint action shape: (B, T, nhand, n_joint+1). Used only by the
+        joint-action model; a passthrough-to-cuda mirror of process_actions."""
+        joint_action = joint_action.cuda(non_blocking=True).float()
+        if self.keypose_only:
+            joint_action = joint_action[:, [-1]]
+        return joint_action
+
+    def process_joint_proprio(self, joint_proprio):
+        """Joint proprio shape: (B, nhist, nhand, n_joint+1). Mirror of
+        process_proprio for the joint-action model."""
+        joint_proprio = joint_proprio.cuda(non_blocking=True).float()
+        nhist_ = joint_proprio.size(1)
+        assert nhist_ >= self.num_history, "not enough joint proprio timesteps"
+        joint_proprio = joint_proprio[:, :max(self.num_history, 1)]
+        return joint_proprio
+
     def process_obs(self, rgbs, pcds):
         pass

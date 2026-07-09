@@ -1,0 +1,18 @@
+{
+  "sequence_index": 1,
+  "subtask_index": 0,
+  "target_task": "turn_off_led",
+  "instruction": "press the button to turn off the led light",
+  "success": true,
+  "target_replans": 7,
+  "prefix_results": [],
+  "camera": "static",
+  "num_rgb_frames": 64,
+  "num_depth_frames": 64,
+  "fps": 30,
+  "rgb_video": "vis_outputs/calvin_task_rollouts/turn_off_led/seq0001_sub0_turn_off_led_static_rgb.mp4",
+  "depth_video": "vis_outputs/calvin_task_rollouts/turn_off_led/seq0001_sub0_turn_off_led_static_depth.mp4",
+  "raw_depth_npz": "vis_outputs/calvin_task_rollouts/turn_off_led/seq0001_sub0_turn_off_led_static_depth_raw.npz",
+  "depth_min": 3.761842727661133,
+  "depth_max": 5.999061584472656
+}

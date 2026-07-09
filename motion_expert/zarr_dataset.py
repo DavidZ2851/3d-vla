@@ -644,6 +644,7 @@ def compute_calvin_zarr_normalization_stats(
     traj_key: str = "traj_3d_xyz",
     mem_limit_gb: float = 16.0,
     chunk_size: int = 512,
+    max_samples: Optional[int] = None,
 ) -> Dict[str, object]:
     query_sums = np.zeros(3, dtype=np.float64)
     query_sumsq = np.zeros(3, dtype=np.float64)
@@ -651,8 +652,13 @@ def compute_calvin_zarr_normalization_stats(
     traj_sumsq = np.zeros(3, dtype=np.float64)
     query_count = 0
     traj_count = 0
+    remaining = None if max_samples is None else int(max_samples)
+    if remaining is not None and remaining <= 0:
+        raise ValueError("max_samples must be positive when provided.")
 
     for zarr_path in zarr_paths:
+        if remaining is not None and remaining <= 0:
+            break
         annos = read_zarr_with_cache(zarr_path, mem_gb=mem_limit_gb)
         if query_key not in annos:
             raise KeyError(f"Calvin zarr normalization requires `{query_key}`.")
@@ -668,16 +674,20 @@ def compute_calvin_zarr_normalization_stats(
         if len(query_arr) != len(traj_arr) or len(query_arr) != len(mask_arr):
             raise ValueError("query, trajectory, and mask arrays must have the same length.")
 
-        for start in range(0, len(query_arr), chunk_size):
-            query_chunk_arr = np.asarray(query_arr[start : start + chunk_size], dtype=np.float32)
+        store_len = len(query_arr)
+        if remaining is not None:
+            store_len = min(store_len, remaining)
+        for start in range(0, store_len, chunk_size):
+            end = min(start + chunk_size, store_len)
+            query_chunk_arr = np.asarray(query_arr[start:end], dtype=np.float32)
             query_chunk = query_chunk_arr.reshape(query_chunk_arr.shape[0], -1, 3)
             for query_sample in query_chunk:
                 centered_query = _center_finite_query_xyz_np(query_sample)
                 query_count += _update_axis_sums(centered_query, query_sums, query_sumsq)
 
-            traj_chunk_arr = np.asarray(traj_arr[start : start + chunk_size], dtype=np.float32)
+            traj_chunk_arr = np.asarray(traj_arr[start:end], dtype=np.float32)
             traj_chunk = traj_chunk_arr.reshape(traj_chunk_arr.shape[0], -1, traj_chunk_arr.shape[-2], 3)
-            mask_chunk_arr = np.asarray(mask_arr[start : start + chunk_size]).astype(bool)
+            mask_chunk_arr = np.asarray(mask_arr[start:end]).astype(bool)
             if mask_chunk_arr.shape == traj_chunk_arr.shape:
                 mask_chunk_arr = mask_chunk_arr.all(axis=-1)
             mask_chunk = mask_chunk_arr.reshape(
@@ -689,6 +699,8 @@ def compute_calvin_zarr_normalization_stats(
             valid_traj = mask_chunk & finite_traj
             traj_values = traj_chunk[valid_traj]
             traj_count += _update_axis_sums(traj_values, traj_sums, traj_sumsq)
+        if remaining is not None:
+            remaining -= store_len
 
     if query_count <= 0 or traj_count <= 0:
         raise RuntimeError("Could not compute Calvin zarr normalization statistics.")

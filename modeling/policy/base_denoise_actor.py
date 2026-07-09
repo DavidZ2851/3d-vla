@@ -43,6 +43,16 @@ class DenoiseActor(nn.Module):
         self._continuous_openness = False
         self._normalized_action_clamp = None
         self._signed_binary_openness_output = False
+        # Binary default keeps existing dataset behavior: positive raw gripper
+        # labels train the positive class. RobotWin2 overrides this to learn
+        # closed logits from raw openness labels.
+        self._binary_openness_target_mode = "positive"
+        self._binary_openness_target_threshold = 0.5
+        self._binary_openness_inference_threshold = 0.5
+        # Default behavior preserves the existing relative-action semantics used
+        # by other datasets. Dataset-specific trainers can narrow this.
+        self._relative_position_mode = "cumulative"
+        self._relative_rotation = relative
 
         # Vision-language encoder, runs only once
         self.encoder = None  # Implement this!
@@ -134,6 +144,25 @@ class DenoiseActor(nn.Module):
         query_trajectory = proprio[:, -1:]
         return (query_trajectory,) + fixed_inputs
 
+    def _absolute_query_xyz(self, query_trajectory, traj_xyz):
+        """Map (possibly relative) decoder query positions to absolute world xyz.
+
+        Honors ``self._relative_position_mode``:
+          - "anchor"     : each step is relative to the current anchor pose.
+          - "cumulative" : steps are incremental deltas to be cumulatively summed.
+        Subclasses that override ``policy_forward_pass`` MUST call this instead of
+        hardcoding a mode, so dataset-specific relative xyz semantics stay correct.
+        """
+        if not self._relative:
+            return traj_xyz
+        if self._relative_position_mode == "anchor":
+            return query_trajectory[..., :3] + traj_xyz
+        if self._relative_position_mode == "cumulative":
+            return query_trajectory[..., :3] + torch.cumsum(traj_xyz, dim=1)
+        raise ValueError(
+            f"Unknown relative position mode: {self._relative_position_mode!r}"
+        )
+
     def policy_forward_pass(self, trajectory, timestep, fixed_inputs, valid_mask=None):
         # Parse inputs
         (
@@ -149,11 +178,8 @@ class DenoiseActor(nn.Module):
 
         # But use positions from unnormalized absolute trajectory
         traj_xyz = self.unnormalize_pos(trajectory)[..., :3]
-        if self._relative:  # relative to absolute
-            traj_xyz = (
-                query_trajectory[..., :3]
-                + torch.cumsum(traj_xyz, dim=1)
-            )
+        # relative to absolute for decoder position queries
+        traj_xyz = self._absolute_query_xyz(query_trajectory, traj_xyz)
 
         return self.prediction_head(
             trajectory_feats,
@@ -195,6 +221,19 @@ class DenoiseActor(nn.Module):
             ).prev_sample
             trajectory = torch.cat((pos, rot), -1)
         return torch.cat((trajectory, out[..., -1:]), -1)
+
+    def _make_binary_openness_target(self, gt_openness):
+        mode = getattr(self, "_binary_openness_target_mode", "positive")
+        threshold = float(getattr(self, "_binary_openness_target_threshold", 0.5))
+        if mode == "positive":
+            return (gt_openness > 0).to(gt_openness.dtype)
+        if mode == "closed_from_open":
+            return (gt_openness < threshold).to(gt_openness.dtype)
+        if mode == "soft_closed_from_open":
+            return (1.0 - gt_openness).clamp(0.0, 1.0).to(gt_openness.dtype)
+        if mode == "open_from_raw":
+            return (gt_openness >= threshold).to(gt_openness.dtype)
+        raise ValueError(f"Unknown binary openness target mode: {mode!r}")
 
     def compute_trajectory(
         self,
@@ -280,13 +319,26 @@ class DenoiseActor(nn.Module):
             instr_mask=instr_mask,
             instr_lens=instr_lens,
         )
+        return self.flow_loss_given_fixed(
+            gt_trajectory, trajectory_mask, fixed_inputs
+        )
 
+    def flow_loss_given_fixed(self, gt_trajectory, trajectory_mask, fixed_inputs,
+                              include_openness=True):
+        """EEF flow-matching loss given already-encoded ``fixed_inputs``. Split
+        out of ``compute_loss`` so subclasses (e.g. the joint-action model) can
+        reuse the EEF supervision without re-running the (expensive) encoder.
+
+        ``include_openness`` defaults to True (unchanged behavior for every
+        existing model). The joint-action model passes False so the EEF expert is
+        supervised on position+rotation only, leaving the gripper entirely to the
+        joint head."""
         # Process gt_trajectory
         gt_openess = gt_trajectory[..., -1:]
         if self._continuous_openness:
             gt_openess = self.normalize_openness(gt_openess)
         else:
-            gt_openess = (gt_openess > 0).to(gt_openess.dtype)
+            gt_openess = self._make_binary_openness_target(gt_openess)
         gt_trajectory = gt_trajectory[..., :-1]
         # Normalize all pos
         gt_trajectory = self.normalize_pos(gt_trajectory)
@@ -337,7 +389,9 @@ class DenoiseActor(nn.Module):
                 )
                 pos_loss = F.l1_loss(pos, denoise_target[..., :3], reduction='mean')
                 rot_loss = F.l1_loss(rot, denoise_target[..., 3:], reduction='mean')
-                if self._continuous_openness:
+                if not include_openness:
+                    openness_loss = pos_loss.new_zeros(())
+                elif self._continuous_openness:
                     openness_loss = F.smooth_l1_loss(
                         torch.tanh(openess),
                         gt_openess,
@@ -418,11 +472,24 @@ class DenoiseActor(nn.Module):
     def convert_rot(self, signal):
         """Convert external rotation representation to rot6d for diffusion.
         euler/axisangle : already 3, no conversion needed.
+        rot6d           : input is already xyz(3) + rot6d(6) [+ res], no conversion.
+                          For relative-rotation mode we subtract the identity
+                          rot6d so the rest pose maps to zeros.
         quat_*          : quat(4) → rotmat(3x3) → rot6d(6).
         rotmatrix       : rotmat flat(9) → rot6d(6).
         """
         if self._rotation_format in ('euler', 'axisangle'):
             return signal
+        if self._rotation_format == 'rot6d':
+            # signal: (..., 3 + 6 [+ res])
+            rot6d = signal[..., 3:9]
+            if self._relative_rotation:
+                rot6d = rot6d - self._identity_rot6d_like(rot6d)
+            res = signal[..., 9:] if signal.size(-1) > 9 else None
+            out = torch.cat([signal[..., :3], rot6d], dim=-1)
+            if res is not None:
+                out = torch.cat((out, res), -1)
+            return out
             # NOTE: if use euler->6d
             # rot = signal[..., 3:6]
             # res = signal[..., 6:] if signal.size(-1) > 6 else None
@@ -456,7 +523,7 @@ class DenoiseActor(nn.Module):
             rot = rot.reshape(B, L, 6)
         else:
             rot = get_ortho6d_from_rotation_matrix(rot)
-        if self._relative:
+        if self._relative_rotation:
             rot = rot - self._identity_rot6d_like(rot)
         signal = torch.cat([signal[..., :3], rot], dim=-1)
         if res is not None:
@@ -466,11 +533,21 @@ class DenoiseActor(nn.Module):
     def unconvert_rot(self, signal):
         """Convert rot6d back to the external rotation representation.
         euler/axisangle : no conversion needed.
+        rot6d           : add identity back in relative-rotation mode; output is still rot6d.
         quat_*          : rot6d(6) → rotmat(3x3) → quat(4).
         rotmatrix       : rot6d(6) → rotmat(3x3) → flat(9).
         """
         if self._rotation_format in ('euler', 'axisangle'):
             return signal
+        if self._rotation_format == 'rot6d':
+            rot6d = signal[..., 3:9]
+            if self._relative_rotation:
+                rot6d = rot6d + self._identity_rot6d_like(rot6d)
+            res = signal[..., 9:] if signal.size(-1) > 9 else None
+            out = torch.cat([signal[..., :3], rot6d], dim=-1)
+            if res is not None:
+                out = torch.cat((out, res), -1)
+            return out
             # NOTE: if use euler->6d->euler
             # res = signal[..., 9:] if signal.size(-1) > 9 else None
             # rot6d = signal[..., 3:9]
@@ -496,14 +573,14 @@ class DenoiseActor(nn.Module):
         if len(signal.shape) == 3:
             B, L, _ = signal.shape
             rot = signal[..., 3:9].reshape(B * L, 6)
-            if self._relative:
+            if self._relative_rotation:
                 rot = rot + self._identity_rot6d_like(rot)
             mat = compute_rotation_matrix_from_ortho6d(rot)
             quat = matrix_to_quaternion(mat)
             quat = quat.reshape(B, L, 4)
         else:
             rot = signal[..., 3:9]
-            if self._relative:
+            if self._relative_rotation:
                 rot = rot + self._identity_rot6d_like(rot)
             mat = compute_rotation_matrix_from_ortho6d(rot)
             quat = matrix_to_quaternion(mat)

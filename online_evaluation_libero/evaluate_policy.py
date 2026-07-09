@@ -18,14 +18,20 @@ def parse_arguments():
     arguments = [
         # Setup arguments
         ("libero_root", str, "/data/user_data/ziyinx/LIBERO"),
+        ("libero_variant", str, "standard"),
         ("seed", int, 0),
         # Task arguments
         ("benchmark", str, "libero_spatial"),
         ("task_order_index", int, 0),
         ("task_id", int, -1),
         ("all_tasks", str2bool, False),
+        ("task_start", int, 0),
+        ("task_end", int, -1),
         ("num_eval", int, 20),
+        ("init_state_index_offset", int, 0),
         ("max_steps", int, 600),
+        ("auto_max_steps", str2bool, False),
+        ("aggregate_plus_categories", str2bool, False),
         ("img_h", int, LIBERO_RGBD_SIZE),
         ("img_w", int, LIBERO_RGBD_SIZE),
         ("use_mp", str2bool, False),
@@ -78,6 +84,14 @@ def parse_arguments():
         ("libero_target_max_steps", int, 250),
         ("denoise_timesteps", int, 5),
         ("denoise_model", str, "rectified_flow"),
+        # Model arguments: motion latent (flower_actor_3d_motion_latent)
+        ("motion_expert_config", str_none, None),
+        ("motion_expert_checkpoint", str_none, None),
+        ("motion_solver_steps", int, 10),
+        ("motion_steps_to_run", int, 1),
+        ("motion_finetune", str2bool, False),
+        ("motion_scene_fusion", str2bool, True),
+        ("motion_action_fusion", str2bool, False),
     ]
     for name, typ, default in arguments:
         parser.add_argument(f"--{name}", type=typ, default=default)
@@ -202,14 +216,30 @@ def _record_video_if_needed(frames, args, task_id, task_name):
 
 
 def _prepare_libero_imports(args):
+    from online_evaluation_libero.libero_runtime import infer_max_steps, prepare_libero_runtime
+
     if args.libero_root is None:
         args.libero_root = str(Path(__file__).resolve().parents[2] / "LIBERO")
-    if args.libero_root not in sys.path:
-        sys.path.insert(0, args.libero_root)
+    prepare_libero_runtime(args.libero_root)
+    if args.auto_max_steps:
+        args.max_steps = infer_max_steps(args.benchmark, default=args.max_steps)
+
+
+def _select_init_state_indices(num_eval, num_init_states, offset=0):
+    if num_init_states <= 0:
+        raise ValueError("LIBERO task has no saved init states to select from.")
+    start = int(offset)
+    stop = start + int(num_eval)
+    if start < 0 or stop > int(num_init_states):
+        raise ValueError(
+            "Requested LIBERO init-state range "
+            f"[{start}, {stop}) is outside available range [0, {num_init_states})."
+        )
+    return np.arange(start, stop, dtype=np.int64)
 
 
 @torch.no_grad()
-def evaluate_one_task(args, model, task, task_id):
+def evaluate_one_task(args, model, task, task_id, benchmark):
     from online_evaluation_libero.utils_with_libero import (
         create_vectorized_env,
         get_static_camera_matrices,
@@ -226,6 +256,16 @@ def evaluate_one_task(args, model, task, task_id):
             "target_max_steps": args.libero_target_max_steps,
             "absolute_gripper_openness": False,
         }
+    init_states = load_init_states(task, benchmark=benchmark, task_id=task_id)
+    if init_states.ndim == 1:
+        init_states = init_states.unsqueeze(0)
+    available_inits = int(init_states.shape[0])
+    if env_num > available_inits:
+        print(
+            f"[warn] task_id={task_id} requested num_eval={env_num} but only "
+            f"{available_inits} init states are available; using {available_inits}."
+        )
+        env_num = available_inits
     env = create_vectorized_env(
         task,
         args.img_h,
@@ -236,8 +276,11 @@ def evaluate_one_task(args, model, task, task_id):
     )
     env.seed(args.seed)
 
-    init_states = load_init_states(task)
-    indices = np.arange(env_num) % init_states.shape[0]
+    indices = _select_init_state_indices(
+        env_num,
+        available_inits,
+        offset=args.init_state_index_offset,
+    )
     init_states_batch = init_states[indices]
 
     env.reset()
@@ -298,9 +341,14 @@ def evaluate_one_task(args, model, task, task_id):
             break
 
     success_rate = float(np.mean(np.array(dones, dtype=np.float32)))
+    successful_init_state_indices = [
+        int(indices[k])
+        for k, done in enumerate(dones)
+        if done
+    ]
     video_path = _record_video_if_needed(video_frames, args, task_id=task_id, task_name=task.name)
     env.close()
-    return success_rate, video_path
+    return success_rate, video_path, successful_init_state_indices
 
 
 @torch.no_grad()
@@ -309,7 +357,12 @@ def main(args):
     _validate_image_setup(args)
     _validate_control_setup(args)
 
-    from online_evaluation_libero.utils_with_libero import build_benchmark, save_results
+    from online_evaluation_libero.utils_with_libero import (
+        aggregate_plus_categories,
+        build_benchmark,
+        save_results,
+        select_task_ids,
+    )
 
     if (not args.use_circle_policy) and args.checkpoint is None:
         raise ValueError("--checkpoint is required unless --use_circle_policy true")
@@ -326,29 +379,44 @@ def main(args):
         model = create_model(args)
 
     benchmark = build_benchmark(args.benchmark, args.task_order_index)
-    task_ids = (
-        list(range(benchmark.n_tasks))
-        if args.all_tasks or args.task_id < 0
-        else [args.task_id]
+    task_ids = select_task_ids(
+        benchmark,
+        all_tasks=args.all_tasks,
+        task_id=args.task_id,
+        task_start=args.task_start,
+        task_end=args.task_end,
     )
 
     results = {
         "benchmark": args.benchmark,
+        "libero_root": args.libero_root,
+        "libero_variant": args.libero_variant,
         "task_order_index": args.task_order_index,
         "checkpoint": args.checkpoint,
+        "model_type": args.model_type,
         "num_eval": args.num_eval,
+        "init_state_index_offset": args.init_state_index_offset,
         "max_steps": args.max_steps,
+        "task_start": args.task_start,
+        "task_end": args.task_end if args.task_end >= 0 else benchmark.n_tasks,
         "results": {},
     }
 
     for task_id in task_ids:
         task = benchmark.get_task(task_id)
         print(f"[eval] task_id={task_id} name={task.name} lang='{task.language}'")
-        success_rate, video_path = evaluate_one_task(args, model, task, task_id=task_id)
+        success_rate, video_path, successful_init_state_indices = evaluate_one_task(
+            args,
+            model,
+            task,
+            task_id=task_id,
+            benchmark=benchmark,
+        )
         results["results"][str(task_id)] = {
             "task_name": task.name,
             "language": task.language,
             "success_rate": success_rate,
+            "successful_init_state_indices": successful_init_state_indices,
         }
         if video_path is not None:
             results["results"][str(task_id)]["video_path"] = video_path
@@ -361,6 +429,18 @@ def main(args):
         )
     else:
         results["mean_success_rate"] = 0.0
+
+    if args.aggregate_plus_categories:
+        category_rates = aggregate_plus_categories(
+            args.benchmark,
+            results["results"],
+            args.libero_root,
+        )
+        if category_rates:
+            results["category_success_rates"] = category_rates
+            results["category_mean_success_rate"] = float(
+                np.mean(list(category_rates.values()))
+            )
 
     save_results(str(args.output_file), round_floats(results))
     print(f"Saved results to {args.output_file}")

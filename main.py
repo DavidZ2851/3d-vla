@@ -6,6 +6,9 @@ from pathlib import Path
 import sys
 import datetime
 
+os.environ["MOTION_EXPERT_USE_FLASH_ATTN_VARLEN"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 
 from datasets import fetch_dataset_class
@@ -95,6 +98,9 @@ def parse_arguments():
         # Training-only conditioning dropout for grounding-conditioned policies.
         # Samples dropped here are trained exactly like inference: no grounding token.
         ('grounding_dropout_prob', float, 0.0),
+        # Optional RoboTwin2 rel_action stats JSON for action normalization.
+        ('robotwin2_action_stats', str_none, None),
+        ('robotwin2_relative_rotation', str2bool, False),
         # Motion Expert latent conditioning.
         ('motion_expert_config', str_none, None),
         ('motion_expert_checkpoint', str_none, None),
@@ -103,6 +109,19 @@ def parse_arguments():
         ('motion_finetune', str2bool, True),
         ('motion_scene_fusion', str2bool, True),
         ('motion_action_fusion', str2bool, True),
+        # Joint-action decoder (flower_actor_3d_motion_latent_joint / flower_actor_2d_joint).
+        ('joint_action_dim', int, 7),
+        ('joint_proprio_dim', int, 8),
+        ('gripper_dim', int, 1),
+        ('joint_num_layers', int, 4),
+        # 0 -> share the backbone embedding_dim / num_attn_heads.
+        ('joint_embedding_dim', int, 0),
+        ('joint_num_attn_heads', int, 0),
+        ('joint_loss_weight', float, 1.0),
+        ('joint_action_weight', float, 30.0),
+        # Number of 3D scene cameras the 2D ablation (flower_actor_2d*) tags with
+        # camera-id embeddings. CALVIN/LIBERO: 2; RoboTwin2 head/left/right: 3.
+        ('num_camera_ids', int, 2),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
@@ -110,10 +129,28 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def suppress_output_on_non_main():
+def suppress_output_on_non_main(log_dir=None):
     if int(os.environ.get("RANK", 0)) != 0:
-        sys.stdout = open(os.devnull, "w")
-        sys.stderr = open(os.devnull, "w")
+        if os.environ.get("FLOWERVLA_KEEP_NON_MAIN_OUTPUT", "0") == "1":
+            return
+        if log_dir is not None and os.environ.get("FLOWERVLA_RANK_LOGS", "1") != "0":
+            rank = int(os.environ.get("RANK", 0))
+            local_rank = int(os.environ.get("LOCAL_RANK", rank))
+            rank_log_dir = Path(log_dir) / "rank_logs"
+            rank_log_dir.mkdir(exist_ok=True, parents=True)
+            sys.stdout = open(
+                rank_log_dir / f"rank{rank}_local{local_rank}.out",
+                "a",
+                buffering=1,
+            )
+            sys.stderr = open(
+                rank_log_dir / f"rank{rank}_local{local_rank}.err",
+                "a",
+                buffering=1,
+            )
+        else:
+            sys.stdout = open(os.devnull, "w")
+            sys.stderr = open(os.devnull, "w")
 
 
 if __name__ == '__main__':
@@ -137,7 +174,7 @@ if __name__ == '__main__':
     )
     print("Device count:", torch.cuda.device_count())
     args.local_rank = int(os.environ["LOCAL_RANK"])
-    suppress_output_on_non_main()
+    suppress_output_on_non_main(log_dir)
 
     # DDP initialization
     torch.cuda.set_device(args.local_rank)

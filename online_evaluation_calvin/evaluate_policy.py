@@ -84,6 +84,12 @@ def parse_arguments():
         ('motion_finetune', str2bool, False),
         ('motion_scene_fusion', str2bool, True),
         ('motion_action_fusion', str2bool, False),
+        # Model arguments: joint-angle decoder (flower_actor_3d_motion_latent_joint)
+        ('joint_action_dim', int, 7),
+        ('joint_proprio_dim', int, 8),
+        ('joint_num_layers', int, 4),
+        ('joint_embedding_dim', int, 0),
+        ('joint_num_attn_heads', int, 0),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
@@ -221,7 +227,18 @@ def rollout(env, model, task_oracle, subtask, lang, verbose=True):
             # - cartesian_abs / cartesian_rel: dict with pos, euler, gripper chunks
             # - relative_array: bare length-7 ndarray -> relative_to_absolute (NOT absolute pose)
             exec_mode = getattr(model, "calvin_action_exec", "cartesian_abs")
-            if exec_mode == "relative_array":
+            if exec_mode == "joint_abs":
+                # Joint-space command: 7 absolute arm-joint targets (radians) +
+                # discrete gripper. calvin_env robot.apply_action sends these
+                # straight to POSITION_CONTROL (no IK). trajectory is (1, T, 8).
+                step_action = np.asarray(trajectory[0, act_ind], dtype=np.float64).reshape(8)
+                step_action[7] = 1 if step_action[7] > 0 else -1
+                if verbose:
+                    pbar.set_description(f"step: {step}")
+                obs, _, _, current_info = env.step(
+                    {"action": step_action, "type": "joint_abs"}
+                )
+            elif exec_mode == "relative_array":
                 step_action = np.asarray(trajectory[0, act_ind], dtype=np.float64).reshape(7)
                 step_action[6] = 1 if step_action[6] > 0 else -1
                 if verbose:
@@ -230,8 +247,8 @@ def rollout(env, model, task_oracle, subtask, lang, verbose=True):
             else:
                 if exec_mode not in ("cartesian_abs", "cartesian_rel"):
                     raise ValueError(
-                        f"Unknown calvin_action_exec={exec_mode!r}; "
-                        "use 'cartesian_abs', 'cartesian_rel', or 'relative_array'"
+                        f"Unknown calvin_action_exec={exec_mode!r}; use "
+                        "'cartesian_abs', 'cartesian_rel', 'relative_array', or 'joint_abs'"
                     )
                 curr_action = {
                     "action": [
@@ -270,10 +287,18 @@ def main(args):
     # Load a custom model wrapper
     model = create_model(args)
 
+    # Optional per-action-chunk inference timing during live rollouts (BENCH_TIMING=1).
+    from online_evaluation_calvin._bench_timing import maybe_install
+    bench_timer = maybe_install(model)
+
     # Split sequence indices for multi-processing
     sequence_indices = list(
         range(args.local_rank, NUM_SEQUENCES, int(os.environ["WORLD_SIZE"]))
     )
+    # Cap the number of sequences when benchmarking a handful of rollouts.
+    bench_max_seq = os.environ.get("BENCH_MAX_SEQ")
+    if bench_max_seq is not None:
+        sequence_indices = sequence_indices[: int(bench_max_seq)]
 
     # Make environment
     env = get_env(args.merged_config_file, show_gui=False)
@@ -285,6 +310,14 @@ def main(args):
                     eval_log_dir=args.base_log_dir,
                     sequence_indices=sequence_indices,
                     save_video=args.save_video)
+
+    if bench_timer is not None:
+        bench_timer.restore()
+        bench_timer.report(
+            tag=f"{args.model_type}",
+            pred_len=args.pred_len,
+            json_out=os.environ.get("BENCH_JSON_OUT"),
+        )
 
     # Gather statistics from the whole dataset
     results, _ = collect_results(args.base_log_dir)

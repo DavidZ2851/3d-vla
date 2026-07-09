@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import bisect
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from glob import glob
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -40,6 +43,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--package", type=Path, default=DEFAULT_PACKAGE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--stage",
+        choices=("track", "predict", "all"),
+        default="all",
+        help=(
+            "`track` only runs SpaTracker and writes --package. "
+            "`predict` loads --package and runs MotionExpert + rendering. "
+            "`all` preserves the original single-command behavior."
+        ),
+    )
     parser.add_argument("--rerun-tracking", action="store_true")
     parser.add_argument(
         "--calvin-root",
@@ -47,13 +60,31 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "CALVIN split directory containing lang_annotations/auto_lang_ann.npy "
-            "and episode_*.npz. Required with --rerun-tracking."
+            "and episode_*.npz. Required with --stage track or --rerun-tracking."
         ),
     )
     parser.add_argument("--ann-id", type=int, default=None)
     parser.add_argument("--unit-index", type=int, default=0)
     parser.add_argument("--query-index", type=int, default=0)
     parser.add_argument("--future-len", type=int, default=15)
+    parser.add_argument(
+        "--track-step",
+        type=int,
+        default=3,
+        help="Raw CALVIN frame stride between supervised future trajectory steps.",
+    )
+    parser.add_argument(
+        "--query-stride-raw",
+        type=int,
+        default=45,
+        help="Raw CALVIN frame stride between query chunks. Default is 15 future steps * 3 raw frames.",
+    )
+    parser.add_argument(
+        "--max-query-chunks",
+        type=int,
+        default=-1,
+        help="Optional cap on query chunks saved/predicted/rendered. Negative means all chunks.",
+    )
     parser.add_argument("--query-grid-size", type=int, default=20)
     parser.add_argument("--motion-annotation-root", type=Path, default=DEFAULT_MOTION_ANNOTATION_ROOT)
     parser.add_argument("--spatracker-root", type=Path, default=DEFAULT_SPATRACKER_ROOT)
@@ -75,15 +106,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--fps", type=int, default=12)
-    parser.add_argument("--video-frames", type=int, default=96)
+    parser.add_argument(
+        "--raw-rgb-video",
+        type=Path,
+        default=None,
+        help="Optional path for the raw RGB MP4 saved during --stage track.",
+    )
+    parser.add_argument(
+        "--skip-raw-rgb-video",
+        action="store_true",
+        help="Do not save the raw RGB MP4 during --stage track.",
+    )
+    parser.add_argument(
+        "--video-frames",
+        type=int,
+        default=16,
+        help="Rendered frames per query chunk. Default is query anchor + 15 future steps.",
+    )
     parser.add_argument("--pcd-stride", type=int, default=2)
     parser.add_argument("--pcd-max-points", type=int, default=45000)
     parser.add_argument("--crop-padding", type=float, default=0.12)
     parser.add_argument("--motion-threshold", type=float, default=0.002)
     parser.add_argument("--max-moving-points", type=int, default=240)
-    parser.add_argument("--anchor-size", type=float, default=34.0)
-    parser.add_argument("--line-width", type=float, default=1.6)
-    parser.add_argument("--scene-alpha", type=float, default=0.38)
+    parser.add_argument("--anchor-size", type=float, default=5.0)
+    parser.add_argument("--line-width", type=float, default=3.0)
+    parser.add_argument("--gt-line-width", type=float, default=2.4)
+    parser.add_argument("--scene-alpha", type=float, default=1.0)
+    parser.add_argument("--scene-point-size", type=float, default=1.25)
+    parser.add_argument("--scene-color-gain", type=float, default=1.8)
+    parser.add_argument(
+        "--camera-zoom",
+        type=float,
+        default=1.35,
+        help="Pointcloud render zoom multiplier. Larger values move the visualization camera closer.",
+    )
+    parser.add_argument("--query-color", type=str, default="#7dd3fc")
+    parser.add_argument("--pred-color", type=str, default="#00d084")
+    parser.add_argument("--gt-color", type=str, default="#ff4f9a")
     parser.add_argument("--dpi", type=int, default=150)
     parser.add_argument("--save-predictions", action="store_true", default=True)
     parser.add_argument("--skip-predict", action="store_true")
@@ -240,9 +299,137 @@ def _future_abs_from_delta(anchor_xyz: np.ndarray, delta_xyz: np.ndarray) -> np.
     return anchor_xyz[:, None, :] + np.cumsum(delta_xyz, axis=1)
 
 
+def _write_rgb_video(frames: np.ndarray, output_path: Path, fps: int) -> Path:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg was not found in PATH; cannot write raw RGB MP4.")
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        raise ValueError(f"Expected RGB frames with shape (T,H,W,3), got {frames.shape}.")
+    rgb = np.ascontiguousarray(np.asarray(frames, dtype=np.uint8))
+    height, width = int(rgb.shape[1]), int(rgb.shape[2])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(max(1, int(fps))),
+        "-i",
+        "-",
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-pix_fmt",
+        "yuv420p",
+        "-vcodec",
+        "libx264",
+        str(output_path),
+    ]
+    proc = subprocess.run(cmd, input=rgb.tobytes(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"ffmpeg failed writing {output_path}:\n{stderr}")
+    print(f"[calvin-pointworld] saved raw RGB video: {output_path} frames={rgb.shape[0]}")
+    return output_path
+
+
+def _ensure_local_package_available(package_name: str) -> Optional[Path]:
+    if importlib.util.find_spec(package_name) is not None:
+        return None
+
+    candidate_roots: List[Path] = []
+    env_root = Path("/data/user_data/ziyinx/miniconda3_more/envs")
+    if env_root.exists():
+        for site_packages in sorted(glob(str(env_root / "*" / "lib" / "python*" / "site-packages"))):
+            candidate_roots.append(Path(site_packages))
+
+    for site_packages in candidate_roots:
+        pkg_dir = site_packages / package_name
+        if pkg_dir.is_dir() and (pkg_dir / "__init__.py").exists():
+            bridge_root = Path(tempfile.mkdtemp(prefix=f"{package_name}_bridge_"))
+            bridged_pkg = bridge_root / package_name
+            shutil.copytree(pkg_dir, bridged_pkg, dirs_exist_ok=True)
+            sys.path.insert(0, str(bridge_root))
+            if importlib.util.find_spec(package_name) is not None:
+                return bridge_root
+            try:
+                sys.path.remove(str(bridge_root))
+            except ValueError:
+                pass
+    return None
+
+
+def _ensure_utils3d_available() -> Optional[Path]:
+    return _ensure_local_package_available("utils3d")
+
+
+def _ensure_flow_vis_available() -> Optional[Path]:
+    return _ensure_local_package_available("flow_vis")
+
+
+def _build_calvin_manifest_rows_resilient(ma: Any, calvin_root: Path) -> List[Any]:
+    ann = ma.load_calvin_lang_annotations(calvin_root)
+    bounds = np.asarray(ma.load_calvin_rollout_bounds(calvin_root), dtype=np.int64)
+    if bounds.ndim != 2 or bounds.shape[1] != 2:
+        raise ValueError(f"Unexpected CALVIN rollout bounds shape: {bounds.shape}")
+
+    order = np.argsort(bounds[:, 0], kind="stable")
+    bounds_sorted = bounds[order]
+    rollout_starts = bounds_sorted[:, 0].tolist()
+    instructions = list(ann["language"]["ann"])
+    spans = list(ann["info"]["indx"])
+    if len(instructions) != len(spans):
+        raise ValueError(
+            f"CALVIN annotation mismatch: {len(instructions)} instructions vs {len(spans)} spans"
+        )
+
+    rows: List[Any] = []
+    for ann_id, (instruction, span) in enumerate(zip(instructions, spans)):
+        global_start = int(span[0])
+        global_end = int(span[1])
+        rollout_index = bisect.bisect_right(rollout_starts, global_start) - 1
+        if rollout_index < 0:
+            raise ValueError(f"Annotation {ann_id} starts before the first rollout: {global_start}")
+        rollout_start = int(bounds_sorted[rollout_index, 0])
+        rollout_end = int(bounds_sorted[rollout_index, 1])
+        if global_start < rollout_start or global_end > rollout_end:
+            raise ValueError(
+                "Annotation span crosses rollout boundary even after sorting bounds: "
+                f"ann_id={ann_id} span=({global_start}, {global_end}) "
+                f"rollout={rollout_index} bounds=({rollout_start}, {rollout_end})"
+            )
+        rows.append(
+            ma.CalvinManifestRow(
+                ann_id=ann_id,
+                instruction=str(instruction).strip(),
+                rollout_index=rollout_index,
+                global_start=global_start,
+                global_end=global_end,
+                local_start=global_start - rollout_start,
+                local_end=global_end - rollout_start,
+                length=global_end - global_start + 1,
+            )
+        )
+
+    rows.sort(key=lambda row: (row.rollout_index, row.local_start, row.ann_id))
+    return rows
+
+
 def rerun_tracking_and_save_package(args: argparse.Namespace) -> Path:
     if args.calvin_root is None:
         raise ValueError("--calvin-root is required when --rerun-tracking is set.")
+    injected_utils3d = _ensure_utils3d_available()
+    if injected_utils3d is not None:
+        print(f"[calvin-pointworld] using local utils3d from {injected_utils3d}")
+    injected_flow_vis = _ensure_flow_vis_available()
+    if injected_flow_vis is not None:
+        print(f"[calvin-pointworld] using local flow_vis from {injected_flow_vis}")
     ma_root = args.motion_annotation_root.resolve()
     if str(ma_root) not in sys.path:
         sys.path.insert(0, str(ma_root))
@@ -254,7 +441,7 @@ def rerun_tracking_and_save_package(args: argparse.Namespace) -> Path:
     if manifest_path.exists():
         rows = ma.load_calvin_manifest(manifest_path)
     else:
-        rows = ma.build_calvin_manifest_rows(training_root)
+        rows = _build_calvin_manifest_rows_resilient(ma, training_root)
         ma.save_calvin_manifest(manifest_path, rows)
     if args.ann_id is not None:
         matches = [row for row in rows if int(row.ann_id) == int(args.ann_id)]
@@ -272,6 +459,33 @@ def rerun_tracking_and_save_package(args: argparse.Namespace) -> Path:
         raise IndexError(
             f"--query-index must be in [0, {ep_data.rgb.shape[0] - 1}) for this segment."
         )
+    future_len = int(args.future_len)
+    track_step = int(args.track_step)
+    query_stride_raw = int(args.query_stride_raw)
+    if future_len <= 0:
+        raise ValueError("--future-len must be positive.")
+    if track_step <= 0:
+        raise ValueError("--track-step must be positive.")
+    if query_stride_raw <= 0:
+        raise ValueError("--query-stride-raw must be positive.")
+
+    full_horizon = future_len * track_step
+    max_query = ep_data.rgb.shape[0] - 1 - full_horizon
+    if max_query >= query_index:
+        query_indices = list(range(query_index, max_query + 1, query_stride_raw))
+        tail_query = max(0, ep_data.rgb.shape[0] - 1 - full_horizon)
+        if tail_query not in query_indices:
+            query_indices.append(tail_query)
+    else:
+        query_indices = [query_index]
+    query_indices = sorted(set(int(q) for q in query_indices))
+    if int(args.max_query_chunks) >= 0:
+        query_indices = query_indices[: int(args.max_query_chunks)]
+    if not query_indices:
+        raise ValueError(
+            "No query chunks fit in this segment. Try a smaller --query-index, "
+            "--future-len, or --track-step."
+        )
 
     device = str(_device_from_arg(args.device))
     runner = ma.SpaTrackerOfflineRunner(
@@ -282,49 +496,106 @@ def rerun_tracking_and_save_package(args: argparse.Namespace) -> Path:
         track_num=max(int(args.spatracker_track_num), int(args.query_grid_size) ** 2),
         iters_track=int(args.spatracker_iters_track),
     )
-    datapoint, metrics = ma.build_datapoint(
-        runner=runner,
-        unit_rgb=ep_data.rgb,
-        unit_depth=ep_data.depth,
-        unit_intrinsics=ep_data.intrinsics,
-        unit_extrinsics_w2c=ep_data.extrinsics_w2c,
-        query_index=query_index,
-        future_len=int(args.future_len),
-        query_grid_size=int(args.query_grid_size),
-        track_visibility_threshold=float(args.track_visibility_threshold),
-        track_confidence_threshold=float(args.track_confidence_threshold),
-        track_jump_max_meters=float(args.track_jump_max_meters),
-    )
-    if datapoint is None:
-        raise RuntimeError(f"Motion tracking dropped this query frame: {metrics}")
 
-    end = min(query_index + int(args.future_len), ep_data.rgb.shape[0] - 1)
-    frame_slice = slice(query_index, end + 1)
+    query_uv_chunks = []
+    query_world_xyz_chunks = []
+    gt_delta_chunks = []
+    gt_abs_chunks = []
+    traj_mask_chunks = []
+    chunk_frame_indices = []
+    chunk_raw_frame_indices = []
+    metrics_json = []
+    kept_query_indices = []
+
+    for chunk_i, q in enumerate(query_indices):
+        raw_window = q + np.arange(future_len + 1, dtype=np.int32) * track_step
+        raw_window = np.clip(raw_window, 0, ep_data.rgb.shape[0] - 1).astype(np.int32)
+        actual_steps = int(np.count_nonzero(raw_window[1:] > raw_window[:-1]))
+        if actual_steps <= 0:
+            print(f"[calvin-pointworld] dropped query chunk q={q}: no future raw frames")
+            continue
+        datapoint, metrics = ma.build_datapoint(
+            runner=runner,
+            unit_rgb=ep_data.rgb[raw_window],
+            unit_depth=ep_data.depth[raw_window],
+            unit_intrinsics=ep_data.intrinsics[raw_window],
+            unit_extrinsics_w2c=ep_data.extrinsics_w2c[raw_window],
+            query_index=0,
+            future_len=actual_steps,
+            query_grid_size=int(args.query_grid_size),
+            track_visibility_threshold=float(args.track_visibility_threshold),
+            track_confidence_threshold=float(args.track_confidence_threshold),
+            track_jump_max_meters=float(args.track_jump_max_meters),
+        )
+        if datapoint is None:
+            print(f"[calvin-pointworld] dropped query chunk q={q}: {metrics}")
+            continue
+        query_uv_chunks.append(datapoint["query_uv"].astype(np.float32))
+        query_world_xyz = datapoint["query_world_xyz"].astype(np.float32)
+        gt_delta_actual = datapoint["traj_3d_xyz"].astype(np.float32)
+        gt_mask_actual = datapoint["valid_mask"].astype(bool)
+        gt_delta = np.full((gt_delta_actual.shape[0], future_len, 3), -np.inf, dtype=np.float32)
+        gt_mask = np.zeros((gt_mask_actual.shape[0], future_len), dtype=bool)
+        gt_delta[:, :actual_steps] = gt_delta_actual[:, :actual_steps]
+        gt_mask[:, :actual_steps] = gt_mask_actual[:, :actual_steps]
+        query_world_xyz_chunks.append(query_world_xyz)
+        gt_delta_chunks.append(gt_delta)
+        gt_abs_chunks.append(
+            _future_abs_from_delta(
+                query_world_xyz,
+                np.nan_to_num(gt_delta, nan=0.0, posinf=0.0, neginf=0.0),
+            ).astype(np.float32)
+        )
+        traj_mask_chunks.append(gt_mask)
+        chunk_frame_indices.append(raw_window.astype(np.int32))
+        chunk_raw_frame_indices.append(ep_data.raw_frame_indices[raw_window].astype(np.int32))
+        metrics_json.append(json.dumps(metrics))
+        kept_query_indices.append(int(q))
+        print(
+            "[calvin-pointworld] tracked chunk "
+            f"{chunk_i + 1}/{len(query_indices)} q={q} raw={int(ep_data.raw_frame_indices[q])}"
+        )
+
+    if not kept_query_indices:
+        raise RuntimeError("All motion tracking chunks were dropped.")
+
     package_path = args.package
     package_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         package_path,
-        rgb=ep_data.rgb[frame_slice].astype(np.uint8),
-        depth=ep_data.depth[frame_slice].astype(np.float32),
-        intrinsics=ep_data.intrinsics[frame_slice].astype(np.float32),
-        extrinsics_w2c=ep_data.extrinsics_w2c[frame_slice].astype(np.float32),
-        raw_frame_indices=ep_data.raw_frame_indices[frame_slice].astype(np.int32),
+        rgb=ep_data.rgb.astype(np.uint8),
+        depth=ep_data.depth.astype(np.float32),
+        intrinsics=ep_data.intrinsics.astype(np.float32),
+        extrinsics_w2c=ep_data.extrinsics_w2c.astype(np.float32),
+        raw_frame_indices=ep_data.raw_frame_indices.astype(np.int32),
         instruction=np.array(str(row.instruction)),
         ann_id=np.array(row.ann_id, dtype=np.int32),
         rollout_index=np.array(row.rollout_index, dtype=np.int32),
         source_query_index=np.array(query_index, dtype=np.int32),
-        package_query_frame_index=np.array(0, dtype=np.int32),
-        query_uv=datapoint["query_uv"].astype(np.float32),
-        query_world_xyz=datapoint["query_world_xyz"].astype(np.float32),
-        gt_delta_xyz=datapoint["traj_3d_xyz"].astype(np.float32),
-        gt_abs_xyz=_future_abs_from_delta(
-            datapoint["query_world_xyz"].astype(np.float32),
-            np.nan_to_num(datapoint["traj_3d_xyz"].astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0),
-        ).astype(np.float32),
-        traj_mask=datapoint["valid_mask"].astype(bool),
-        metrics_json=np.array(json.dumps(metrics)),
+        track_step=np.array(track_step, dtype=np.int32),
+        query_stride_raw=np.array(query_stride_raw, dtype=np.int32),
+        query_frame_indices=np.asarray(kept_query_indices, dtype=np.int32),
+        raw_query_frame_indices=ep_data.raw_frame_indices[np.asarray(kept_query_indices)].astype(np.int32),
+        chunk_frame_indices=np.stack(chunk_frame_indices).astype(np.int32),
+        chunk_raw_frame_indices=np.stack(chunk_raw_frame_indices).astype(np.int32),
+        query_uv=np.stack(query_uv_chunks).astype(np.float32),
+        query_world_xyz=np.stack(query_world_xyz_chunks).astype(np.float32),
+        gt_delta_xyz=np.stack(gt_delta_chunks).astype(np.float32),
+        gt_abs_xyz=np.stack(gt_abs_chunks).astype(np.float32),
+        traj_mask=np.stack(traj_mask_chunks).astype(bool),
+        metrics_json=np.asarray(metrics_json),
     )
-    print(f"[calvin-pointworld] saved RGB-D/GT package: {package_path}")
+    print(
+        "[calvin-pointworld] saved RGB-D/GT package: "
+        f"{package_path} chunks={len(kept_query_indices)}"
+    )
+    if not bool(args.skip_raw_rgb_video):
+        raw_rgb_video_path = (
+            args.raw_rgb_video
+            if args.raw_rgb_video is not None
+            else package_path.with_name(f"{package_path.stem}_raw_rgb.mp4")
+        )
+        _write_rgb_video(ep_data.rgb, raw_rgb_video_path, int(args.fps))
     return package_path
 
 
@@ -449,19 +720,48 @@ def predict_tracks(
     intr_seq = np.asarray(package["intrinsics"], dtype=np.float32)
     ext_seq = np.asarray(package["extrinsics_w2c"], dtype=np.float32)
 
-    for frame_idx in frame_indices:
-        query_uv, query_xyz, query_valid = _query_world_xyz_from_rgbd(
-            depth_seq[frame_idx],
-            intr_seq[frame_idx],
-            ext_seq[frame_idx],
-            int(model_cfg.grid_size),
-        )
-        gt_delta = None
-        gt_mask = None
-        package_query_frame = int(np.asarray(package.get("package_query_frame_index", 0)).item())
-        if frame_idx == package_query_frame and "gt_delta_xyz" in package:
-            gt_delta = np.asarray(package["gt_delta_xyz"], dtype=np.float32)
-            gt_mask = np.asarray(package["traj_mask"], dtype=bool)
+    if "query_frame_indices" in package:
+        query_frame_indices = np.asarray(package["query_frame_indices"], dtype=np.int32)
+        query_uv_all = np.asarray(package["query_uv"], dtype=np.float32)
+        query_xyz_all = np.asarray(package["query_world_xyz"], dtype=np.float32)
+        gt_delta_all = np.asarray(package["gt_delta_xyz"], dtype=np.float32)
+        gt_mask_all = np.asarray(package["traj_mask"], dtype=bool)
+        chunk_frame_indices_all = np.asarray(package["chunk_frame_indices"], dtype=np.int32)
+    else:
+        query_frame_indices = np.asarray(frame_indices, dtype=np.int32)
+        query_uv_all = None
+        query_xyz_all = None
+        gt_delta_all = None
+        gt_mask_all = None
+        chunk_frame_indices_all = None
+
+    chunk_count = int(query_frame_indices.shape[0])
+    if int(args.max_query_chunks) >= 0:
+        chunk_count = min(chunk_count, int(args.max_query_chunks))
+
+    for chunk_idx in range(chunk_count):
+        frame_idx = int(query_frame_indices[chunk_idx])
+        if query_uv_all is not None and query_xyz_all is not None:
+            query_uv = query_uv_all[chunk_idx]
+            query_xyz = query_xyz_all[chunk_idx]
+            query_valid = np.isfinite(query_xyz).all(axis=1) & (np.linalg.norm(query_xyz, axis=1) > 1e-8)
+            gt_delta = gt_delta_all[chunk_idx] if gt_delta_all is not None else None
+            gt_mask = gt_mask_all[chunk_idx] if gt_mask_all is not None else None
+            chunk_frame_indices = (
+                chunk_frame_indices_all[chunk_idx]
+                if chunk_frame_indices_all is not None
+                else None
+            )
+        else:
+            query_uv, query_xyz, query_valid = _query_world_xyz_from_rgbd(
+                depth_seq[frame_idx],
+                intr_seq[frame_idx],
+                ext_seq[frame_idx],
+                int(model_cfg.grid_size),
+            )
+            gt_delta = None
+            gt_mask = None
+            chunk_frame_indices = None
 
         batch = _make_motion_batch(
             model_cfg=model_cfg,
@@ -477,11 +777,15 @@ def predict_tracks(
         pred_delta = outputs["pred_delta_xyz"].detach().cpu().float().numpy()[0]
         predictions.append(
             {
+                "chunk_idx": int(chunk_idx),
                 "frame_idx": int(frame_idx),
+                "chunk_frame_indices": chunk_frame_indices,
                 "query_uv": query_uv,
                 "query_world_xyz": query_xyz,
                 "query_valid": query_valid,
                 "pred_delta_xyz": pred_delta,
+                "gt_delta_xyz": gt_delta,
+                "traj_mask": gt_mask,
                 "instruction": instruction,
                 "metrics": {
                     key: float(value.detach().cpu().item())
@@ -492,7 +796,8 @@ def predict_tracks(
         )
         print(
             "[calvin-pointworld] predicted "
-            f"frame={frame_idx} valid_query_points={int(query_valid.sum())}/{query_valid.size}"
+            f"chunk={chunk_idx} frame={frame_idx} "
+            f"valid_query_points={int(query_valid.sum())}/{query_valid.size}"
         )
     return predictions
 
@@ -534,6 +839,256 @@ def _set_3d_limits(ax, center: np.ndarray, radius: float, zoom: float) -> None:
     ax.set_xlim(center[0] - r, center[0] + r)
     ax.set_ylim(center[1] - r, center[1] + r)
     ax.set_zlim(center[2] - r, center[2] + r)
+
+
+def _select_motion_points_for_render(
+    query_xyz: np.ndarray,
+    pred_delta: np.ndarray,
+    query_valid: np.ndarray,
+    *,
+    gt_delta: Optional[np.ndarray],
+    gt_mask: Optional[np.ndarray],
+    motion_threshold: float,
+    max_points: int,
+) -> np.ndarray:
+    pred_cumulative = np.cumsum(np.nan_to_num(pred_delta, nan=0.0, posinf=0.0, neginf=0.0), axis=1)
+    motion = np.linalg.norm(pred_cumulative, axis=-1).max(axis=1)
+    if gt_delta is not None:
+        gt_delta_safe = np.nan_to_num(gt_delta, nan=0.0, posinf=0.0, neginf=0.0)
+        if gt_mask is not None:
+            gt_delta_safe = np.where(gt_mask[..., None], gt_delta_safe, 0.0)
+        gt_cumulative = np.cumsum(gt_delta_safe, axis=1)
+        motion = np.maximum(motion, np.linalg.norm(gt_cumulative, axis=-1).max(axis=1))
+
+    valid = query_valid & np.isfinite(query_xyz).all(axis=1) & (motion > float(motion_threshold))
+    idx = np.where(valid)[0]
+    if idx.size == 0:
+        idx = np.where(query_valid & np.isfinite(query_xyz).all(axis=1))[0]
+    if idx.size > max_points:
+        order = np.argsort(motion[idx])[::-1][:max_points]
+        idx = idx[order]
+    return idx.astype(np.int64)
+
+
+def _render_episode_video(
+    *,
+    package: Dict[str, Any],
+    predictions: Sequence[Dict[str, Any]],
+    output_path: Path,
+    args: argparse.Namespace,
+    include_gt: bool,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    rgb_seq = np.asarray(package["rgb"], dtype=np.uint8)
+    depth_seq = np.asarray(package["depth"], dtype=np.float32)
+    intr_seq = np.asarray(package["intrinsics"], dtype=np.float32)
+    ext_seq = np.asarray(package["extrinsics_w2c"], dtype=np.float32)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="calvin_pointworld_episode_"))
+    fig = plt.figure(figsize=(7.4, 7.4), dpi=int(args.dpi))
+    ax = fig.add_subplot(111, projection="3d")
+    fig.patch.set_facecolor("white")
+
+    requested_frames_per_chunk = max(2, int(args.video_frames))
+    total_requested_frames = max(1, len(predictions) * requested_frames_per_chunk)
+    frame_id = 0
+    last_scene_frame_idx = -1
+    try:
+        for pred in predictions:
+            query_xyz = np.asarray(pred["query_world_xyz"], dtype=np.float32)
+            pred_delta = np.asarray(pred["pred_delta_xyz"], dtype=np.float32)
+            query_valid = np.asarray(pred["query_valid"], dtype=bool)
+            gt_delta = pred.get("gt_delta_xyz")
+            gt_mask = pred.get("traj_mask")
+            if gt_delta is not None:
+                gt_delta = np.asarray(gt_delta, dtype=np.float32)
+            if gt_mask is not None:
+                gt_mask = np.asarray(gt_mask, dtype=bool)
+
+            keep_idx = _select_motion_points_for_render(
+                query_xyz,
+                pred_delta,
+                query_valid,
+                gt_delta=gt_delta if include_gt else None,
+                gt_mask=gt_mask if include_gt else None,
+                motion_threshold=float(args.motion_threshold),
+                max_points=int(args.max_moving_points),
+            )
+            pred_abs = _future_abs_from_delta(query_xyz, np.nan_to_num(pred_delta))
+            gt_abs = None
+            if include_gt and gt_delta is not None:
+                gt_delta_safe = np.nan_to_num(gt_delta, nan=0.0, posinf=0.0, neginf=0.0)
+                if gt_mask is not None:
+                    gt_delta_safe = np.where(gt_mask[..., None], gt_delta_safe, 0.0)
+                gt_abs = _future_abs_from_delta(query_xyz, gt_delta_safe)
+
+            future_steps = int(pred_delta.shape[1])
+            chunk_frame_indices = pred.get("chunk_frame_indices")
+            if chunk_frame_indices is None:
+                chunk_frame_indices = np.arange(int(pred["frame_idx"]), int(pred["frame_idx"]) + future_steps + 1)
+            chunk_frame_indices = np.asarray(chunk_frame_indices, dtype=np.int32)
+            visible_start_pos = int(np.searchsorted(chunk_frame_indices, last_scene_frame_idx, side="right"))
+            visible_start_pos = max(0, min(visible_start_pos, future_steps))
+            if visible_start_pos >= len(chunk_frame_indices):
+                continue
+
+            if visible_start_pos == 0:
+                visible_anchor_xyz = query_xyz
+                visible_pred_tail = pred_abs
+                visible_gt_tail = gt_abs
+            else:
+                visible_anchor_xyz = pred_abs[:, visible_start_pos - 1]
+                visible_pred_tail = pred_abs[:, visible_start_pos - 1 :]
+                visible_gt_tail = gt_abs[:, visible_start_pos - 1 :] if gt_abs is not None else None
+
+            focus_parts = [visible_anchor_xyz[keep_idx]]
+            if keep_idx.size > 0:
+                focus_parts.append(visible_pred_tail[keep_idx].reshape(-1, 3))
+                if visible_gt_tail is not None:
+                    focus_parts.append(visible_gt_tail[keep_idx].reshape(-1, 3))
+            focus_points = np.concatenate(focus_parts, axis=0) if focus_parts else visible_anchor_xyz[query_valid]
+            center, radius = _axis_limits_for_focus(focus_points, float(args.crop_padding))
+
+            for video_i in range(requested_frames_per_chunk):
+                local_phase = video_i / float(max(requested_frames_per_chunk - 1, 1))
+                hist_count = min(int(round(local_phase * future_steps)), future_steps)
+                scene_frame_idx = int(chunk_frame_indices[min(hist_count, len(chunk_frame_indices) - 1)])
+                scene_frame_idx = max(0, min(scene_frame_idx, rgb_seq.shape[0] - 1))
+                if scene_frame_idx <= last_scene_frame_idx:
+                    continue
+
+                scene_points, scene_colors = _rgbd_to_world_cloud(
+                    rgb_seq[scene_frame_idx],
+                    depth_seq[scene_frame_idx],
+                    intr_seq[scene_frame_idx],
+                    ext_seq[scene_frame_idx],
+                    stride=max(1, int(args.pcd_stride)),
+                    max_points=max(1, int(args.pcd_max_points)),
+                )
+                scene_keep = np.isfinite(scene_points).all(axis=1)
+                scene_keep &= np.linalg.norm(scene_points - center[None], axis=1) <= radius * 1.8
+                if np.any(scene_keep):
+                    scene_points_plot = scene_points[scene_keep]
+                    scene_colors_plot = scene_colors[scene_keep]
+                else:
+                    scene_points_plot = scene_points
+                    scene_colors_plot = scene_colors
+                scene_colors_plot = np.clip(scene_colors_plot * float(args.scene_color_gain), 0.0, 1.0)
+
+                ax.cla()
+                if scene_points_plot.size:
+                    ax.scatter(
+                        scene_points_plot[:, 0],
+                        scene_points_plot[:, 1],
+                        scene_points_plot[:, 2],
+                        c=scene_colors_plot,
+                        s=float(args.scene_point_size),
+                        alpha=float(args.scene_alpha),
+                        linewidths=0,
+                        depthshade=False,
+                )
+                if keep_idx.size > 0:
+                    anchors = visible_anchor_xyz[keep_idx]
+                    ax.scatter(
+                        anchors[:, 0],
+                        anchors[:, 1],
+                        anchors[:, 2],
+                        color=str(args.query_color),
+                        s=float(args.anchor_size),
+                        alpha=0.95,
+                        depthshade=False,
+                    )
+                if hist_count >= visible_start_pos:
+                    for point_idx in keep_idx.tolist():
+                        if visible_start_pos == 0:
+                            pred_poly = np.concatenate(
+                                [query_xyz[point_idx][None], pred_abs[point_idx, :hist_count]],
+                                axis=0,
+                            )
+                        else:
+                            pred_poly = pred_abs[point_idx, visible_start_pos - 1 : hist_count]
+                        if pred_poly.shape[0] >= 2:
+                            ax.plot(
+                                pred_poly[:, 0],
+                                pred_poly[:, 1],
+                                pred_poly[:, 2],
+                                color=str(args.pred_color),
+                                linewidth=float(args.line_width),
+                                alpha=0.95,
+                            )
+                        if gt_abs is not None:
+                            if visible_start_pos == 0:
+                                valid_count = hist_count
+                                if gt_mask is not None:
+                                    valid_count = min(valid_count, int(gt_mask[point_idx, :hist_count].sum()))
+                                gt_poly = np.concatenate(
+                                    [query_xyz[point_idx][None], gt_abs[point_idx, :valid_count]],
+                                    axis=0,
+                                )
+                            else:
+                                gt_start = visible_start_pos - 1
+                                gt_poly = gt_abs[point_idx, gt_start:hist_count]
+                                if gt_mask is not None:
+                                    gt_valid = gt_mask[point_idx, gt_start:hist_count]
+                                    gt_poly = gt_poly[gt_valid]
+                            if gt_poly.shape[0] >= 2:
+                                ax.plot(
+                                    gt_poly[:, 0],
+                                    gt_poly[:, 1],
+                                    gt_poly[:, 2],
+                                    color=str(args.gt_color),
+                                    linewidth=float(args.gt_line_width),
+                                    alpha=0.9,
+                                )
+
+                global_phase = frame_id / float(max(total_requested_frames - 1, 1))
+                zoom = float(args.camera_zoom) * (1.0 + 0.35 * global_phase)
+                azim = -68.0 + 32.0 * global_phase
+                elev = 24.0 + 4.0 * np.sin(global_phase * np.pi)
+                _set_3d_limits(ax, center, radius, zoom)
+                ax.view_init(elev=elev, azim=azim)
+                ax.set_axis_off()
+                ax.set_box_aspect((1, 1, 1))
+                fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+                fig.savefig(
+                    tmp_dir / f"frame_{frame_id:05d}.png",
+                    facecolor=fig.get_facecolor(),
+                    bbox_inches="tight",
+                    pad_inches=0,
+                )
+                frame_id += 1
+                last_scene_frame_idx = scene_frame_idx
+
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("ffmpeg was not found in PATH; cannot write MP4.")
+        render_fps = max(1, int(round(float(args.fps) * 0.5)))
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-framerate",
+            str(render_fps),
+            "-i",
+            str(tmp_dir / "frame_%05d.png"),
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+            "-vcodec",
+            "libx264",
+            str(output_path),
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed writing {output_path}:\n{proc.stderr}")
+    finally:
+        plt.close(fig)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    print(f"[calvin-pointworld] rendered episode video={output_path} frames={frame_id} fps={render_fps}")
+    return output_path
 
 
 def _render_prediction_video(
@@ -688,6 +1243,12 @@ def _save_predictions(path: Path, predictions: Sequence[Dict[str, Any]]) -> None
         payload[f"{prefix}_query_world_xyz"] = pred["query_world_xyz"].astype(np.float32)
         payload[f"{prefix}_query_valid"] = pred["query_valid"].astype(bool)
         payload[f"{prefix}_delta_xyz"] = pred["pred_delta_xyz"].astype(np.float32)
+        if pred.get("chunk_frame_indices") is not None:
+            payload[f"{prefix}_chunk_frame_indices"] = np.asarray(pred["chunk_frame_indices"], dtype=np.int32)
+        if pred.get("gt_delta_xyz") is not None:
+            payload[f"{prefix}_gt_delta_xyz"] = np.asarray(pred["gt_delta_xyz"], dtype=np.float32)
+        if pred.get("traj_mask") is not None:
+            payload[f"{prefix}_traj_mask"] = np.asarray(pred["traj_mask"], dtype=bool)
         payload[f"{prefix}_metrics_json"] = np.array(json.dumps(pred.get("metrics", {})))
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **payload)
@@ -699,8 +1260,13 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.rerun_tracking:
+    run_tracking = args.stage in ("track", "all") and (args.rerun_tracking or args.stage == "track")
+    if run_tracking:
         rerun_tracking_and_save_package(args)
+    if args.stage == "track":
+        print(f"[calvin-pointworld] tracking stage complete package={args.package}")
+        return
+
     package = _load_package(args.package)
     frame_indices = _parse_frame_indices(args.frame_indices, int(np.asarray(package["rgb"]).shape[0]))
 
@@ -713,14 +1279,20 @@ def main() -> None:
     if not args.skip_render:
         if not predictions:
             raise ValueError("Rendering needs predictions; omit --skip-predict or load predictions support first.")
-        for pred in predictions:
-            output_path = args.output_dir / f"pointworld_pred_frame_{int(pred['frame_idx']):03d}.mp4"
-            _render_prediction_video(
-                package=package,
-                prediction=pred,
-                output_path=output_path,
-                args=args,
-            )
+        _render_episode_video(
+            package=package,
+            predictions=predictions,
+            output_path=args.output_dir / "pointworld_pred_only.mp4",
+            args=args,
+            include_gt=False,
+        )
+        _render_episode_video(
+            package=package,
+            predictions=predictions,
+            output_path=args.output_dir / "pointworld_pred_gt.mp4",
+            args=args,
+            include_gt=True,
+        )
 
 
 if __name__ == "__main__":

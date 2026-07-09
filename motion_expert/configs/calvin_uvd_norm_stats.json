@@ -1,0 +1,28 @@
+{
+  "zarr": "/data/user_data/ziyinx/datasets/zarr_datasets/calvin_motion_uvd_zarr/train_rechunked8.zarr",
+  "num_rows_sampled": 8000,
+  "src_hw": [
+    200,
+    200
+  ],
+  "target_hw": [
+    224,
+    224
+  ],
+  "query_depth_mean": 4.290678619501367,
+  "query_depth_std": 0.5424240862196633,
+  "query_depth_count": 3200000,
+  "traj_delta_uvd_mean": [
+    0.004443782381246698,
+    0.0013797658106316233,
+    0.000373084183019643
+  ],
+  "traj_delta_uvd_scale": [
+    0.057555263287861064,
+    0.05048082797004363,
+    0.06805399388915967
+  ],
+  "traj_delta_count": 27631352,
+  "channels": "u_grid,v_grid,depth_metres",
+  "notes": "query depth is GLOBAL-standardized (no centroid centering); delta uv in [-1,1] grid units, delta depth in metres."
+}
