@@ -42,7 +42,7 @@ num_finetune_vision_layers=0
 vision_lr_scale=0.2
 projector_lr_scale=0.4
 wd=0.05
-train_iters=${TRAIN_ITERS:-600000}
+train_iters=${TRAIN_ITERS:-500000}
 use_compile=false
 use_ema=false
 grounding_dropout_prob=0.0
@@ -85,7 +85,7 @@ base_log_dir=${BASE_LOG_DIR:-${REPO_ROOT}/train_logs}
 run_log_dir=${RUN_LOG_DIR:-3dfavla_motion}
 run_dir=${base_log_dir}/${main_dir}/${run_log_dir}
 # finetune=false restores iter, optimizer, lr_scheduler, scaler, and best_loss.
-checkpoint=${CHECKPOINT:-}
+checkpoint=${CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/robotwin2/3dfavla_motion_15tasks/420k.pth}
 if [[ "${checkpoint}" == "None" ]]; then
     checkpoint=""
 fi
