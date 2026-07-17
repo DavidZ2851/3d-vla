@@ -32,5 +32,7 @@ Edits:
 /data/user_data/ziyinx/miniconda3_more/envs/3dfavla/lib/python3.10/site-packages/urdfpy/urdf.py: line 898, replace np.float with float
 
 ### Install Libero locally
+Follow https://github.com/Lifelong-Robot-Learning/LIBERO.
 
 ### Install RoboTwin2.0 locally
+Follow https://github.com/robotwin-Platform/RoboTwin.
