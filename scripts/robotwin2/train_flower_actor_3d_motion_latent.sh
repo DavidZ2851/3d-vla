@@ -72,7 +72,7 @@ denoise_timesteps=5
 denoise_model=rectified_flow
 
 motion_expert_config=${MOTION_EXPERT_CONFIG:-${REPO_ROOT}/motion_expert/configs/robotwin2_florence2.yaml}
-motion_expert_checkpoint=${MOTION_EXPERT_CHECKPOINT:-${REPO_ROOT}/train_logs/motion_expert/robotwin2_florence2/checkpoint_step_40000.pt}
+motion_expert_checkpoint=${MOTION_EXPERT_CHECKPOINT:-${REPO_ROOT}/train_logs/motion_expert/robotwin2_florence2_15tasks/checkpoint_step_40000.pt}
 motion_solver_steps=${MOTION_SOLVER_STEPS:-10}
 motion_steps_to_run=${MOTION_STEPS_TO_RUN:-1}
 motion_finetune=${MOTION_FINETUNE:-true}

@@ -34,7 +34,7 @@ SEED="${SEED:-0}"
 # How many normal eval episodes to evaluate
 NUM_EPISODES="${NUM_EPISODES:-50}"
 # Checkpoint to evaluate (default: the 15-task motion-latent ee model)
-CHECKPOINT="${CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/robotwin2/3dfavla_motion_15tasks/590k.pth}"
+CHECKPOINT="${CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/robotwin2/3dfavla_motion_15tasks/440k.pth}"
 # Motion expert checkpoint (15-task motion expert paired with the 15-task policy)
 MOTION_EXPERT_CHECKPOINT="${MOTION_EXPERT_CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/robotwin2_florence2_15tasks/checkpoint_step_40000.pt}"
 SAVE_VIDEO="${SAVE_VIDEO:-True}"
