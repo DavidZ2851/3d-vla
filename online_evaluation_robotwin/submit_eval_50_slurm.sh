@@ -34,9 +34,17 @@ SEED="${SEED:-0}"
 # How many normal eval episodes to evaluate
 NUM_EPISODES="${NUM_EPISODES:-50}"
 # Checkpoint to evaluate (default: the 15-task motion-latent ee model)
-CHECKPOINT="${CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/robotwin2/3dfavla_motion_15tasks/440k.pth}"
+CHECKPOINT="${CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/robotwin2/rw2_all/310k.pth}"
 # Motion expert checkpoint (15-task motion expert paired with the 15-task policy)
-MOTION_EXPERT_CHECKPOINT="${MOTION_EXPERT_CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/motion_expert/robotwin2_florence2_15tasks/checkpoint_step_40000.pt}"
+MOTION_EXPERT_CHECKPOINT="${MOTION_EXPERT_CHECKPOINT:-}"
+# rw2_all is the scaled-up model: policy embedding_dim 912 -> 1024 and motion
+# expert sparse_decoder.hidden_dim 320 -> 512. Both must match the checkpoint or
+# load_state_dict fails on shape mismatch. Set here (this wrapper defaults to the
+# rw2_all checkpoint) rather than in eval_robotwin_flower_actor_3d_motion_latent.sh,
+# which the 912/320 checkpoints still use. Override both together if you point
+# CHECKPOINT at a non-scaled model.
+EMBEDDING_DIM="${EMBEDDING_DIM:-1024}"
+# MOTION_EXPERT_CONFIG is set below, once REPO_ROOT is defined.
 SAVE_VIDEO="${SAVE_VIDEO:-True}"
 EXPERT_CHECK="${EXPERT_CHECK:-True}"
 # Root for this wrapper's summaries/logs. Each submission gets a fresh child
@@ -50,6 +58,9 @@ SUMMARY_ROOT="${SUMMARY_ROOT:-}"
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/data/user_data/ziyinx/analogical_manipulation_clean}"
+# Scaled-up (hidden_dim 512) motion expert config to match rw2_all. See the
+# EMBEDDING_DIM note above.
+MOTION_EXPERT_CONFIG="${MOTION_EXPERT_CONFIG:-${REPO_ROOT}/motion_expert/configs/robotwin2_florence2_large.yaml}"
 CONDA_BASE="${CONDA_BASE:-/home/ziyinx/miniconda3}"
 CONDA_ENV="${CONDA_ENV:-flowervla}"
 
@@ -155,6 +166,8 @@ SAVE_VIDEO="${SAVE_VIDEO}" \
 SUMMARY_DIR="${SUMMARY_DIR}" \
 ALLOW_NON_ZARR_TASKS=True \
 MOTION_EXPERT_CHECKPOINT="${MOTION_EXPERT_CHECKPOINT}" \
+EMBEDDING_DIM="${EMBEDDING_DIM}" \
+MOTION_EXPERT_CONFIG="${MOTION_EXPERT_CONFIG}" \
 bash "${REPO_ROOT}/online_evaluation_robotwin/eval_robotwin_flower_actor_3d_motion_latent.sh" \
   "${SPLIT}" 0 "${SEED}" "${TASK}" "${SAVE_VIDEO}"
 

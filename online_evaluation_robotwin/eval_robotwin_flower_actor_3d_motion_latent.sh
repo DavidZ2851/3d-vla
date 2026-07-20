@@ -16,7 +16,10 @@ export RELATIVE_ACTION=${RELATIVE_ACTION:-True}
 export RELATIVE_ROTATION=${RELATIVE_ROTATION:-True}
 
 export MOTION_EXPERT_CONFIG=${MOTION_EXPERT_CONFIG:-${REPO_ROOT}/motion_expert/configs/robotwin2_florence2.yaml}
-export MOTION_EXPERT_CHECKPOINT=${MOTION_EXPERT_CHECKPOINT:-${REPO_ROOT}/train_logs/motion_expert/robotwin2_florence2/checkpoint_step_20000.pt}
+# No motion-expert checkpoint at eval: the policy checkpoint already carries the
+# (finetuned) motion_expert.* weights, and load_pretrained_weights overwrites
+# anything pre-loaded here. Only the config is needed, to build the module.
+export MOTION_EXPERT_CHECKPOINT=${MOTION_EXPERT_CHECKPOINT:-None}
 export MOTION_SOLVER_STEPS=${MOTION_SOLVER_STEPS:-10}
 export MOTION_STEPS_TO_RUN=${MOTION_STEPS_TO_RUN:-1}
 export MOTION_FINETUNE=${MOTION_FINETUNE:-true}

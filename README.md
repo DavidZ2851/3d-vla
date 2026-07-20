@@ -36,3 +36,6 @@ Follow https://github.com/Lifelong-Robot-Learning/LIBERO.
 
 ### Install RoboTwin2.0 locally
 Follow https://github.com/robotwin-Platform/RoboTwin.
+
+# Checkpoints
+Check out our checkpoints for CALVIN at https://huggingface.co/ziyin123/geomvla-calvin, for LIBERO at https://huggingface.co/ziyin123/geomvla-libero, and for RoboTwin 2.0 at https://huggingface.co/ziyin123/geomvla-robotwin2.
