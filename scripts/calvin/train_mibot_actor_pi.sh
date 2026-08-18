@@ -16,7 +16,9 @@ export WANDB_API_KEY=wandb_v1_5XMh8RwiRYiNK9evDg0XSRGb9jr_lNho5y9LpqVyamQhxBkjXl
 export QWEN3VL_MODEL_PATH=/home/ziyinx/Xiaomi-Robotics-0-Pretrain
 
 DATA_PATH=/data/user_data/ziyinx/datasets
-train_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/train_rechunked8.zarr
+# CALVIN train zarr now lives on the SSD tier; override with CALVIN_DATA_ROOT.
+CALVIN_DATA_ROOT="${CALVIN_DATA_ROOT:-/data/group_data/katefgroup-ssd/world_model/ziyinx}"
+train_data_dir=${CALVIN_DATA_ROOT}/calvin_zarr/train_rechunked8.zarr
 eval_data_dir=/data/group_data/katefgroup/VLA/zarr_datasets/calvin_zarr/val_rechunked8.zarr
 train_instructions=instructions/calvin/train_instructions.json
 val_instructions=instructions/calvin/val_instructions.json

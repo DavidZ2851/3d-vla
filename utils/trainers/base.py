@@ -107,10 +107,11 @@ class BaseTrainTester:
                 qwen_tokenize_collate_fn,
                 model_name_or_path=os.environ.get("QWEN3VL_MODEL_PATH"),
             )
-        # Samplers and loaders
+        # Samplers and loaders. seed=0 reproduces the historical data order.
+        seed = getattr(self.args, "seed", 0)
         g = torch.Generator()
-        g.manual_seed(0)
-        train_sampler = DistributedSampler(train_dataset, drop_last=True)
+        g.manual_seed(seed)
+        train_sampler = DistributedSampler(train_dataset, drop_last=True, seed=seed)
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.args.batch_size // self.args.chunk_size,
@@ -224,6 +225,7 @@ class BaseTrainTester:
             "motion_finetune": getattr(self.args, "motion_finetune", True),
             "motion_scene_fusion": getattr(self.args, "motion_scene_fusion", True),
             "motion_action_fusion": getattr(self.args, "motion_action_fusion", True),
+            "motion_expert_frame": getattr(self.args, "motion_expert_frame", "world"),
             "proprio_nhand": getattr(self.args, "proprio_nhand", None),
             "joint_action_dim": getattr(self.args, "joint_action_dim", 7),
             "joint_proprio_dim": getattr(self.args, "joint_proprio_dim", 8),

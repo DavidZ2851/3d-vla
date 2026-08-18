@@ -91,6 +91,18 @@ class RoboTwin2Dataset(BaseDataset):
             return out
         return ['instruction'] * self.chunk_size
 
+    def _get_rgb_channel_fixed(self, idx, key):
+        """Undo the R<->B swap baked into the RoboTwin2 zarr.
+
+        RoboTwin2 collection encodes a true-RGB array with cv2.imencode (which
+        assumes BGR), so the stored hdf5 JPEG already decodes back to true RGB
+        via a plain cv2.imdecode. robotwin2_to_zarr._decode_rgb_bytes then
+        applies a second COLOR_BGR2RGB, which *introduces* a swap. Eval
+        (online_evaluation_robotwin/model_wrapper.py) feeds sapien "rgb"
+        untouched, so without this flip training and eval see different colors.
+        """
+        return self._get_attr_by_idx(idx, key).flip(-3)  # (..., 3, H, W)
+
     def _get_proprioception(self, idx):
         proprio = self._get_attr_by_idx(idx, 'proprioception', False)  # (B, T_his=1, nhand=2, dim=8)
         return proprio
@@ -132,9 +144,9 @@ class RoboTwin2Dataset(BaseDataset):
         return {
             "task": self._get_task(idx),
             "instr": self._get_instr(idx),
-            "rgb_head": self._get_attr_by_idx(idx, 'rgb_head'),
-            "rgb_left": self._get_attr_by_idx(idx, 'rgb_left'),
-            "rgb_right": self._get_attr_by_idx(idx, 'rgb_right'),
+            "rgb_head": self._get_rgb_channel_fixed(idx, 'rgb_head'),
+            "rgb_left": self._get_rgb_channel_fixed(idx, 'rgb_left'),
+            "rgb_right": self._get_rgb_channel_fixed(idx, 'rgb_right'),
             "depth_head": self._get_attr_by_idx(idx, 'depth_head'),
             "depth_left": self._get_attr_by_idx(idx, 'depth_left'),
             "depth_right": self._get_attr_by_idx(idx, 'depth_right'),

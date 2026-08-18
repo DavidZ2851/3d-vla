@@ -20,6 +20,9 @@ from .flower_actor import (
     FlowerActor2DMotion2D,
     FlowerActor2DCLIP,
 )
+from .flower_actor_cam import FlowerActor3DMotionLatentCam
+from .flower_actor_yaw45 import FlowerActor3DMotionLatentYaw45
+from .flower_actor_2d_motion_uvd import FlowerActor2DMotionUVD
 
 def fetch_model_class(model_type):
     if model_type == 'denoise3d':  # standard 3DFA
@@ -42,6 +45,10 @@ def fetch_model_class(model_type):
         return FlowerActor3DMotionLatent
     if model_type == 'flower_actor_3d_motion_latent_uvd':  # UVD (u,v,depth) motion expert
         return FlowerActor3DMotionLatentUVD
+    if model_type == 'flower_actor_3d_motion_latent_cam':  # anchored to CALVIN's static camera frame
+        return FlowerActor3DMotionLatentCam
+    if model_type == 'flower_actor_3d_motion_latent_yaw45':  # anchored to the robot-base yaw45 frame
+        return FlowerActor3DMotionLatentYaw45
     if model_type == 'flower_actor_3d_motion_latent_joint':  # joint-angle decoder on the 3D CoT
         return FlowerActor3DMotionLatentJoint
     if model_type == 'flower_actor_3d_motion_partial_latent':  # partially-denoised motion latent ablation
@@ -60,6 +67,8 @@ def fetch_model_class(model_type):
         return FlowerActor2DJoint
     if model_type == 'flower_actor_2d_motion_2d':
         return FlowerActor2DMotion2D
+    if model_type == 'flower_actor_2d_motion_uvd':  # LaMP-style plain-2D VLA + UVD motion expert
+        return FlowerActor2DMotionUVD
     if model_type == 'flower_actor_2d_clip':  # legacy CLIP-only 2D actor
         return FlowerActor2DCLIP
     return None

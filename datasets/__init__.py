@@ -29,6 +29,20 @@ def fetch_dataset_class(dataset_name):
         'Calvin10th': CALVINDataset,
         'CalvinContact': CALVINContactDataset,
         'CalvinContact10th': CALVINContactDataset,
+        # Static-camera-frame variants. The zarr and the dataset class are
+        # identical to the world-frame ones -- the frame change happens in
+        # CALVINCamDataPreprocessor / CALVINCamDepth2Cloud, which the three
+        # dataset-name-keyed registries select on the 'calvincam' substring.
+        'CalvinCam': CALVINDataset,
+        'CalvinCam10th': CALVINDataset,
+        'CalvinCamContact': CALVINContactDataset,
+        'CalvinCamContact10th': CALVINContactDataset,
+        # Robot-base yaw45-frame variants, selected on the 'calvinyaw45'
+        # substring by the same three registries. Same zarr, same classes.
+        'CalvinYaw45': CALVINDataset,
+        'CalvinYaw4510th': CALVINDataset,
+        'CalvinYaw45Contact': CALVINContactDataset,
+        'CalvinYaw45Contact10th': CALVINContactDataset,
         'CalvinJoint': CALVINJointDataset,
         'CalvinJoint10th': CALVINJointDataset,
         "Peract2TCSingle": SinglePeract2Dataset,

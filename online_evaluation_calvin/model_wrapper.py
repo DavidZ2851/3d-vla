@@ -8,6 +8,13 @@ from modeling.policy import fetch_model_class
 from modeling.encoder.text import fetch_tokenizers
 from utils.depth2cloud import fetch_depth2cloud
 from utils.data_preprocessors import fetch_data_preprocessor
+from utils.calvin_camera_frame import (
+    get_frame_transforms,
+    pose_frame_to_world_np,
+    pose_cam_to_world_np,
+    rel_action_frame_to_abs_world,
+    rel_action_cam_to_abs_world,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -194,12 +201,36 @@ class Model:
         # Anchor (current arm-joint angles, radians) for reconstructing absolute
         # joint targets from the model's anchor-relative deltas. Set in preprocess.
         self._joint_anchor = None
+        # Coordinate frame the policy was trained in. 'world' (default) keeps the
+        # original path byte-for-byte; 'camera' anchors observations, proprio and
+        # the action chunk to CALVIN's fixed static-camera frame (see
+        # utils/calvin_camera_frame) and converts predictions back to world
+        # before they reach the env.
+        # coord_frame -> (preprocessor registry key, utils.calvin_camera_frame name)
+        COORD_FRAMES = {
+            'world': ('calvin', 'world'),
+            'camera': ('calvincam', 'calvin_static'),
+            'yaw45': ('calvinyaw45', 'calvin_base_yaw45'),
+        }
+        self._coord_frame = str(getattr(args, "coord_frame", "world")).lower()
+        if self._coord_frame not in COORD_FRAMES:
+            raise ValueError(
+                f"--coord_frame must be one of {sorted(COORD_FRAMES)}, "
+                f"got {self._coord_frame!r}."
+            )
+        if self._coord_frame != "world" and self._is_joint_model:
+            raise ValueError(
+                f"coord_frame={self._coord_frame!r} is an EEF-space "
+                "reparameterization and does not apply to the joint-angle decoder."
+            )
+        preprocessor_key, frame_name = COORD_FRAMES[self._coord_frame]
+        self._world2frame, self._frame2world = get_frame_transforms(frame_name)
         self.policy = self.get_policy()
-        self.preprocessor = fetch_data_preprocessor('calvin')(
+        self.preprocessor = fetch_data_preprocessor(preprocessor_key)(
             keypose_only=False,
             num_history=1,
             custom_imsize=args.custom_img_size,
-            depth2cloud=fetch_depth2cloud('calvin')
+            depth2cloud=fetch_depth2cloud(preprocessor_key)
         )
         self.reset()
 
@@ -250,6 +281,7 @@ class Model:
             "motion_finetune": getattr(self.args, "motion_finetune", False),
             "motion_scene_fusion": getattr(self.args, "motion_scene_fusion", True),
             "motion_action_fusion": getattr(self.args, "motion_action_fusion", False),
+            "motion_expert_frame": getattr(self.args, "motion_expert_frame", "world"),
         }
         for key, value in motion_latent_kwargs.items():
             if key in model_init_params:
@@ -309,11 +341,17 @@ class Model:
 
     @torch.no_grad()
     def preprocess(self, obs, env):
-        real_proprio = self.preprocessor.process_actions(
-            torch.from_numpy(np.concatenate([
-                obs['robot_obs'][:6],
-                (obs['robot_obs'][[-1]] + 1) / 2
-            ], -1))[None, None, None].float()
+        proprio_world = torch.from_numpy(np.concatenate([
+            obs['robot_obs'][:6],
+            (obs['robot_obs'][[-1]] + 1) / 2
+        ], -1))[None, None, None].float()
+        # process_proprio is the frame-aware entry point (the camera-frame
+        # preprocessor overrides it); process_actions is a plain to-cuda move on
+        # both, so the world path is unchanged.
+        real_proprio = (
+            self.preprocessor.process_proprio(proprio_world)
+            if self._world2frame is not None
+            else self.preprocessor.process_actions(proprio_world)
         )  # (B=1, nhist=1, nhand=1, 7)
         proprio = real_proprio
         
@@ -404,6 +442,21 @@ class Model:
         ).view(1, self.args.pred_len, 1, 7)  # (1, T, nhand=1 or pad to 2, 7)  # NOTE: if pad to bimanual: ).view(1, self.args.pred_len, 2, 7)
         trajectory = trajectory.data.cpu().numpy()[:,:,0,:]  # (1, T, 7)
         trajectory[..., -1] = 2 * (trajectory[..., -1] >= 0.5).astype(int) - 1  # openness
+
+        if self._world2frame is not None:
+            # The policy predicts frame-local deltas off a frame-local anchor;
+            # the env still wants absolute WORLD TCP targets.
+            proprio_frame = torch.from_numpy(
+                obs['proprio'][:, [-1], 0].cpu().numpy()
+            ).double()
+            traj = torch.from_numpy(trajectory).double()
+            if bool(self.args.relative_action):
+                traj = rel_action_frame_to_abs_world(
+                    traj, proprio_frame, self._frame2world
+                )
+                return traj.numpy()
+            return pose_frame_to_world_np(trajectory, self._frame2world)
+
         # Back to absolute actions
         if bool(self.args.relative_action):
             trajectory = self._to_abs(

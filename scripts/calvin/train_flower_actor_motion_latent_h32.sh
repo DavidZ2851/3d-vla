@@ -27,7 +27,9 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
-train_data_dir="${TRAIN_DATA_DIR:-${DATA_PATH}/zarr_datasets/calvin_zarr/train_rechunked8.zarr}"
+# CALVIN train zarr now lives on the SSD tier; override with CALVIN_DATA_ROOT.
+CALVIN_DATA_ROOT="${CALVIN_DATA_ROOT:-/data/group_data/katefgroup-ssd/world_model/ziyinx}"
+train_data_dir="${TRAIN_DATA_DIR:-${CALVIN_DATA_ROOT}/calvin_zarr/train_rechunked8.zarr}"
 eval_data_dir="${EVAL_DATA_DIR:-/data/group_data/katefgroup/VLA/zarr_datasets/calvin_zarr/val_rechunked8.zarr}"
 train_instructions="${TRAIN_INSTRUCTIONS:-instructions/calvin/train_instructions.json}"
 val_instructions="${VAL_INSTRUCTIONS:-instructions/calvin/val_instructions.json}"

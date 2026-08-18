@@ -53,6 +53,15 @@ class AlohaTrainTester(BaseTrainTester):
     OPENNESS_MAX = torch.tensor(1.0, dtype=torch.float32)
     OPENNESS_LABEL_THRESH = 0.5
 
+    # Unified multi-camera motion fusion (Design B): sample motion queries from
+    # BOTH ALOHA head cameras (front=0, back=1 -- the rgb3d/pcd order set by
+    # AlohaDataPreprocessor.process_obs) and concatenate the two per-camera latents
+    # into ONE world-frame motion bank that all scene patches attend to (single
+    # scene_motion_attn / alpha_scene gate). Set to (0,) to fall back to the
+    # original front-only single-latent fusion. Applies to every ALOHA motion-latent
+    # model (EEF and joint alike); models without a motion expert ignore it.
+    MOTION_QUERY_CAMERAS = (0, 1)
+
     def _is_rank0(self):
         return (
             not dist.is_available()
@@ -125,10 +134,19 @@ class AlohaTrainTester(BaseTrainTester):
             )
         return self._aloha_action_stats
 
+    @torch.no_grad()
+    def _configure_motion_cameras(self, model):
+        if model is None:
+            return
+        module = model.module if hasattr(model, "module") else model
+        if hasattr(module, "_motion_query_cameras"):
+            module._motion_query_cameras = tuple(self.MOTION_QUERY_CAMERAS)
+
     def _configure_aloha_model(self, model):
         if model is None:
             return
         module = model.module if hasattr(model, "module") else model
+        self._configure_motion_cameras(model)
         # aloha_to_zarr.py labels every future xyz/rot6d target relative to the
         # current proprio anchor. Do not use the default cumulative relative
         # position reconstruction, and do not center rot6d by subtracting identity.
@@ -226,15 +244,22 @@ class AlohaTrainTester(BaseTrainTester):
             "traj_gripper": (pred_closed == gt_closed).float().mean(),
         }
 
+    # Pure-2D models (2DFA encoder + non-RoPE head). Neither their encoder nor
+    # their action head has an rgb2d branch -- Encoder2DFA discards rgb2d and pcd,
+    # and TransformerHead2D / JointFlowHead never read rgb2d_feats -- so a wrist
+    # left on the rgb2d path would be silently dropped.
+    WRIST_AS_SCENE_MODELS = ("flower_actor_2d", "flower_actor_2d_joint")
+
     def _feed_wrist_as_scene(self):
-        """The 2D visual-language model (flower_actor_2d_joint) has no rgb2d
-        branch: its 2DFA encoder only consumes rgb3d scene cameras (tagged with
-        camera-id embeddings) and discards rgb2d + pcd. Route the ALOHA wrist as a
-        third scene camera for that model so all three cameras (front, back, wrist)
-        are used; keep the default front/back-3D + wrist-2D-context routing for the
-        3D models. Gate on model_type so existing 3D runs are unchanged.
+        """The pure-2D visual-language models (flower_actor_2d,
+        flower_actor_2d_joint) have no rgb2d branch: their 2DFA encoder only
+        consumes rgb3d scene cameras (tagged with camera-id embeddings) and
+        discards rgb2d + pcd. Route the ALOHA wrist as a third scene camera for
+        those models so all three cameras (front, back, wrist) are used; keep the
+        default front/back-3D + wrist-2D-context routing for the 3D models. Gate on
+        model_type so existing 3D runs are unchanged. Requires --num_camera_ids 3.
         """
-        return getattr(self.args, "model_type", "") == "flower_actor_2d_joint"
+        return getattr(self.args, "model_type", "") in self.WRIST_AS_SCENE_MODELS
 
     @torch.no_grad()
     def prepare_batch(self, sample, augment=False):
@@ -345,13 +370,8 @@ class AlohaJointTrainer(AlohaTrainTester):
     JOINT_NORM_HI = torch.tensor([0.270, 0.722, 0.544, 0.634, 0.482, 0.692])
     USE_DATASET_JOINT_STATS = True
 
-    # Unified multi-camera motion fusion (Design B): sample motion queries from
-    # BOTH ALOHA head cameras (front=0, back=1 -- the rgb3d/pcd order set by
-    # AlohaDataPreprocessor.process_obs) and concatenate the two per-camera latents
-    # into ONE world-frame motion bank that all scene patches attend to (single
-    # scene_motion_attn / alpha_scene gate). Set to (0,) to fall back to the
-    # original front-only single-latent fusion.
-    MOTION_QUERY_CAMERAS = (0, 1)
+    # MOTION_QUERY_CAMERAS / _configure_motion_cameras are inherited from
+    # AlohaTrainTester (front+back motion queries for every ALOHA motion model).
 
     @staticmethod
     def _joint_stats_path(train_data_dir):
@@ -389,14 +409,6 @@ class AlohaJointTrainer(AlohaTrainTester):
     def get_joint_normalizer(self):
         hi = self._resolve_joint_hi()
         return torch.stack([-hi, hi])  # (2, 6)
-
-    @torch.no_grad()
-    def _configure_motion_cameras(self, model):
-        if model is None:
-            return
-        module = model.module if hasattr(model, "module") else model
-        if hasattr(module, "_motion_query_cameras"):
-            module._motion_query_cameras = tuple(self.MOTION_QUERY_CAMERAS)
 
     @torch.no_grad()
     def _copy_joint_normalizer(self, model):

@@ -235,6 +235,15 @@ echo -e "\033[33msummary csv: ${SUMMARY_CSV}\033[0m"
 
 cd "${ROBOTWIN_ROOT}"
 
+# Tasks whose eval produced no success rate at all. eval_policy.py can exit 0
+# without evaluating anything -- most notably script/test_render.py, which on a
+# node whose SAPIEN renderer fails to initialize prints "Render Error" and calls
+# bare exit() (status 0). Without the check below, record_result would append an
+# empty CSV row, the awk summary would skip it (it requires a non-empty success
+# column), no <split>_success_rate line would be printed, and this script would
+# still exit 0 -- i.e. a task that never ran would be reported as done.
+EVAL_FAILED_TASKS=""
+
 record_result() {
   local split_label="$1"
   local task_config="$2"
@@ -264,6 +273,18 @@ record_result() {
     "${split_label}" "${task_config}" "${task_name}" \
     "${successes}" "${TEST_NUM}" "${success_rate}" "${abs_result_file}" \
     >> "${SUMMARY_CSV}"
+
+  if [[ -z "${success_rate}" ]]; then
+    local reason="eval_policy.py produced no result file"
+    if grep -q "Render Error" "${log_file}"; then
+      reason="SAPIEN renderer failed to initialize on $(hostname) (\"Render Error\" from script/test_render.py)"
+    elif [[ -n "${abs_result_file}" ]]; then
+      reason="result file is missing or empty: ${abs_result_file}"
+    fi
+    echo -e "\033[31m[eval] FAILED split=${split_label} task=${task_name}: ${reason}\033[0m" >&2
+    echo -e "\033[31m[eval]   log: ${log_file}\033[0m" >&2
+    EVAL_FAILED_TASKS="${EVAL_FAILED_TASKS}${EVAL_FAILED_TASKS:+ }${split_label}/${task_name}"
+  fi
 }
 
 for config_i in "${!TASK_CONFIGS[@]}"; do
@@ -361,3 +382,11 @@ done
 } | tee "${SUMMARY_TXT}"
 
 echo -e "\033[32mWrote RobotWin2 eval summary to ${SUMMARY_CSV}\033[0m"
+
+# Exit non-zero so a task that never actually ran shows up as a FAILED slurm job
+# instead of a silent COMPLETED with no numbers in it.
+if [[ -n "${EVAL_FAILED_TASKS}" ]]; then
+  echo -e "\033[31m[eval] ERROR: no success rate was produced for: ${EVAL_FAILED_TASKS}\033[0m" >&2
+  echo -e "\033[31m[eval] These (task, split) pairs must be re-run; the summary above is incomplete.\033[0m" >&2
+  exit 1
+fi

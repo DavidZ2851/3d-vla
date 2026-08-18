@@ -5,12 +5,11 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=400G
 #SBATCH --gres=gpu:8
-#SBATCH --time=72:00:00
-#SBATCH --partition=katef
-#SBATCH --qos=katef_qos
+#SBATCH --time=48:00:00
+#SBATCH --partition=general
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="A100_40GB"
+#SBATCH --constraint="L40S"
 
 set -euo pipefail
 
@@ -58,7 +57,7 @@ finetune_backbone=true
 finetune_text_encoder=false
 fps_subsampling_factor=1
 
-C=${EMBEDDING_DIM:-912}
+C=${EMBEDDING_DIM:-1024}
 num_attn_heads=16
 num_vis_instr_attn_layers=3
 num_history=${NUM_HISTORY:-1}
@@ -85,7 +84,7 @@ base_log_dir=${BASE_LOG_DIR:-${REPO_ROOT}/train_logs}
 run_log_dir=${RUN_LOG_DIR:-3dfavla_motion}
 run_dir=${base_log_dir}/${main_dir}/${run_log_dir}
 # finetune=false restores iter, optimizer, lr_scheduler, scaler, and best_loss.
-checkpoint=${CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/robotwin2/3dfavla_motion_15tasks/420k.pth}
+checkpoint=${CHECKPOINT:-}
 if [[ "${checkpoint}" == "None" ]]; then
     checkpoint=""
 fi
@@ -117,7 +116,7 @@ echo "[train] finetune mode          = ${finetune}"
 echo "[train] action normalization    = fixed hand-designed RoboTwinTrainTester constants"
 echo "[train] motion expert ckpt      = ${motion_expert_checkpoint}"
 
-ngpus=${NGPUS:-8}
+ngpus=${NGPUS:-1}
 master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))
 
 torchrun --nproc_per_node $ngpus --master_port $master_port \

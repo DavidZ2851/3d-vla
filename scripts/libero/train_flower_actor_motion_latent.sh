@@ -17,18 +17,24 @@ export MOTION_EXPERT_USE_FLASH_ATTN_VARLEN=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 REPO_ROOT=/data/user_data/ziyinx/analogical_manipulation_clean
-DATA_PATH=/data/user_data/ziyinx/datasets
+DATA_PATH=/data/group_data/katefgroup-ssd/world_model/ziyinx
 BASE_LOG_DIR=$REPO_ROOT/train_logs
 
-# Filtered subdataset: libero_10/spatial/object/goal only (libero_90 dropped),
-# with 10k val rows moved into train. Produced by 3dfa-vla-data-processing/
-# data_processing/filter_libero_zarr_drop_libero90.py
-train_data_dir=$DATA_PATH/zarr_datasets/libero_zarr/train_rechunked8.zarr
-eval_data_dir=$DATA_PATH/zarr_datasets/libero_zarr/val_rechunked8.zarr
+# FULL libero_zarr (886,043 train / 56,575 val rows, libero_90 included), NOT
+# the filtered no-libero_90 subdataset this run previously used -- that copy
+# under /data/user_data/ziyinx/datasets is gone. Re-run
+# data_processing/filter_libero_zarr_drop_libero90.py to rebuild the filtered one.
+# Train was copied to the ssd mount by 3dfa-vla-data-processing/
+# sync_libero_zarr_to_ssd.sbatch; val is small and still read from group_data.
+train_data_dir=$DATA_PATH/libero_zarr/train_rechunked8.zarr
+eval_data_dir=/data/group_data/katefgroup/VLA/zarr_datasets/libero_zarr/val_rechunked8.zarr
 train_instructions=instructions/libero/instructions.json
 val_instructions=instructions/libero/instructions.json
 
 dataset=Libero
+# Master RNG seed: data order + model init + flow-matching noise.
+# 0 == the historical behaviour; override per run, e.g. SEED=1 sbatch ...
+seed=${SEED:-42}
 num_workers=4
 memory_limit=6
 B=8
@@ -80,13 +86,12 @@ motion_scene_fusion=true
 motion_action_fusion=false
 
 main_dir=libero
-run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-motion_finetuned_$motion_finetune-from75k-job${SLURM_JOBID}
-# Continue from the 75k checkpoint on the new filtered subdataset.
-# finetune=true => load weights only, reset iter/best_loss, and recompute the
-# workspace normalizer on the current (filtered) dataset.
-# RESUME from the 50k checkpoint of job8275118: finetune=false restores
-# iter/optimizer/scheduler/scaler and keeps the checkpoint's workspace normalizer.
-checkpoint=$BASE_LOG_DIR/${main_dir}/flower_actor_3d_motion_latent-Libero-C912-B8-lr3e-5-tristage_flower-H1-rectified_flow-florence2-motion_finetuned_true-from75k-job8275118/50000.pth
+run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-motion_finetuned_$motion_finetune-scratch-seed$seed-job${SLURM_JOBID}
+# Train from scratch: no policy checkpoint, so iter/optimizer/scheduler start at
+# 0 and the workspace normalizer is computed on the current dataset. The
+# florence2 backbone and the motion expert are still loaded pretrained
+# (motion_expert_checkpoint below); only the policy weights are random.
+checkpoint=None
 finetune=false
 
 ngpus=8
@@ -99,6 +104,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --train_instructions $train_instructions \
     --val_instructions $val_instructions \
     --dataset $dataset \
+    --seed $seed \
     --num_workers $num_workers \
     --memory_limit $memory_limit \
     --batch_size $B \

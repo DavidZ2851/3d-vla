@@ -72,8 +72,11 @@ train:
       - florence2
 
 data:
-  train_zarr: /data/user_data/ziyinx/datasets/zarr_datasets/calvin_motion_zarr/train_rechunked8.zarr
-  val_zarr: /data/user_data/ziyinx/datasets/zarr_datasets/calvin_motion_zarr/val_rechunked8.zarr
+  # Repointed to the SSD copy: the old /data/user_data/.../zarr_datasets path
+  # was deleted, so this config could not run as written. Same store, verified
+  # file-count parity against group_data.
+  train_zarr: /data/group_data/katefgroup-ssd/world_model/ziyinx/calvin_motion_zarr/train_rechunked8.zarr
+  val_zarr: /data/group_data/katefgroup-ssd/world_model/ziyinx/calvin_motion_zarr/val_rechunked8.zarr
   instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/train_motion_instructions_full.json
   train_instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/train_motion_instructions_full.json
   val_instructions_path: /data/user_data/ziyinx/analogical_manipulation_clean/instructions/calvin/val_motion_instructions_full.json

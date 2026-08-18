@@ -19,6 +19,7 @@ except Exception:
 
 from .compute_calvin_normalization_stats import (
     compute_calvin_normalization_stats,
+    compute_calvin_zarr_percentile_stats,
     extract_calvin_normalization_tensors,
     load_calvin_normalization_stats,
     save_calvin_normalization_stats,
@@ -36,6 +37,7 @@ from .zarr_dataset import (
     MotionExpertCollator,
     MotionExpertQwenTokenizer,
     MotionExpertZarrDataset,
+    canonical_camera_frame_name,
     compute_calvin_zarr_normalization_stats,
     compute_query_xyz_statistics,
     compute_query_xyz_statistics_from_dataset,
@@ -282,6 +284,26 @@ def _barrier_if_distributed(distributed: bool) -> None:
         dist.barrier(device_ids=[torch.cuda.current_device()])
 
 
+def _assert_stats_frame_matches(stats: Dict[str, object], expected_frame: str, stats_path: Path):
+    """Refuse statistics estimated in a different coordinate frame.
+
+    The per-axis scale is frame-dependent (a 62 deg rotation redistributes
+    motion energy across axes), so silently reusing world-frame stats for a
+    camera-frame run mis-scales the axes by up to ~1.8x relative to each other
+    without raising anything. Stats written before this field existed are
+    world-frame by construction.
+    """
+    found_frame = canonical_camera_frame_name(stats.get("camera_frame"))
+    if found_frame != expected_frame:
+        raise ValueError(
+            f"Normalization stats at {stats_path} were estimated in the "
+            f"'{found_frame}' frame but training runs in '{expected_frame}'. "
+            "Per-axis scale is frame-dependent -- point "
+            "`normalization_stats_path` at a frame-specific file (e.g. "
+            "calvin_motion_normalization_stats_cam.json) instead of reusing it."
+        )
+
+
 def _load_or_compute_motion_normalization_stats(
     stats_path: Path,
     train_cfg: dict,
@@ -289,17 +311,43 @@ def _load_or_compute_motion_normalization_stats(
     *,
     is_main_process: bool,
     distributed: bool,
+    traj_is_delta: bool = True,
 ) -> Dict[str, object]:
+    camera_frame = data_cfg.get("camera_frame")
+    expected_frame = canonical_camera_frame_name(camera_frame)
+
     if stats_path.exists():
-        return load_calvin_normalization_stats(stats_path)
+        stats = load_calvin_normalization_stats(stats_path)
+        _assert_stats_frame_matches(stats, expected_frame, stats_path)
+        return stats
 
     if is_main_process:
         num_bins = int(train_cfg.get("normalization_num_bins", 131072))
         source_root_cfg = train_cfg.get("normalization_source_root")
         if source_root_cfg is not None:
+            if expected_frame != "world":
+                raise ValueError(
+                    "normalization_source_root computes percentile stats from the "
+                    "raw world-frame annotations and cannot express "
+                    f"camera_frame={camera_frame!r}. Drop it so stats are "
+                    "estimated from the zarr with the frame transform applied."
+                )
             stats = compute_calvin_normalization_stats(
                 source_root=Path(source_root_cfg),
                 num_bins=num_bins,
+            )
+        elif bool(train_cfg.get("normalization_use_percentile_from_zarr", False)):
+            # Percentile estimator sourced from zarr: same center/scale
+            # definition as the NPZ path above, but able to apply a frame
+            # transform. Required for world-vs-camera runs to stay comparable.
+            stats = compute_calvin_zarr_percentile_stats(
+                [data_cfg["train_zarr"]],
+                num_bins=num_bins,
+                camera_frame=camera_frame,
+                traj_is_delta=traj_is_delta,
+                mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
+                chunk_size=int(train_cfg.get("normalization_chunk_size", 512)),
+                max_samples=train_cfg.get("normalization_max_samples"),
             )
         else:
             stats = compute_calvin_zarr_normalization_stats(
@@ -307,7 +355,10 @@ def _load_or_compute_motion_normalization_stats(
                 mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
                 chunk_size=int(train_cfg.get("normalization_chunk_size", 512)),
                 max_samples=train_cfg.get("normalization_max_samples"),
+                camera_frame=camera_frame,
+                traj_is_delta=traj_is_delta,
             )
+        stats.setdefault("camera_frame", expected_frame)
         save_calvin_normalization_stats(stats, stats_path)
 
     _barrier_if_distributed(distributed)
@@ -315,7 +366,9 @@ def _load_or_compute_motion_normalization_stats(
         raise FileNotFoundError(
             f"Normalization stats were not created by the main process: {stats_path}"
         )
-    return load_calvin_normalization_stats(stats_path)
+    stats = load_calvin_normalization_stats(stats_path)
+    _assert_stats_frame_matches(stats, expected_frame, stats_path)
+    return stats
 
 
 def _load_or_compute_query_xyz_stats(
@@ -326,30 +379,44 @@ def _load_or_compute_query_xyz_stats(
     is_main_process: bool,
     distributed: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if stats_path.exists():
+    expected_frame = canonical_camera_frame_name(data_cfg.get("camera_frame"))
+
+    def _load_checked() -> tuple[torch.Tensor, torch.Tensor]:
         stats = torch.load(stats_path, map_location="cpu")
+        _assert_stats_frame_matches(stats, expected_frame, stats_path)
         return stats["center"], stats["scale"]
+
+    if stats_path.exists():
+        return _load_checked()
 
     if is_main_process:
         if "query_world_xyz" in train_dataset.annos:
             query_center, query_scale = compute_query_xyz_statistics(
                 [data_cfg["train_zarr"]],
                 mem_limit_gb=float(data_cfg.get("mem_limit_gb", 16.0)),
+                camera_frame=data_cfg.get("camera_frame"),
             )
         else:
+            # The dataset already re-anchors at load time, so no transform here.
             query_center, query_scale = compute_query_xyz_statistics_from_dataset(
                 train_dataset
             )
         stats_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"center": query_center, "scale": query_scale}, stats_path)
+        torch.save(
+            {
+                "center": query_center,
+                "scale": query_scale,
+                "camera_frame": expected_frame,
+            },
+            stats_path,
+        )
 
     _barrier_if_distributed(distributed)
     if not stats_path.exists():
         raise FileNotFoundError(
             f"Query XYZ stats were not created by the main process: {stats_path}"
         )
-    stats = torch.load(stats_path, map_location="cpu")
-    return stats["center"], stats["scale"]
+    return _load_checked()
 
 
 def _build_spaghetti_viz_kwargs(
@@ -424,6 +491,7 @@ def main():
         traj_3d_xyz_is_delta=data_cfg.get("traj_3d_xyz_is_delta"),
         max_samples=data_cfg.get("max_train_samples"),
         chunk_size=int(data_cfg.get("chunk_size", 1)),
+        camera_frame=data_cfg.get("camera_frame"),
     )
     val_dataset = None
     if data_cfg.get("val_zarr"):
@@ -441,6 +509,7 @@ def main():
             traj_3d_xyz_is_delta=data_cfg.get("traj_3d_xyz_is_delta"),
             max_samples=data_cfg.get("max_val_samples"),
             chunk_size=int(data_cfg.get("chunk_size", 1)),
+            camera_frame=data_cfg.get("camera_frame"),
         )
 
     train_sampler = None
@@ -533,6 +602,7 @@ def main():
             data_cfg,
             is_main_process=is_main_process,
             distributed=distributed,
+            traj_is_delta=bool(train_dataset.traj_3d_xyz_is_delta),
         )
         query_center, query_scale, traj_center, traj_scale = extract_calvin_normalization_tensors(stats)
         pipeline.set_calvin_normalization_statistics(

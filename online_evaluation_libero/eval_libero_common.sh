@@ -81,7 +81,7 @@ run_libero_eval() {
     local video_dir="$3"
 
     echo "[eval] benchmark=$benchmark libero_root=$libero_root checkpoint=$checkpoint"
-    torchrun --nproc_per_node "$ngpus" --master_port "${MASTER_PORT:-$RANDOM}" \
+    torchrun --nproc_per_node "$ngpus" --master_port "${MASTER_PORT:-$((20000 + RANDOM % 20000))}" \
         online_evaluation_libero/evaluate_policy.py \
         --libero_root "$libero_root" \
         --libero_variant "$libero_variant" \

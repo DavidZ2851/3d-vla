@@ -7,14 +7,13 @@
 #SBATCH --output=/data/user_data/ziyinx/logs/%x_%j.out
 #SBATCH --error=/data/user_data/ziyinx/logs/%x_%j.err
 #SBATCH --constraint="L40S|A100_80GB"
-#SBATCH --exclude=babel-m5-32
 
 REPO_ROOT=/data/user_data/ziyinx/analogical_manipulation_clean
 libero_root=/data/user_data/ziyinx/LIBERO
 
 # Task/eval arguments
 # Runs all LIBERO suites sequentially.
-suites=(libero_10)
+suites=(libero_goal)
 task_order_index=0
 task_id=0
 all_tasks=true
@@ -31,7 +30,7 @@ libero_target_max_steps=250
 
 # Output
 exp=LIBERO
-checkpoint=${CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/libero/3dfavla_motion_subset/95k.pth}
+checkpoint=${CHECKPOINT:-/data/user_data/ziyinx/analogical_manipulation_clean/train_logs/libero/flower_actor_3d_motion_latent-Libero-C912-B8-lr3e-5-tristage_flower-H1-rectified_flow-florence2-motion_finetuned_true-scratch-seed42-job9793827/120k.pth}
 save_video=true
 video_fps=20
 video_env_index=0
@@ -90,7 +89,7 @@ for benchmark in "${suites[@]}"; do
     video_dir=eval_logs/$exp/videos/seed$seed/$benchmark
     echo "[eval] Starting benchmark=$benchmark num_eval=$num_eval all_tasks=$all_tasks"
 
-    torchrun --nproc_per_node $ngpus --master_port $RANDOM \
+    torchrun --nproc_per_node $ngpus --master_port $((20000 + RANDOM % 20000)) \
         online_evaluation_libero/evaluate_policy.py \
         --libero_root "$libero_root" \
         --checkpoint "$checkpoint" \

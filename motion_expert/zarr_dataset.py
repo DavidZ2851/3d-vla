@@ -26,6 +26,65 @@ from .geometry import (
 )
 
 
+#: ``camera_frame`` spellings that mean "leave the data in world frame".
+CAMERA_FRAME_WORLD_ALIASES = ("", "none", "world")
+
+
+def resolve_camera_frame_matrix(camera_frame: Optional[str]) -> Optional[np.ndarray]:
+    """Resolve a ``camera_frame`` config string to a world -> camera 4x4.
+
+    Returns ``None`` for the world-frame default so callers can skip the
+    transform entirely. Shared by the dataset and the statistics estimators so
+    the two can never disagree about what a frame name means.
+    """
+    if camera_frame is None:
+        return None
+    key = str(camera_frame).strip().lower()
+    if key in CAMERA_FRAME_WORLD_ALIASES:
+        return None
+    from utils.calvin_camera_frame import get_frame_transforms
+
+    world2frame, _ = get_frame_transforms(key)
+    if world2frame is None:
+        return None
+    return np.ascontiguousarray(world2frame, dtype=np.float32)
+
+
+def canonical_camera_frame_name(camera_frame: Optional[str]) -> str:
+    """Normalized frame label, used to tag and validate cached statistics."""
+    if camera_frame is None:
+        return "world"
+    key = str(camera_frame).strip().lower()
+    return "world" if key in CAMERA_FRAME_WORLD_ALIASES else key
+
+
+def apply_camera_frame_np(
+    points: np.ndarray,
+    world2cam: Optional[np.ndarray],
+    *,
+    is_delta: bool,
+) -> np.ndarray:
+    """World -> camera for ``(..., 3)`` numpy points, preserving sentinels.
+
+    Numpy twin of ``MotionExpertZarrDataset._to_camera_frame``: rows that are
+    not fully finite (``-inf`` marks unobserved track points) pass through
+    untouched, because a rigid transform would turn them into NaN. Deltas
+    rotate but do not translate.
+    """
+    if world2cam is None:
+        return points
+    pts = np.asarray(points, dtype=np.float32)
+    # The -inf sentinels make the matmul emit inf*0 -> NaN warnings; the result
+    # for those rows is discarded below, so silence rather than let it flood
+    # the logs once per chunk over a 727k-row corpus.
+    with np.errstate(invalid="ignore"):
+        out = pts @ world2cam[:3, :3].T
+        if not is_delta:
+            out = out + world2cam[:3, 3]
+    finite = np.isfinite(pts).all(axis=-1, keepdims=True)
+    return np.where(finite, out, pts)
+
+
 def _center_finite_query_xyz_np(query_world_xyz: np.ndarray) -> np.ndarray:
     query_world_xyz = np.asarray(query_world_xyz, dtype=np.float32).reshape(-1, 3)
     finite = np.isfinite(query_world_xyz).all(axis=1)
@@ -220,7 +279,23 @@ class MotionExpertZarrDataset(Dataset):
         traj_3d_xyz_is_delta: Optional[bool] = None,
         max_samples: Optional[int] = None,
         chunk_size: int = 1,
+        camera_frame: Optional[str] = None,
     ):
+        """
+        Args:
+            camera_frame: optional constant world -> camera re-anchoring applied
+                at load time. ``None`` / ``"world"`` (default) is a no-op.
+                ``"calvin_static"`` rotates+translates ``query_world_xyz`` and
+                the trajectory into CALVIN's fixed static front-camera frame.
+
+                This is deliberately a *training-time* transform rather than
+                something baked into the zarr: the geometry is a rounding error
+                next to the RGB (400x3 + 400x15x3 floats vs a 200x200x3 image
+                per row), the transform is one constant 4x4, and baking it would
+                fork ~102 GB of data while locking out the world-frame baseline.
+                Note the normalization statistics are frame-dependent, so a
+                camera-frame expert needs its own stats either way.
+        """
         super().__init__()
         self.annos = read_zarr_with_cache(root, mem_gb=mem_limit_gb)
         self.instructions = InstructionTable(instructions_path)
@@ -249,6 +324,31 @@ class MotionExpertZarrDataset(Dataset):
         self.depth_key = self._resolve_optional_key(("depth",))
         self.intrinsics_key = self._resolve_optional_key(("intrinsics", "camera_intrinsics"))
         self.extrinsics_key = self._resolve_optional_key(("extrinsics", "camera_extrinsics"))
+        self.world2cam = self._resolve_camera_frame(camera_frame)
+
+    @staticmethod
+    def _resolve_camera_frame(camera_frame: Optional[str]) -> Optional[torch.Tensor]:
+        """Return the world -> camera 4x4, or None for the world-frame default."""
+        world2cam = resolve_camera_frame_matrix(camera_frame)
+        if world2cam is None:
+            return None
+        return torch.from_numpy(world2cam).float()
+
+    def _to_camera_frame(self, points: torch.Tensor, is_delta: bool) -> torch.Tensor:
+        """World -> camera for ``(..., 3)`` points, preserving invalid sentinels.
+
+        Tracks carry non-finite entries (``-inf``) where a point is unobserved;
+        a rigid transform would turn those into NaN, so rows that are not fully
+        finite are passed through untouched. Deltas rotate but do not translate.
+        """
+        if self.world2cam is None:
+            return points
+        rot = self.world2cam[:3, :3].to(points.dtype)
+        out = points @ rot.t()
+        if not is_delta:
+            out = out + self.world2cam[:3, 3].to(points.dtype)
+        finite = torch.isfinite(points).all(dim=-1, keepdim=True)
+        return torch.where(finite, out, points)
 
     def _resolve_optional_key(self, candidates: Sequence[str]) -> Optional[str]:
         for candidate in candidates:
@@ -335,11 +435,17 @@ class MotionExpertZarrDataset(Dataset):
             if query_world_xyz.dim() == 3:
                 query_world_xyz = query_world_xyz.unsqueeze(0)
             query_world_xyz = flatten_query_grid(query_world_xyz)
+            # Optional constant re-anchoring to the fixed static camera. No-op
+            # unless camera_frame was requested; see _to_camera_frame.
+            query_world_xyz = self._to_camera_frame(query_world_xyz, is_delta=False)
 
         traj_3d_xyz = prefetched["traj_3d_xyz"][local_idx].to(dtype=torch.float32)
         if traj_3d_xyz.dim() == 4:
             traj_3d_xyz = traj_3d_xyz.unsqueeze(0)
         traj_3d_xyz = flatten_future_grid(traj_3d_xyz)
+        traj_3d_xyz = self._to_camera_frame(
+            traj_3d_xyz, is_delta=self.traj_3d_xyz_is_delta
+        )
 
         traj_mask = prefetched["traj_mask"][local_idx].bool()
         if traj_mask.dim() == 4:
@@ -592,7 +698,14 @@ def compute_query_xyz_statistics(
     query_key: str = "query_world_xyz",
     mem_limit_gb: float = 16.0,
     chunk_size: int = 512,
+    camera_frame: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-axis center/scale of the per-sample-centered query cloud.
+
+    ``camera_frame`` must match the dataset's, otherwise the scale is estimated
+    in a different frame than the one the model trains in.
+    """
+    world2cam = resolve_camera_frame_matrix(camera_frame)
     sums = np.zeros(3, dtype=np.float64)
     sumsq = np.zeros(3, dtype=np.float64)
     count = 0
@@ -603,6 +716,8 @@ def compute_query_xyz_statistics(
         for start in range(0, len(arr), chunk_size):
             chunk_arr = np.asarray(arr[start : start + chunk_size], dtype=np.float32)
             chunk = chunk_arr.reshape(chunk_arr.shape[0], -1, 3)
+            # Re-anchor before centering, mirroring the dataset's load order.
+            chunk = apply_camera_frame_np(chunk, world2cam, is_delta=False)
             for sample in chunk:
                 centered_sample = _center_finite_query_xyz_np(sample)
                 count += _update_axis_sums(centered_sample, sums, sumsq)
@@ -645,7 +760,17 @@ def compute_calvin_zarr_normalization_stats(
     mem_limit_gb: float = 16.0,
     chunk_size: int = 512,
     max_samples: Optional[int] = None,
+    camera_frame: Optional[str] = None,
+    traj_is_delta: bool = True,
 ) -> Dict[str, object]:
+    """Streaming per-axis statistics for the motion expert's two 3D arrays.
+
+    ``camera_frame`` re-anchors both arrays exactly as the dataset does at load
+    time; the returned dict records which frame it was estimated in so callers
+    can refuse to mix frames. ``traj_is_delta`` must match the dataset's
+    resolved semantics -- deltas rotate but must not pick up the translation.
+    """
+    world2cam = resolve_camera_frame_matrix(camera_frame)
     query_sums = np.zeros(3, dtype=np.float64)
     query_sumsq = np.zeros(3, dtype=np.float64)
     traj_sums = np.zeros(3, dtype=np.float64)
@@ -681,12 +806,14 @@ def compute_calvin_zarr_normalization_stats(
             end = min(start + chunk_size, store_len)
             query_chunk_arr = np.asarray(query_arr[start:end], dtype=np.float32)
             query_chunk = query_chunk_arr.reshape(query_chunk_arr.shape[0], -1, 3)
+            query_chunk = apply_camera_frame_np(query_chunk, world2cam, is_delta=False)
             for query_sample in query_chunk:
                 centered_query = _center_finite_query_xyz_np(query_sample)
                 query_count += _update_axis_sums(centered_query, query_sums, query_sumsq)
 
             traj_chunk_arr = np.asarray(traj_arr[start:end], dtype=np.float32)
             traj_chunk = traj_chunk_arr.reshape(traj_chunk_arr.shape[0], -1, traj_chunk_arr.shape[-2], 3)
+            traj_chunk = apply_camera_frame_np(traj_chunk, world2cam, is_delta=traj_is_delta)
             mask_chunk_arr = np.asarray(mask_arr[start:end]).astype(bool)
             if mask_chunk_arr.shape == traj_chunk_arr.shape:
                 mask_chunk_arr = mask_chunk_arr.all(axis=-1)
@@ -707,6 +834,8 @@ def compute_calvin_zarr_normalization_stats(
 
     return {
         "source_zarr_paths": [str(path) for path in zarr_paths],
+        "camera_frame": canonical_camera_frame_name(camera_frame),
+        "traj_is_delta": bool(traj_is_delta),
         "estimation_method": {
             "type": "streaming_mean_std",
             "note": "query_world_xyz is centered per sample before accumulating statistics.",

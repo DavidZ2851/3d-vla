@@ -10,19 +10,23 @@
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
 #SBATCH --constraint="L40S|A100_80GB"
-#SBATCH --exclude=babel-m5-32,babel-n9-32,babel-n9-28,babel-p9-28,babel-q5-28
 
 export WANDB_MODE=${WANDB_MODE:-online}
 
 REPO_ROOT=/data/user_data/ziyinx/analogical_manipulation_clean
 DATA_PATH=/data/user_data/ziyinx/datasets
 
-train_data_dir=$DATA_PATH/zarr_datasets/calvin_zarr/train_rechunked8.zarr
+# CALVIN train zarr now lives on the SSD tier; override with CALVIN_DATA_ROOT.
+CALVIN_DATA_ROOT="${CALVIN_DATA_ROOT:-/data/group_data/katefgroup-ssd/world_model/ziyinx}"
+train_data_dir=${CALVIN_DATA_ROOT}/calvin_zarr/train_rechunked8.zarr
 eval_data_dir=/data/group_data/katefgroup/VLA/zarr_datasets/calvin_zarr/val_rechunked8.zarr
 train_instructions=instructions/calvin/train_instructions.json
 val_instructions=instructions/calvin/val_instructions.json
 
 dataset=CalvinContact10th
+# Master RNG seed: data order + model init + flow-matching noise.
+# 0 == the historical behaviour; override per run, e.g. SEED=1 sbatch ...
+seed=${SEED:-42}
 num_workers=4
 memory_limit=6
 B=8
@@ -74,7 +78,7 @@ motion_scene_fusion=true
 motion_action_fusion=false
 
 main_dir=calvin
-run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-motion_finetuned_$motion_finetune-job${SLURM_JOBID}
+run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-$backbone-motion_finetuned_$motion_finetune-seed$seed-job${SLURM_JOBID}
 checkpoint=$DATA_PATH/train_logs/${main_dir}/${run_log_dir}/last.pth
 finetune=false
 
@@ -88,6 +92,7 @@ torchrun --nproc_per_node $ngpus --master_port $master_port \
     --train_instructions $train_instructions \
     --val_instructions $val_instructions \
     --dataset $dataset \
+    --seed $seed \
     --num_workers $num_workers \
     --memory_limit $memory_limit \
     --batch_size $B \

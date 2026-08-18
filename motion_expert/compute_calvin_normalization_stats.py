@@ -259,6 +259,156 @@ def compute_calvin_normalization_stats(
     return result
 
 
+def _iter_zarr_frame_values(
+    zarr_paths,
+    *,
+    camera_frame,
+    traj_is_delta,
+    mem_limit_gb,
+    chunk_size,
+    max_samples,
+) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+    """Yield ``(query_centered, traj_delta)`` value blocks from motion zarrs.
+
+    Applies the same world -> camera re-anchoring the dataset applies at load
+    time, in the same order (transform, then per-sample centering), so the
+    resulting statistics describe exactly what the model will see.
+    """
+    from datasets.utils import read_zarr_with_cache
+
+    from .zarr_dataset import apply_camera_frame_np, resolve_camera_frame_matrix
+
+    world2cam = resolve_camera_frame_matrix(camera_frame)
+    remaining = None if max_samples is None else int(max_samples)
+
+    for zarr_path in zarr_paths:
+        if remaining is not None and remaining <= 0:
+            break
+        annos = read_zarr_with_cache(str(zarr_path), mem_gb=mem_limit_gb)
+        query_arr = annos["query_world_xyz"]
+        traj_arr = annos["traj_3d_xyz"]
+        mask_arr = annos["traj_mask" if "traj_mask" in annos else "valid_mask"]
+
+        store_len = len(query_arr)
+        if remaining is not None:
+            store_len = min(store_len, remaining)
+        for start in range(0, store_len, chunk_size):
+            end = min(start + chunk_size, store_len)
+
+            q = np.asarray(query_arr[start:end], dtype=np.float32)
+            q = q.reshape(q.shape[0], -1, 3)
+            q = apply_camera_frame_np(q, world2cam, is_delta=False)
+            centered = []
+            for sample in q:
+                finite = np.isfinite(sample).all(axis=-1)
+                if not finite.any():
+                    continue
+                valid = sample[finite]
+                centered.append(valid - valid.mean(axis=0, keepdims=True))
+            query_values = (
+                np.concatenate(centered, axis=0)
+                if centered
+                else np.empty((0, 3), dtype=np.float32)
+            )
+
+            t = np.asarray(traj_arr[start:end], dtype=np.float32)
+            t = t.reshape(t.shape[0], -1, t.shape[-2], 3)
+            t = apply_camera_frame_np(t, world2cam, is_delta=traj_is_delta)
+            m = np.asarray(mask_arr[start:end])
+            if m.shape == t.shape:
+                m = m.all(axis=-1)
+            m = m.reshape(t.shape[0], -1, t.shape[-2]).astype(bool)
+            traj_values = t[m & np.isfinite(t).all(axis=-1)]
+
+            yield query_values, traj_values
+        if remaining is not None:
+            remaining -= store_len
+
+
+def compute_calvin_zarr_percentile_stats(
+    zarr_paths,
+    percentiles: Tuple[float, float] = DEFAULT_PERCENTILES,
+    num_bins: int = DEFAULT_NUM_BINS,
+    camera_frame: Optional[str] = None,
+    traj_is_delta: bool = True,
+    mem_limit_gb: float = 16.0,
+    chunk_size: int = 512,
+    max_samples: Optional[int] = None,
+) -> Dict[str, object]:
+    """Percentile normalization statistics estimated from motion zarrs.
+
+    Same two-pass histogram estimator as ``compute_calvin_normalization_stats``
+    (which reads the raw NPZs), so world- and camera-frame runs can share one
+    definition of center/scale and stay comparable. The NPZ path cannot express
+    a frame transform, which is why this zarr-sourced twin exists.
+
+    ``max_samples`` caps how many rows are read. The rechunked stores are row
+    shuffled, so a prefix is an unbiased sample -- 0.5/99.5 percentiles are
+    stable well below the full corpus and a capped pass is far cheaper than
+    streaming ~100 GB twice.
+    """
+    paths = [str(p) for p in zarr_paths]
+    kwargs = dict(
+        camera_frame=camera_frame,
+        traj_is_delta=traj_is_delta,
+        mem_limit_gb=mem_limit_gb,
+        chunk_size=chunk_size,
+        max_samples=max_samples,
+    )
+
+    # Pass 1: extent + counts (histogram bin edges need the true min/max).
+    query_min = np.full(3, np.inf, dtype=np.float64)
+    query_max = np.full(3, -np.inf, dtype=np.float64)
+    traj_min = np.full(3, np.inf, dtype=np.float64)
+    traj_max = np.full(3, -np.inf, dtype=np.float64)
+    query_count = 0
+    traj_count = 0
+    for query_values, traj_values in _iter_zarr_frame_values(paths, **kwargs):
+        query_count += _update_min_max_count(query_values, query_min, query_max)
+        traj_count += _update_min_max_count(traj_values, traj_min, traj_max)
+
+    if query_count <= 0 or traj_count <= 0:
+        raise RuntimeError(
+            "Could not compute Calvin zarr percentile statistics: no valid values."
+        )
+
+    # Pass 2: histograms over the now-known extent.
+    query_hist = np.zeros((3, num_bins), dtype=np.int64)
+    traj_hist = np.zeros((3, num_bins), dtype=np.int64)
+    for query_values, traj_values in _iter_zarr_frame_values(paths, **kwargs):
+        _accumulate_histogram(query_values, query_hist, query_min, query_max)
+        _accumulate_histogram(traj_values, traj_hist, traj_min, traj_max)
+
+    return {
+        "source_zarr_paths": paths,
+        "camera_frame": "world" if camera_frame in (None, "", "none", "world") else str(camera_frame),
+        "traj_is_delta": bool(traj_is_delta),
+        "max_samples": None if max_samples is None else int(max_samples),
+        "percentile_range": [float(percentiles[0]), float(percentiles[1])],
+        "estimation_method": {
+            "type": "two_pass_histogram",
+            "num_bins": int(num_bins),
+            "source": "zarr",
+        },
+        "query_centered_xyz": _finalize_axis_summary(
+            "query_centered_xyz",
+            query_hist,
+            query_min,
+            query_max,
+            total_count=query_count,
+            percentiles=percentiles,
+        ).__dict__,
+        "traj_delta_xyz": _finalize_axis_summary(
+            "traj_delta_xyz",
+            traj_hist,
+            traj_min,
+            traj_max,
+            total_count=traj_count,
+            percentiles=percentiles,
+        ).__dict__,
+    }
+
+
 def save_calvin_normalization_stats(stats: Dict[str, object], output_json: Path) -> None:
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_json.write_text(json.dumps(stats, indent=2) + "\n")
@@ -315,16 +465,84 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap for smoke tests or quick iteration.",
     )
+    parser.add_argument(
+        "--zarr",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Motion zarr store(s) to estimate from instead of --source-root. "
+            "Required for camera-frame stats: the NPZ path cannot apply a "
+            "frame transform."
+        ),
+    )
+    parser.add_argument(
+        "--camera-frame",
+        type=str,
+        default=None,
+        help="'world' (default) or 'calvin_static'. Only valid with --zarr.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help=(
+            "Cap on rows read from each zarr. Rechunked stores are row "
+            "shuffled, so a prefix is an unbiased sample."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=512,
+        help="Rows read per zarr slice.",
+    )
+    parser.add_argument(
+        "--mem-limit-gb",
+        type=float,
+        default=2.0,
+        help=(
+            "LRU chunk-cache budget. Both passes touch every chunk exactly "
+            "once in order, so caching buys nothing here -- the default is "
+            "deliberately small. Raising it to the training-time 16 GB makes "
+            "the process grow until the host kills it."
+        ),
+    )
+    parser.add_argument(
+        "--traj-absolute",
+        action="store_true",
+        help=(
+            "Treat traj_3d_xyz as absolute positions rather than deltas. "
+            "Deltas (the default) rotate but must not pick up the translation."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    stats = compute_calvin_normalization_stats(
-        source_root=args.source_root,
-        num_bins=int(args.num_bins),
-        max_files=args.max_files,
-    )
+    if args.zarr:
+        stats = compute_calvin_zarr_percentile_stats(
+            args.zarr,
+            num_bins=int(args.num_bins),
+            camera_frame=args.camera_frame,
+            traj_is_delta=not args.traj_absolute,
+            mem_limit_gb=float(args.mem_limit_gb),
+            chunk_size=int(args.chunk_size),
+            max_samples=args.max_samples,
+        )
+    else:
+        if args.camera_frame not in (None, "", "world"):
+            parser_error = (
+                "--camera-frame requires --zarr; the NPZ annotations are "
+                "world-frame and cannot express a transform."
+            )
+            raise SystemExit(parser_error)
+        stats = compute_calvin_normalization_stats(
+            source_root=args.source_root,
+            num_bins=int(args.num_bins),
+            max_files=args.max_files,
+        )
     save_calvin_normalization_stats(stats, args.output_json)
     print(json.dumps(stats, indent=2))
 

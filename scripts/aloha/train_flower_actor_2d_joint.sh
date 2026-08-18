@@ -2,17 +2,24 @@
 #SBATCH --job-name=aloha_2d_joint
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=400G
-#SBATCH --gres=gpu:8
-#SBATCH --time=24:00:00
-#SBATCH --partition=general
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=200G
+#SBATCH --gres=gpu:4
+#SBATCH --time=48:00:00
+#SBATCH --partition=katef
+#SBATCH --qos=katef_qos
 #SBATCH --output=/data/user_data/%u/logs/%x_%j.out
 #SBATCH --error=/data/user_data/%u/logs/%x_%j.err
-#SBATCH --constraint="L40S|A100_80GB"
+#SBATCH --constraint="A100_40GB"
+
+# Train flower_actor_2d_joint on the SINGLE-ARM ALOHA zarr (5 tasks: bottle_upright,
+# bottles_triangle, marker_cup, rank_color, uncap_marker). This is the pure-2D
+# visual-language joint-action baseline:
 #
-# Train flower_actor_2d_joint on the COMBINED ALOHA zarr (bimanual + single-arm,
-# 8 tasks). This is the pure-2D visual-language joint-action baseline:
+# To train the older COMBINED bimanual+single-arm set (8 tasks) instead, just
+# override the root -- everything else is identical:
+#   ZARR_ROOT=/data/group_data/katefgroup-ssd/world_model/ziyinx/aloha_combined_zarr \
+#       sbatch scripts/aloha/train_flower_actor_2d_joint.sh
 #
 #   * Cameras: the two head Azure Kinects (front, back) + the wrist camera are all
 #     fed as 2D SCENE cameras (num_camera_ids=3). The 2DFA encoder tags each with a
@@ -23,8 +30,18 @@
 #   * Action: anchor-relative delta JOINT angles (6 arm joints, radians) + a binary
 #     gripper command, anchored to the current joint-angle proprioception. No EEF
 #     chain-of-thought, no MotionExpert (both removed from FlowerActor2DJoint).
-#   * Normalizer: the per-joint arm envelope is read from the combined zarr's
-#     aloha_joint_rel_action_stats.json sidecar (AlohaJointTrainer.USE_DATASET_JOINT_STATS).
+#   * Normalizer: the per-joint arm envelope is read from the sidecar
+#     aloha_joint_rel_action_stats.json sitting next to the loaded train.zarr
+#     (AlohaJointTrainer.USE_DATASET_JOINT_STATS), so each ALOHA set is normalized
+#     to ITS OWN joint-delta envelope. The single-arm sidecar was generated with
+#       python scripts/aloha/compute_joint_rel_action_stats.py \
+#           --train-zarr $ZARR_ROOT/train.zarr --val-zarr $ZARR_ROOT/val.zarr \
+#           --output-json $ZARR_ROOT/aloha_joint_rel_action_stats.json
+#     giving hi = [0.277, 0.614, 0.375, 0.428, 0.558, 0.564] rad (p99.9 x1.15).
+#     That is materially tighter than the 8-task combined envelope on joints 2/3
+#     (0.375/0.428 vs 0.521/0.575) and wider on joint 4, so DO NOT reuse the
+#     combined sidecar or the hardcoded JOINT_NORM_HI fallback here -- a missing
+#     sidecar silently falls back and wastes dynamic range.
 #
 # ALOHA arm joints are stored in DEGREES; AlohaJointDataset converts the 6 arm
 # joints to RADIANS at load time so the radian normalizer matches. Offline training
@@ -37,8 +54,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 REPO_ROOT=${REPO_ROOT:-/data/user_data/ziyinx/analogical_manipulation_clean}
 BASE_LOG_DIR=${BASE_LOG_DIR:-/data/user_data/ziyinx/datasets/train_logs}
-# Combined bimanual+single-arm ALOHA zarr (8 tasks) on the SSD world_model store.
-ZARR_ROOT=${ZARR_ROOT:-/data/group_data/katefgroup-ssd/world_model/ziyinx/aloha_combined_zarr}
+# Single-arm ALOHA zarr (5 tasks) on the SSD world_model store.
+ZARR_ROOT=${ZARR_ROOT:-/data/group_data/katefgroup-ssd/world_model/ziyinx/aloha_singlearm_zarr}
 
 train_data_dir=${TRAIN_DATA_DIR:-$ZARR_ROOT/train.zarr}
 eval_data_dir=${EVAL_DATA_DIR:-$ZARR_ROOT/val.zarr}
@@ -118,9 +135,18 @@ fi
 finetune=${FINETUNE:-false}
 
 if [[ ! -d "${train_data_dir}" || ! -d "${eval_data_dir}" ]]; then
-    echo "ERROR: missing ALOHA combined joint zarr stores:" >&2
+    echo "ERROR: missing ALOHA joint zarr stores:" >&2
     echo "  train_data_dir=${train_data_dir}" >&2
     echo "  eval_data_dir=${eval_data_dir}" >&2
+    exit 1
+fi
+# AlohaJointTrainer reads the per-joint normalizer from this sidecar and SILENTLY
+# falls back to the hardcoded bimanual envelope when it is absent. Fail loudly
+# instead -- a wrong normalizer is invisible in the loss curve.
+joint_stats="${ZARR_ROOT}/aloha_joint_rel_action_stats.json"
+if [[ ! -f "${joint_stats}" ]]; then
+    echo "ERROR: missing joint-normalizer sidecar: ${joint_stats}" >&2
+    echo "  generate it with scripts/aloha/compute_joint_rel_action_stats.py" >&2
     exit 1
 fi
 if [[ -n "${checkpoint}" && ! -f "${checkpoint}" ]]; then
@@ -133,7 +159,7 @@ echo "[train] cameras      = front+back+wrist as 2D scene cams (num_camera_ids=$
 echo "[train] joint dims   = action_dim=${joint_action_dim} proprio_dim=${joint_proprio_dim} gripper_dim=${gripper_dim}"
 echo "[train] output dir   = ${BASE_LOG_DIR}/${main_dir}/${run_log_dir}"
 
-ngpus=${NGPUS:-8}
+ngpus=${NGPUS:-4}
 master_port=$(expr 10000 + $(echo -n ${SLURM_JOBID:-12345} | tail -c 4))
 custom_img_size_args=()
 if [[ -n "$custom_img_size" && "$custom_img_size" != "None" && "$custom_img_size" != "none" ]]; then

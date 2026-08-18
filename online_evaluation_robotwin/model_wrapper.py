@@ -258,6 +258,30 @@ class Model:
             self._gt_replay = True
             print(f"\033[95m[GT-REPLAY] feeding recorded actions from {gt_path} "
                   f"(T={self._gt_T} frames); policy is bypassed.\033[0m", flush=True)
+        # RW2_SWAP_RB: swap the R and B channels of every camera image before the
+        # policy sees it, so a checkpoint trained on miscolored data is evaluated
+        # under the colors it actually learned.
+        #
+        # Background: robotwin2_to_zarr's _decode_rgb_bytes runs cv2.imdecode (which
+        # already yields the stored channel order) and then applies an extra
+        # COLOR_BGR2RGB, so the zarr it wrote has R and B transposed relative to the
+        # simulator. Models trained on that zarr (train_logs/robotwin2/rw2_bad_color)
+        # grounded the word "red" in the blue channel. The live env hands us true RGB,
+        # so evaluating them straight would score them on a color mapping they never
+        # saw -- swapping here reproduces the training colors and makes the comparison
+        # fair. Leave unset for models trained on the corrected zarr (e.g. rw2_all):
+        # for those, the swap would introduce the very bug it compensates for.
+        self._swap_rb = os.environ.get("RW2_SWAP_RB", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if self._swap_rb:
+            print(
+                "\033[95m[RW2_SWAP_RB] feeding R/B-swapped images to the policy "
+                "(matches the rw2_bad_color training colors).\033[0m",
+                flush=True,
+            )
         # Opt-in head-camera RGBD recorder (active only when ROBOTWIN_ROLLOUT_DUMP_DIR
         # is set); dumps per-episode rgb/depth/summary for motion-expert spaghetti viz.
         from .rollout_recorder import RoboTwinRolloutRecorder
@@ -639,6 +663,10 @@ class Model:
         depth_arrays = []
         for name in self.CAMERA_NAMES:
             rgb = np.asarray(camera_obs[name]["rgb"], dtype=np.uint8).transpose(2, 0, 1)
+            if self._swap_rb:
+                # (3,H,W) -> reverse the channel axis: RGB -> BGR. See RW2_SWAP_RB
+                # in __init__.
+                rgb = np.ascontiguousarray(rgb[::-1])
             depth = np.asarray(camera_obs[name]["depth"], dtype=np.float32)
             if rgb.shape[-2:] != depth.shape[-2:]:
                 raise ValueError(

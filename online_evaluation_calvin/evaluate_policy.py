@@ -84,6 +84,11 @@ def parse_arguments():
         ('motion_finetune', str2bool, False),
         ('motion_scene_fusion', str2bool, True),
         ('motion_action_fusion', str2bool, False),
+        # 'world' (default) or 'camera': the coordinate frame the policy was
+        # trained in. See utils/calvin_camera_frame.
+        # 'world' | 'camera' | 'yaw45' -- fixed frame the policy was trained in.
+        ('coord_frame', str, 'world'),
+        ('motion_expert_frame', str, 'world'),
         # Model arguments: joint-angle decoder (flower_actor_3d_motion_latent_joint)
         ('joint_action_dim', int, 7),
         ('joint_proprio_dim', int, 8),

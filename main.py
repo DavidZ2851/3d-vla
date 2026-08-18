@@ -3,8 +3,11 @@
 import argparse
 import os
 from pathlib import Path
+import random
 import sys
 import datetime
+
+import numpy as np
 
 os.environ["MOTION_EXPERT_USE_FLASH_ATTN_VARLEN"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -27,6 +30,11 @@ def parse_arguments():
         ('train_instructions', Path, ''),
         ('val_instructions', Path, ''),
         ('dataset', str, "Peract"),
+        # Master RNG seed. Seeds model init, flow-matching noise and dropout
+        # (main.py, offset per rank) and the data order (DistributedSampler +
+        # DataLoader generator in utils/trainers/base.py). 0 = the historical
+        # data order, so existing runs are unchanged.
+        ('seed', int, 0),
         ('num_workers', int, 4),
         ('batch_size', int, 64),
         ('batch_size_val', int, 64),
@@ -109,6 +117,13 @@ def parse_arguments():
         ('motion_finetune', str2bool, True),
         ('motion_scene_fusion', str2bool, True),
         ('motion_action_fusion', str2bool, True),
+        # Geometry frame handed to the motion expert by a fixed-frame policy
+        # (flower_actor_3d_motion_latent_cam / _yaw45). 'world' reuses a
+        # world-trained expert checkpoint as-is by converting the query back to
+        # world; 'camera' feeds the policy's own frame straight through and
+        # therefore needs an expert trained in THAT frame (the value is a
+        # frame-agnostic "use my frame", not literally the camera).
+        ('motion_expert_frame', str, 'world'),
         # Joint-action decoder (flower_actor_3d_motion_latent_joint / flower_actor_2d_joint).
         ('joint_action_dim', int, 7),
         ('joint_proprio_dim', int, 8),
@@ -184,6 +199,16 @@ if __name__ == '__main__':
     torch.backends.cudnn.deterministic = False
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+
+    # Seed the global RNGs: model init, flow-matching noise, dropout. The rank
+    # offset keeps per-rank noise decorrelated (DDP broadcasts parameters from
+    # rank 0 at construction, so init stays consistent across ranks regardless).
+    # Data order is seeded separately from args.seed in utils/trainers/base.py.
+    rank_seed = args.seed * 1000 + int(os.environ.get("RANK", 0))
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
+    torch.cuda.manual_seed_all(rank_seed)
 
     # Select dataset and model classes
     dataset_class = fetch_dataset_class(args.dataset)
