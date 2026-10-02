@@ -3,6 +3,7 @@ import functools
 import torch
 import torch.nn as nn
 from timm.layers.mlp import Mlp
+import modeling.utils.florence_compat  # noqa: F401  (Florence-2 without flash_attn)
 from transformers import AutoModelForCausalLM, AutoProcessor
 
 from .transformers import (

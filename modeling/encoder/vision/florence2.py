@@ -3,6 +3,7 @@ import math
 import torch
 from torch import nn
 
+import modeling.utils.florence_compat  # noqa: F401  (Florence-2 without flash_attn)
 from transformers import AutoModelForCausalLM
 
 
